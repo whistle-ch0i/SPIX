@@ -4,4 +4,7 @@
 
 # NEWS
 
-Comming Soon
+Created a SPIX source folder to organize code into a more modular structure. 
+
+
+Still requires cleaning!!! 
