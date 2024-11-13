@@ -10,6 +10,10 @@ from shapely.ops import unary_union, polygonize
 from scipy.spatial import ConvexHull, Delaunay
 import logging
 
+from viz.plot_utils import rebalance_colors,alpha_shape
+from viz.plot_sanity_checks import _check_spatial_data,_check_img,_check_scale_factor,is_collinear,is_almost_collinear
+
+
 
 
 # Configure logging to display warnings and errors

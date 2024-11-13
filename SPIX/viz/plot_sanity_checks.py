@@ -6,6 +6,7 @@ from shapely.geometry import MultiPoint, Polygon, LineString, MultiLineString
 from shapely.ops import unary_union, polygonize
 from scipy.spatial import ConvexHull, Delaunay
 import logging
+
 def _check_spatial_data(uns, library_id):
     spatial_mapping = uns.get('spatial', {})
     if library_id is None:

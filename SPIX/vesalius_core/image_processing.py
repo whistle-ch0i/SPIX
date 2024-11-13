@@ -1,19 +1,26 @@
-
-
-### smooth using tiles ###
 import numpy as np
 import pandas as pd
 import scanpy as sc
 import cv2
+import warnings
+import logging
 from scipy.ndimage import gaussian_filter
 from tqdm import tqdm
-import logging
 from sklearn.preprocessing import MinMaxScaler
 from joblib import Parallel, delayed
 from tqdm_joblib import tqdm_joblib
+from sklearn.neighbors import NearestNeighbors
+from skimage.exposure import equalize_hist, equalize_adapthist, rescale_intensity
+from anndata import AnnData
+from scipy.ndimage import gaussian_filter
+from concurrent.futures import ThreadPoolExecutor
+from typing import List
+from sklearn.preprocessing import MinMaxScaler
+from skimage.restoration import denoise_tv_chambolle
+
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+#logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def smooth_image(
     adata,
@@ -548,197 +555,6 @@ def fill_nan_with_opencv_inpaint(image, method='telea', inpaint_radius=3):
 
     return image_filled
 
-### equalize using tiles ###
-import numpy as np
-from skimage.exposure import equalize_hist, equalize_adapthist, rescale_intensity
-from anndata import AnnData
-from scipy.ndimage import gaussian_filter
-from concurrent.futures import ThreadPoolExecutor
-from typing import List
-import warnings
-from sklearn.preprocessing import MinMaxScaler
-
-def equalize_image(
-    adata: AnnData,
-    dimensions: List[int] = [0, 1, 2],
-    method: str = 'BalanceSimplest',
-    N: int = 1,
-    smax: float = 1.0,
-    sleft: float = 1.0,
-    sright: float = 1.0,
-    lambda_: float = 0.1,
-    up: float = 100.0,
-    down: float = 10.0,
-    verbose: bool = True,
-    n_jobs: int = 1  
-) -> AnnData:
-    """
-    Equalize histogram of the smoothed images stored in adata.uns['smoothed_images_dict'].
-    """
-    if 'smoothed_images_dict' not in adata.uns:
-        raise ValueError("smoothed_images_dict not found in adata.uns. Please run smooth_image first.")
-
-    if 'tiles' not in adata.uns:
-        raise ValueError("Tiles not found in adata.uns['tiles'].")
-
-    # Retrieve and prepare the shifted tile coordinates
-    tiles_shifted = adata.uns['tiles'][['x','y','barcode']].copy()
-    min_x = tiles_shifted['x'].min()
-    min_y = tiles_shifted['y'].min()
-    shift_x = -min_x
-    shift_y = -min_y
-    tiles_shifted['x'] += shift_x
-    tiles_shifted['y'] += shift_y
-    x_indices = tiles_shifted['x'].astype(int).values
-    y_indices = tiles_shifted['y'].astype(int).values
-
-    # Prepare a DataFrame to store equalized embeddings
-    equalized_df = pd.DataFrame(index=adata.obs_names)
-
-    def process_dimension(dim):
-        if verbose:
-            print(f"Equalizing dimension {dim} using method '{method}'")
-        # Retrieve the smoothed image for this dimension
-        if dim not in adata.uns['smoothed_images_dict']:
-            raise ValueError(f"Dimension {dim} not found in smoothed_images_dict.")
-        image = adata.uns['smoothed_images_dict'][dim]
-        # Apply the equalization method to the image
-        data_eq = apply_equalization(image, method=method, N=N, smax=smax, sleft=sleft, sright=sright, lambda_=lambda_, up=up, down=down)
-        # Extract the equalized values at the positions corresponding to observations
-        equalized_values = data_eq[y_indices, x_indices]
-        # Map to barcodes
-        equalized_barcode_grouped = pd.DataFrame({
-            'barcode': tiles_shifted['barcode'],
-            'equalized_embed': equalized_values
-        })
-        # Group by barcode in case of duplicates
-        equalized_barcode_grouped = equalized_barcode_grouped.groupby('barcode', as_index=False)['equalized_embed'].mean()
-        # Ensure the order matches adata.obs_names
-        equalized_barcode_grouped = equalized_barcode_grouped.set_index('barcode').loc[adata.obs_names]
-        return equalized_barcode_grouped['equalized_embed'].values
-
-    # Now process all dimensions
-    if n_jobs > 1:
-        with ThreadPoolExecutor(max_workers=n_jobs) as executor:
-            results = list(executor.map(process_dimension, dimensions))
-    else:
-        results = [process_dimension(dim) for dim in dimensions]
-
-    # Assign results to equalized_df
-    for i, dim in enumerate(dimensions):
-        equalized_df[f'dim_{dim}'] = results[i]
-
-    # Optionally, you can perform scaling if necessary
-    # For example, MinMax scaling
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    equalized_scaled = scaler.fit_transform(equalized_df)
-
-    # Store the equalized embeddings in adata.obsm
-    adata.obsm['X_embedding_equalize'] = equalized_scaled
-
-    # Log the parameters used
-    if verbose:
-        print("Logging changes to AnnData.uns['equalize_image_log']")
-    adata.uns['equalize_image_log'] = {
-        'method': method,
-        'parameters': {
-            'N': N,
-            'smax': smax,
-            'sleft': sleft,
-            'sright': sright,
-            'lambda_': lambda_,
-            'up': up,
-            'down': down
-        },
-        'dimensions': dimensions
-    }
-
-    if verbose:
-        print("Histogram equalization completed and embeddings updated in AnnData object.")
-
-    return adata
-
-def apply_equalization(image, method='BalanceSimplest', N=1, smax=1.0, sleft=1.0, sright=1.0, lambda_=0.1, up=100.0, down=10.0):
-    """
-    Apply the specified equalization method to the image.
-    """
-    # Flatten the image to a 1D array for methods that require it
-    data = image.flatten()
-
-    if method == 'BalanceSimplest':
-        data_eq = balance_simplest(data, sleft=sleft, sright=sright)
-    elif method == 'EqualizePiecewise':
-        data_eq = equalize_piecewise(data, N=N, smax=smax)
-    elif method == 'SPE':
-        data_eq = spe_equalization(data, lambda_=lambda_)
-    elif method == 'EqualizeDP':
-        data_eq = equalize_dp(data, down=down, up=up)
-    elif method == 'EqualizeADP':
-        data_eq = equalize_adp(data)
-    elif method == 'ECDF':
-        data_eq = ecdf_eq(data)
-    elif method == 'histogram':
-        data_eq = equalize_hist(data)
-    elif method == 'adaptive':
-        data_eq = equalize_adapthist(image)  # For images, adaptive method can work directly
-        data_eq = data_eq.flatten()
-    else:
-        raise ValueError(f"Unknown equalization method '{method}'")
-
-    # Reshape back to image shape
-    data_eq_image = data_eq.reshape(image.shape)
-    return data_eq_image
-
-# Equalization methods (same as before)
-def balance_simplest(data: np.ndarray, sleft: float = 1.0, sright: float = 1.0, range_limits: tuple = (0, 1)) -> np.ndarray:
-    p_left = np.percentile(data, sleft)
-    p_right = np.percentile(data, 100 - sright)
-    data_eq = rescale_intensity(data, in_range=(p_left, p_right), out_range=range_limits)
-    return data_eq
-
-def equalize_piecewise(data: np.ndarray, N: int = 1, smax: float = 1.0) -> np.ndarray:
-    data_eq = np.copy(data)
-    quantiles = np.linspace(0, 100, N + 1)
-    for i in range(N):
-        lower = np.percentile(data, quantiles[i])
-        upper = np.percentile(data, quantiles[i + 1])
-        mask = (data >= lower) & (data < upper)
-        if np.any(mask):
-            segment = rescale_intensity(data[mask], in_range=(lower, upper), out_range=(0, smax))
-            data_eq[mask] = segment
-    return data_eq
-
-def spe_equalization(data: np.ndarray, lambda_: float = 0.1) -> np.ndarray:
-    data_smoothed = gaussian_filter(data, sigma=lambda_)
-    data_eq = rescale_intensity(data_smoothed, out_range=(0, 1))
-    return data_eq
-
-def equalize_dp(data: np.ndarray, down: float = 10.0, up: float = 100.0) -> np.ndarray:
-    p_down = np.percentile(data, down)
-    p_up = np.percentile(data, up)
-    data_clipped = np.clip(data, p_down, p_up)
-    data_eq = rescale_intensity(data_clipped, out_range=(0, 1))
-    return data_eq
-
-def equalize_adp(data: np.ndarray) -> np.ndarray:
-    data_eq = equalize_adapthist(data.reshape(1, -1), clip_limit=0.03).flatten()
-    return data_eq
-
-def ecdf_eq(data: np.ndarray) -> np.ndarray:
-    sorted_idx = np.argsort(data)
-    ecdf = np.arange(1, len(data) + 1) / len(data)
-    data_eq = np.zeros_like(data)
-    data_eq[sorted_idx] = ecdf
-    return data_eq
-
-### equalize using embedding -faster but not using tiles- ###
-import numpy as np
-from skimage.exposure import equalize_hist, equalize_adapthist, rescale_intensity
-from anndata import AnnData
-from scipy.ndimage import gaussian_filter
-from concurrent.futures import ThreadPoolExecutor
-from typing import List
-import warnings
 
 
 
@@ -1018,9 +834,7 @@ def ecdf_eq(data: np.ndarray) -> np.ndarray:
     return data_eq
 
 
-### regulization using embedding -still need update- ####
-import numpy as np
-from skimage.restoration import denoise_tv_chambolle
+
 
 
 
@@ -1095,7 +909,7 @@ def regularise_image(
     if verbose:
         print("Image regularization completed.")
 
-def regularise(embedding_grid, weight=0.1, n_iter_max=200):
+def regularize(embedding_grid, weight=0.1, n_iter_max=200):
     """
     Denoise data using total variation regularization.
     """
@@ -1131,9 +945,9 @@ def regularise(embedding_grid, weight=0.1, n_iter_max=200):
     embedding_grid_denoised[nan_mask] = np.nan
 
     return embedding_grid_denoised
-from sklearn.neighbors import NearestNeighbors
 
-def regularise_image_knn(
+
+def regularize_image_knn(
     adata,
     dimensions=[0, 1, 2],
     embedding='X_embedding',
