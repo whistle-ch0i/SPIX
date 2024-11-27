@@ -2,22 +2,22 @@
 import numpy as np
 import pandas as pd
 import scanpy as sc
-import scipy
-import itertools
-import os
-import logging
 from anndata import AnnData
 from sklearn.decomposition import PCA, NMF
 from sklearn.preprocessing import MinMaxScaler
+from scipy.sparse import csr_matrix
+import scipy
 from shapely.geometry import Polygon
-from shapely.vectorized import contains
+from shapely.vectorized import contains  # Ensure Shapely version >= 2.0
 from collections import Counter
+import itertools
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor
-
+import os
+import logging
 
 # Configure logging
-# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
 def generate_embeddings(
@@ -186,7 +186,6 @@ def generate_tiles(
     tiles = rasterise(filtered_regions, filtered_coordinates, index, vor,chunksize, n_jobs=n_jobs)
     if verbose:
         print(f"Rasterisation completed. Number of tiles: {len(tiles)}")
-
     # Store tiles in AnnData object
     adata.uns['tiles'] = tiles
     adata.uns['tiles_generated'] = True
