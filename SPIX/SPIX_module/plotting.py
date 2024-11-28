@@ -103,7 +103,18 @@ def image_plot(
             logger.warning(f"'Segment' label for {missing} barcodes in coordinates_df is missing in adata.obs.")
             # Drop rows with missing 'Segment' values
             coordinates_df = coordinates_df.dropna(subset=['Segment'])
+    # **Convert 'x' and 'y' to numeric to prevent dtype=object issues**
+    coordinates_df['x'] = pd.to_numeric(coordinates_df['x'], errors='coerce')
+    coordinates_df['y'] = pd.to_numeric(coordinates_df['y'], errors='coerce')
 
+    # Drop rows with NaN in 'x' or 'y'
+    if coordinates_df[['x', 'y']].isnull().any().any():
+        logger.warning("Found NaN values in 'x' or 'y' after conversion. These will be dropped.")
+        coordinates_df = coordinates_df.dropna(subset=['x', 'y'])
+
+    # Ensure 'x' and 'y' are numeric
+    if not pd.api.types.is_numeric_dtype(coordinates_df['x']) or not pd.api.types.is_numeric_dtype(coordinates_df['y']):
+        raise TypeError("Columns 'x' and 'y' must be numeric after conversion.")
     # Normalize embeddings to values between 0 and 1
     coordinates = rebalance_colors(coordinates_df, dimensions)
 
