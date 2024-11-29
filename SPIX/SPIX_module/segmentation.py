@@ -15,6 +15,7 @@ from scipy.interpolate import griddata
 from sklearn.neighbors import NearestNeighbors
 import warnings
 import networkx as nx
+import multiprocessing
 
 from .utils import bubble_stack, random_sampling, hex_grid, create_pseudo_centroids, is_collinear, select_initial_indices
 
