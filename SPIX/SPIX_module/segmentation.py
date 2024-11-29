@@ -297,7 +297,6 @@ def leiden_segmentation(embeddings, resolution=1.0, n_neighbors=15, random_state
 
 
 def slic_segmentation(
-    adata: AnnData,
     embeddings: np.ndarray,
     spatial_coords: np.ndarray,
     n_segments: int = 100,
@@ -312,8 +311,6 @@ def slic_segmentation(
     
     Parameters
     ----------
-    adata : AnnData
-        The annotated data matrix.
     embeddings : np.ndarray
         The embedding matrix.
     spatial_coords : np.ndarray
