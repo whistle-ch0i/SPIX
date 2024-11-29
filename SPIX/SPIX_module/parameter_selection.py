@@ -225,8 +225,8 @@ def parameter_selection(
     adata,
     original_moranI,
     method = 'leiden_slic',
-    resolutions: List[int] = [1, 5, 10, 20, 30, 100, 300, 1000, 2000],
-    compactness_values: List[int] = [1, 2, 3, 4, 5, 10, 20, 30, 40, 50, 100],
+    resolutions: List[int] = [1, 5, 10, 20, 30, 100,200, 300,500,700,1000, 2000],
+    compactness_values: List[int] = [1, 3, 5, 10, 20, 30, 40, 50, 100,200,500,1000],
     n_jobs: int = 1,
     scaling: float = 0.3,
     n_neighbors: int = 15,
@@ -243,7 +243,7 @@ def parameter_selection(
     resolutions : list of int, optional
         List of resolution values to sweep over. Default is [1, 5, 10, 20, 30, 100, 300, 1000, 2000].
     compactness_values : list of int, optional
-        List of compactness values to sweep over. Default is [1, 2, 3, 4, 5, 10, 20, 30, 40, 50, 100].
+        List of compactness values to sweep over. Default is [1, 3, 5, 10, 20, 30, 40, 50, 100,200,500,1000].
     n_jobs : int, optional
         Number of parallel jobs to run. Default is the number of CPU cores available.
     scaling : float, optional
