@@ -1336,35 +1336,70 @@ def fill_nan_with_opencv_inpaint(image: np.ndarray, method: str = 'telea', inpai
     return image_filled
     
     
-def bubble_stack(data: np.ndarray, stack_size: int = 5, axis: int = 0) -> np.ndarray:
+def bubble_stack(coordinates, n_centers=100, max_iter=500, verbose=True):
     """
-    Create a bubble stack by aggregating data across a specified axis.
+    Select initial indices using the 'bubble' method.
 
     Parameters
     ----------
-    data : np.ndarray
-        Input data array.
-    stack_size : int, optional (default=5)
-        Number of consecutive slices to stack.
-    axis : int, optional (default=0)
-        Axis along which to stack the data.
+    coordinates : np.ndarray
+        Spatial coordinates of the data points.
+    n_centers : int
+        Desired number of cluster centers.
+    max_iter : int
+        Maximum number of iterations for convergence.
+    verbose : bool
+        Whether to display progress messages.
 
     Returns
     -------
-    np.ndarray
-        Bubble stacked data array.
+    background_grid : list of int
+        Indices of the selected initial centers.
     """
-    if stack_size < 1:
-        raise ValueError("stack_size must be at least 1.")
-    if axis < 0 or axis >= data.ndim:
-        raise ValueError(f"axis must be between 0 and {data.ndim - 1}.")
+    from sklearn.neighbors import NearestNeighbors
 
-    # Initialize list to hold stacked data
-    stacked = []
-    for i in range(data.shape[axis] - stack_size + 1):
-        slices = [data.take(i + j, axis=axis) for j in range(stack_size)]
-        stacked.append(np.stack(slices, axis=-1))
-    return np.stack(stacked, axis=axis)
+    # Initialize radius
+    nbrs = NearestNeighbors(n_neighbors=max(2, int(len(coordinates) * 0.2))).fit(coordinates)
+    distances, indices_nn = nbrs.kneighbors(coordinates)
+    radius = np.max(distances)
+
+    convergence = False
+    iter_count = 0
+
+    while not convergence and iter_count < max_iter:
+        if verbose:
+            print(f"Iteration {iter_count+1}: Adjusting radius to achieve desired number of centers...")
+
+        background_grid = []
+        active = set(range(len(coordinates)))
+        nn_indices = indices_nn
+        nn_distances = distances
+
+        while active:
+            random_start = np.random.choice(list(active))
+            background_grid.append(random_start)
+
+            # Find neighbors within radius
+            neighbors = nn_indices[random_start][nn_distances[random_start] <= radius]
+            # Remove these from active
+            active -= set(neighbors)
+
+        if len(background_grid) == n_centers:
+            convergence = True
+        elif len(background_grid) < n_centers:
+            radius *= 0.75  # Decrease radius
+        else:
+            radius *= 1.25  # Increase radius
+
+        iter_count += 1
+
+    if iter_count == max_iter and not convergence:
+        warnings.warn("Max iterations reached without convergence, returning approximation.")
+
+    if len(background_grid) > n_centers:
+        background_grid = background_grid[:n_centers]
+
+    return background_grid
     
     
 def create_pseudo_centroids(df, clusters, dimensions):
@@ -1393,60 +1428,66 @@ def create_pseudo_centroids(df, clusters, dimensions):
     
     return active
     
-def hex_grid(x_min: float, x_max: float, y_min: float, y_max: float, spacing: float) -> np.ndarray:
+def hex_grid(coordinates, n_centers=100):
     """
-    Generate a hexagonal grid within specified bounds.
+    Select initial indices using a hexagonal grid.
 
     Parameters
     ----------
-    x_min : float
-        Minimum x-coordinate.
-    x_max : float
-        Maximum x-coordinate.
-    y_min : float
-        Minimum y-coordinate.
-    y_max : float
-        Maximum y-coordinate.
-    spacing : float
-        Spacing between hexagon centers.
+    coordinates : np.ndarray
+        Spatial coordinates of the data points.
+    n_centers : int
+        Number of cluster centers to select.
 
     Returns
     -------
-    np.ndarray
-        Array of hexagon center coordinates.
+    unique_indices : np.ndarray
+        Indices of the data points closest to the grid points.
     """
-    dx = spacing * 3/2
-    dy = spacing * np.sqrt(3)
-    points = []
-    y = y_min
-    row = 0
-    while y <= y_max:
-        x_offset = spacing * 0.75 if row % 2 else 0
-        x = x_min + x_offset
-        while x <= x_max:
-            points.append([x, y])
-            x += dx
-        y += dy
-        row += 1
-    return np.array(points)
+    x_min, x_max = np.min(coordinates[:,0]), np.max(coordinates[:,0])
+    y_min, y_max = np.min(coordinates[:,1]), np.max(coordinates[:,1])
 
-def random_sampling(data: pd.DataFrame, sample_size: int = 1000) -> pd.DataFrame:
+    grid_size = int(np.sqrt(n_centers))
+    x_coords = np.linspace(x_min, x_max, grid_size)
+    y_coords = np.linspace(y_min, y_max, grid_size)
+
+    shift = (x_coords[1] - x_coords[0]) / 2
+    c_x = []
+    c_y = []
+    for i, y in enumerate(y_coords):
+        if i % 2 == 0:
+            c_x.extend(x_coords)
+        else:
+            c_x.extend(x_coords + shift)
+        c_y.extend([y] * grid_size)
+
+    grid_points = np.vstack([c_x, c_y]).T
+
+    from sklearn.neighbors import NearestNeighbors
+    nbrs = NearestNeighbors(n_neighbors=1).fit(coordinates)
+    distances, indices = nbrs.kneighbors(grid_points)
+
+    unique_indices = np.unique(indices.flatten())
+    return unique_indices[:n_centers]
+
+def random_sampling(coordinates, n_centers=100):
     """
-    Randomly sample a subset of the data.
+    Randomly sample initial indices.
 
     Parameters
     ----------
-    data : pd.DataFrame
-        Input DataFrame.
-    sample_size : int, optional (default=1000)
-        Number of samples to draw.
+    coordinates : np.ndarray
+        Spatial coordinates of the data points.
+    n_centers : int
+        Number of indices to sample.
 
     Returns
     -------
-    pd.DataFrame
-        Sampled DataFrame.
+    indices : np.ndarray
+        Randomly selected indices.
     """
-    return data.sample(n=sample_size, random_state=42)
+    indices = np.random.choice(len(coordinates), size=n_centers, replace=False)
+    return indices
 
 def select_initial_indices(
     coordinates,
