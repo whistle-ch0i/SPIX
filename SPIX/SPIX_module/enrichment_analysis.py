@@ -4,7 +4,9 @@ import numpy as np
 import pandas as pd
 import io
 import logging
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
+import seaborn as sns
+import matplotlib.pyplot as plt
 
 # Configure a module-level logger
 logger = logging.getLogger('SPIX.enrichment')
@@ -12,8 +14,13 @@ logger.setLevel(logging.INFO)  # Default level
 handler = logging.StreamHandler()
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
+
+# Prevent adding multiple handlers
 if not logger.handlers:
     logger.addHandler(handler)
+
+# Disable propagation to avoid duplicate logs
+logger.propagate = False
 
 def set_logger_verbosity(verbose: bool) -> None:
     """
@@ -370,7 +377,7 @@ def subset_enrichment_results(
     Parameters
     ----------
     enrichment_results : Dict[str, Dict[str, pd.DataFrame]]
-        Nested dictionary containing enrichment results from `generate_enrichment_results`.
+        Nested dictionary containing enrichment results from generate_enrichment_results.
     selected_database : str, optional
         The database to use for generating the heatmap. Default is 'GO_Biological_Process_2023'.
     significance_threshold : float, optional
@@ -413,3 +420,123 @@ def subset_enrichment_results(
     logger.info(f"Merged DataFrame created with shape: {merged_df.shape}")
 
     return merged_df
+
+def create_enrichment_clustermap(
+    heatmap_df: pd.DataFrame,
+    selected_database: str,
+    term_pattern: Optional[str] = None,
+    p_value_threshold: float = 0.05,
+    cmap: str = "Reds",
+    figsize: Tuple[int, int] = (14, 12),
+    metric: str = "euclidean",
+    method: str = "average",
+    add_annotations: bool = True,
+    verbose: bool = True
+) -> sns.matrix.ClusterGrid:
+    """
+    Create a clustermap heatmap for enrichment results.
+
+    Parameters
+    ----------
+    heatmap_df : pd.DataFrame
+        DataFrame containing the merged enrichment results for the selected database.
+        Rows represent terms, columns represent gene groups, and values are p-values.
+    selected_database : str
+        The database used for enrichment (used in the plot title).
+    term_pattern : Optional[str], optional
+        Regex pattern to filter terms. Only terms containing this pattern will be included.
+        If None, no term filtering is applied. Default is None.
+    p_value_threshold : float, optional
+        Threshold for significance in p-value. Default is 0.05.
+    cmap : str, optional
+        Colormap for the heatmap. Default is "Reds".
+    figsize : Tuple[int, int], optional
+        Figure size for the heatmap. Default is (14, 12).
+    metric : str, optional
+        Distance metric for clustering. Default is "euclidean".
+    method : str, optional
+        Clustering linkage method. Default is "average".
+    add_annotations : bool, optional
+        Whether to add stars (*) to denote significant p-values. Default is True.
+    verbose : bool, optional
+        If True, enable detailed logging. Default is True.
+
+    Returns
+    -------
+    sns.matrix.ClusterGrid
+        The seaborn clustermap object.
+    """
+    set_logger_verbosity(verbose)
+    logger.info("Starting clustermap generation.")
+
+    # Step 1: Term Selection (if pattern provided)
+    if term_pattern:
+        logger.info(f"Filtering terms with pattern: '{term_pattern}' (case-insensitive)")
+        heatmap_df = heatmap_df[heatmap_df.index.str.contains(term_pattern, case=False, na=False)]
+        logger.debug(f"Number of terms after filtering: {heatmap_df.shape[0]}")
+
+    # Step 2: P-value Filtering
+    mlog10_threshold = -np.log10(p_value_threshold)
+    logger.info(f"Applying p-value threshold: {mlog10_threshold}")
+    # Keep terms where any p-value <= threshold
+    heatmap_df_filtered = heatmap_df[(heatmap_df >= mlog10_threshold).any(axis=1)]
+    logger.debug(f"Number of terms after p-value filtering: {heatmap_df_filtered.shape[0]}")
+
+    if heatmap_df_filtered.empty:
+        logger.warning("No terms meet the p-value threshold after filtering.")
+        raise ValueError("No terms meet the p-value threshold after filtering.")
+
+    logger.debug("Data transformation complete.")
+
+    # Step 3: Generate Clustermap
+    logger.info("Generating clustermap.")
+    g = sns.clustermap(
+        heatmap_df_filtered, 
+        annot=False, 
+        cmap=cmap, 
+        figsize=figsize, 
+        metric=metric, 
+        method=method,
+        standard_scale=None
+    )
+    plt.setp(g.ax_heatmap.get_xticklabels(), rotation=30, ha='right')
+
+    # Step 4: Get reordered indices
+    row_order = g.dendrogram_row.reordered_ind
+    col_order = g.dendrogram_col.reordered_ind
+
+    # Step 5: Adding Stars for Significant P-values
+    if add_annotations:
+        logger.info("Adding stars for significant p-values.")
+        for i, term_idx in enumerate(row_order):
+            for j, group_idx in enumerate(col_order):
+                # Retrieve the original p-value
+                term = heatmap_df_filtered.index[term_idx]
+                group = heatmap_df_filtered.columns[group_idx]
+                p_val = heatmap_df_filtered.loc[term, group]
+                if p_val >= -np.log10(0.001):
+                    symbol = '***'
+                elif p_val >= -np.log10(0.01):
+                    symbol = '**'
+                elif p_val >= -np.log10(0.05):
+                    symbol = '*'
+                else:
+                    symbol = ''
+                if symbol:
+                    g.ax_heatmap.text(
+                        j + 0.5, 
+                        i + 0.5, 
+                        symbol, 
+                        ha='center', 
+                        va='center', 
+                        color='black', 
+                        fontsize=12
+                    )
+
+    # Step 6: Set Title
+    plt.title(f"Enrichment Clustermap for {selected_database}", pad=20)
+
+    logger.info("Clustermap generation complete.")
+    plt.show()
+
+    return g
