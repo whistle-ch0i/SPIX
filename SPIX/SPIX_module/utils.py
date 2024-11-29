@@ -1447,3 +1447,41 @@ def random_sampling(data: pd.DataFrame, sample_size: int = 1000) -> pd.DataFrame
         Sampled DataFrame.
     """
     return data.sample(n=sample_size, random_state=42)
+
+def select_initial_indices(
+    coordinates,
+    n_centers=100,
+    method='bubble',
+    max_iter=500,
+    verbose=True
+):
+    """
+    Select initial indices for cluster centers using various methods.
+
+    Parameters
+    ----------
+    coordinates : np.ndarray
+        Spatial coordinates of the data points.
+    n_centers : int
+        Number of cluster centers to select.
+    method : str
+        Method for selecting initial centers ('bubble', 'random', 'hex').
+    max_iter : int
+        Maximum number of iterations for convergence (used in 'bubble' method).
+    verbose : bool
+        Whether to display progress messages.
+
+    Returns
+    -------
+    indices : list of int
+        Indices of the selected initial centers.
+    """
+    if method == 'bubble':
+        indices = bubble_stack(coordinates, n_centers=n_centers, max_iter=max_iter, verbose=verbose)
+    elif method == 'random':
+        indices = random_sampling(coordinates, n_centers=n_centers)
+    elif method == 'hex':
+        indices = hex_grid(coordinates, n_centers=n_centers)
+    else:
+        raise ValueError(f"Unknown index selection method '{method}'")
+    return indices
