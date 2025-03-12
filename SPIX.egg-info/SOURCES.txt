@@ -1,8 +1,8 @@
 README.md
 pyproject.toml
-SPIX_module/__init__.py
-SPIX_module.egg-info/PKG-INFO
-SPIX_module.egg-info/SOURCES.txt
-SPIX_module.egg-info/dependency_links.txt
-SPIX_module.egg-info/requires.txt
-SPIX_module.egg-info/top_level.txt
+SPIX/__init__.py
+SPIX.egg-info/PKG-INFO
+SPIX.egg-info/SOURCES.txt
+SPIX.egg-info/dependency_links.txt
+SPIX.egg-info/requires.txt
+SPIX.egg-info/top_level.txt

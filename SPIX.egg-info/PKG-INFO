@@ -1,5 +1,5 @@
 Metadata-Version: 2.2
-Name: SPIX_module
+Name: SPIX
 Version: 0.1.0
 Summary: A Python package using Super Pixels for efficient multi-scale Spatial omics analysis
 Author-email: Your Name <your.email@example.com>, Patrick CN Martin <patrick.martin@cshs.org>
@@ -34,4 +34,4 @@ Requires-Dist: alphashape
 
 # NEWS
 
-Building direvtory as python module 
+Building as python module 
