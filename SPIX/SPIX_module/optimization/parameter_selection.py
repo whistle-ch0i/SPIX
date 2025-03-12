@@ -14,7 +14,7 @@ import logging
 from typing import List
 import squidpy as sq
 import NaiveDE
-import SpatialDE
+#import SpatialDE
 from scipy.sparse import csr_matrix, issparse
 
 # Import necessary functions from other modules

@@ -1,0 +1,37 @@
+Metadata-Version: 2.1
+Name: SPIX_module
+Version: 0.1.0
+Summary: A Python package using Super Pixels for efficient multi-scale Spatial omics analysis
+Author-email: Your Name <your.email@example.com>, Patrick CN Martin <patrick.martin@cshs.org>
+License: MIT
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: numpy
+Requires-Dist: scipy
+Requires-Dist: matplotlib
+Requires-Dist: pandas
+Requires-Dist: scikit-learn
+Requires-Dist: scanpy
+Requires-Dist: squidpy
+Requires-Dist: requests
+Requires-Dist: seaborn
+Requires-Dist: skimage
+Requires-Dist: anndata
+Requires-Dist: joblib
+Requires-Dist: tqdm_joblib
+Requires-Dist: sklearn
+Requires-Dist: cv2
+Requires-Dist: opencv-python
+Requires-Dist: NaiveDE
+Requires-Dist: SpatialDE
+Requires-Dist: minisom
+Requires-Dist: networkx
+Requires-Dist: shapely
+Requires-Dist: tqdm
+Requires-Dist: alphashape
+
+# Super Pixels for efficient Spatial Omics analysis
+
+## News 
+
+Comming soon!
