@@ -7,13 +7,15 @@ scanpy
 squidpy
 requests
 seaborn
-scikit-image
+skimage
 anndata
 joblib
 tqdm_joblib
-opencv-python
+sklearn
+cv2
 opencv-python
 NaiveDE
+SpatialDE
 minisom
 networkx
 shapely

@@ -1,4 +1,4 @@
-Metadata-Version: 2.2
+Metadata-Version: 2.1
 Name: SPIX_module
 Version: 0.1.0
 Summary: A Python package using Super Pixels for efficient multi-scale Spatial omics analysis
@@ -15,23 +15,23 @@ Requires-Dist: scanpy
 Requires-Dist: squidpy
 Requires-Dist: requests
 Requires-Dist: seaborn
-Requires-Dist: scikit-image
+Requires-Dist: skimage
 Requires-Dist: anndata
 Requires-Dist: joblib
 Requires-Dist: tqdm_joblib
-Requires-Dist: opencv-python
+Requires-Dist: sklearn
+Requires-Dist: cv2
 Requires-Dist: opencv-python
 Requires-Dist: NaiveDE
+Requires-Dist: SpatialDE
 Requires-Dist: minisom
 Requires-Dist: networkx
 Requires-Dist: shapely
 Requires-Dist: tqdm
 Requires-Dist: alphashape
 
-# Vesalius_SuperPixel_Python
+# Super Pixels for efficient Spatial Omics analysis
 
-![image](https://github.com/user-attachments/assets/729e4f0d-a73c-4e19-b4a9-187cbf5e99c8)
+## News 
 
-# NEWS
-
-Building direvtory as python module 
+Comming soon!

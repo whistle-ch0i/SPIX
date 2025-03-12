@@ -4,7 +4,4 @@
 
 # NEWS
 
-Created a SPIX source folder to organize code into a more modular structure. 
-
-
-Still requires cleaning!!! 
+Building as python module 
