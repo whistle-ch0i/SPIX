@@ -234,7 +234,7 @@ def embed_latent_space(
     adata_proc : AnnData
         The processed AnnData object.
     dim_reduction : str, optional (default='PCA')
-        Dimensionality reduction method ('PCA', 'UMAP', 'NMF', 'LSI', etc.).
+        Dimensionality reduction method ('PCA', 'UMAP', 'NMF', 'LSI','Harmony', etc.).
     dimensions : int, optional (default=30)
         Number of dimensions to reduce to.
     features : list, optional (default=None)
@@ -299,6 +299,14 @@ def embed_latent_space(
         nmf_model = NMF(n_components=dimensions, init='random', random_state=0)
         W = nmf_model.fit_transform(adata_proc.X)
         embeds = MinMaxScaler().fit_transform(W)
+    elif dim_reduction == 'Harmony':
+        # Perform PCA before Harmony integration
+        sc.tl.pca(adata_proc, n_comps=dimensions)
+        # Run Harmony integration using 'library_id' as the batch key
+        sc.external.pp.harmony_integrate(adata_proc, key='library_id')
+        # Retrieve the Harmony integrated embeddings; these are stored in 'X_pca_harmony'
+        embeds = adata_proc.obsm['X_pca_harmony']
+        embeds = MinMaxScaler().fit_transform(embeds)
     else:
         raise ValueError(f"Dimensionality reduction method '{dim_reduction}' is not recognized.")
 
