@@ -167,7 +167,7 @@ def perform_pseudo_bulk_analysis(
     print(f"Gene filtering complete: Retained genes present in at least {min_cells} segments.")
 
     if normalize_total:
-        sc.pp.normalize_total(adata_proc, target_sum=1e4)
+        sc.pp.normalize_total(new_adata, target_sum=1e4)
         print("Total count normalization complete.")
 
     if log_transform:
