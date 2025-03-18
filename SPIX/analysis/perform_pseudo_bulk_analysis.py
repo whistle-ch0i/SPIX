@@ -77,7 +77,7 @@ def perform_pseudo_bulk_analysis(
 
     # Pseudo-Bulk Aggregation
     print("Starting Pseudo-Bulk Aggregation...")
-
+    
     adata_var_index = adata.var.index
     adata_X = adata.X
     adata_obsm_coords = adata.obsm['spatial']
@@ -167,7 +167,7 @@ def perform_pseudo_bulk_analysis(
     print(f"Gene filtering complete: Retained genes present in at least {min_cells} segments.")
 
     if normalize_total:
-        sc.pp.normalize_total(new_adata, inplace=True)
+        sc.pp.normalize_total(adata_proc, target_sum=1e4)
         print("Total count normalization complete.")
 
     if log_transform:
@@ -198,7 +198,7 @@ def perform_pseudo_bulk_analysis(
         sc.tl.pca(new_adata)
         print("PCA complete.")
 
-        sc.pp.neighbors(new_adata, use_rep='X_pca', **neighbors_default)
+        sc.pp.neighbors(new_adata, use_rep='X_pca', **neighbors_kwargs)
         print("Neighbors computation complete.")
 
     print("Pseudo-Bulk analysis complete.")
