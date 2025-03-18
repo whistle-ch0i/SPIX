@@ -35,7 +35,8 @@ dependencies = [
     "shapely",
     "tqdm",
     "alphashape",
-    "igraph"
+    "igraph",
+    'harmonypy'
 ]
 
 
