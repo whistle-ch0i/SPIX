@@ -40,7 +40,7 @@ dependencies = [
 
 
 [tool.setuptools]
-packages = ["SPIX"]
+packages = { find = { where = ["."] } }
 
 
 [tool.black]
