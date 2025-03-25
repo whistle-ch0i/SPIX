@@ -1,4 +1,4 @@
-Metadata-Version: 2.2
+Metadata-Version: 2.4
 Name: SPIX
 Version: 0.1.0
 Summary: A Python package using Super Pixels for efficient multi-scale Spatial omics analysis
@@ -27,6 +27,8 @@ Requires-Dist: networkx
 Requires-Dist: shapely
 Requires-Dist: tqdm
 Requires-Dist: alphashape
+Requires-Dist: igraph
+Requires-Dist: harmonypy
 
 # Vesalius_SuperPixel_Python
 

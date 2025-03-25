@@ -19,3 +19,5 @@ networkx
 shapely
 tqdm
 alphashape
+igraph
+harmonypy

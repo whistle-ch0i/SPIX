@@ -1,4 +1,5 @@
 import numpy as np
+from typing import Union, Optional
 from sklearn.cluster import KMeans
 import multiprocessing
 from joblib import parallel_backend
@@ -10,7 +11,7 @@ def slic_segmentation(
     n_segments: int = 100,
     compactness: float = 1.0,
     scaling: float = 0.3,
-    index_selection: str = 'bubble',
+    index_selection: Optional[Union[str, list]] = None,
     max_iter: int = 1000,
     verbose: bool = True
 ) -> np.ndarray:
@@ -31,6 +32,7 @@ def slic_segmentation(
         Scaling factor for spatial coordinates.
     index_selection : str, optional (default='bubble')
         Method for selecting initial cluster centers ('bubble', 'random', 'hex').
+        As an alternative, you can also provide an array of initial indices.
     max_iter : int, optional (default=1000)
         Maximum number of iterations for convergence in initial cluster selection.
     verbose : bool, optional (default=True)
@@ -55,17 +57,18 @@ def slic_segmentation(
     # Combine embeddings and spatial coordinates
     combined_data = np.concatenate([embeddings_scaled, spatial_coords], axis=1)
 
-    # Select initial cluster centers
-    indices = select_initial_indices(
-        spatial_coords,
-        n_centers=n_segments,
-        method=index_selection,
-        max_iter=max_iter,
-        verbose=verbose
-    )
-
-    # Initialize KMeans with initial centers
-    initial_centers = combined_data[indices]
+    if index_selection is None:
+        index_selection = 'bubble'
+        indices = select_initial_indices(
+            spatial_coords,
+            n_centers=n_segments,
+            method=index_selection,
+            max_iter=max_iter,
+            verbose=verbose
+        )
+        initial_centers = combined_data[indices]
+    else :
+        initial_centers = index_selection
 
     if verbose:
         print("Running K-Means clustering...")

@@ -65,7 +65,7 @@ def get_gene_order(
     adata = adata[:, genes]
     gene_sum = adata.X.sum(axis = 1)
     gene_order = np.argsort(gene_sum)[::-1]
-    return gene_order
+    return gene_order.tolist()
 
 def get_exclusion_zone(
     adata : AnnData,
@@ -84,7 +84,7 @@ def get_hotspot_index(
     initial_index = []
     for i in range(max_spots):
         expr_loc = gene_set.index(max(gene_set))
-        initial_index = initial_index.append(expr_loc)
+        initial_index.append(expr_loc)
         gene_set = [j for j in gene_set if j not in exclusion_zone[i]]
         if len(gene_set) == 0 or len(initial_index) >= max_spots:
             break
