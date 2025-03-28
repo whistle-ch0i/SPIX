@@ -7,17 +7,19 @@ from anndata import AnnData
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
 from .slic_segmentation import slic_segmentation
+from ..utils.utils import create_pseudo_centroids
 
 
 def find_hotspots(
     adata: AnnData,
     genes: list,
-    max_spots: int = 100,
     depth_exclusion: int = 3, # TODO add radius search as well
     embedding = "X_embedding",
+    dimensions: list = list(range(30)),
     compactness: float = 1,
     scaling: float = 0.3,
     max_iter: int = 1000,
+    add_name: str = 'Hotspots',
     verbose: bool = True) -> AnnData:
     #-------------------------------------------------------------------------#
     # First lets get a gene set using sum of counts
@@ -31,10 +33,8 @@ def find_hotspots(
     # Get initial indices from hotspots
     #-------------------------------------------------------------------------#
     hotspots_index = get_hotspot_index(
-        adata,
         gene_set,
-        exclusion_zone,
-        max_spots)
+        exclusion_zone)
     #-------------------------------------------------------------------------#
     # SLIC using hotspots
     # At the moment not sure how we should include the other points
@@ -47,15 +47,41 @@ def find_hotspots(
         embeddings = adata.obsm['X_embedding']
     clusters, combined_data = slic_segmentation(
         embeddings = embeddings,
-        spatial_coord = adata.obsm['spatial'],
+        spatial_coords = adata.obsm['spatial'],
         n_segments = len(hotspots_index),
         compactness = compactness,
         scaling = scaling,
         index_selection = hotspots_index,
         max_iter = max_iter,
         verbose = verbose)
+    # TODO clean this section up - relying on other functions but might be good
+    # to have this in a more streamline manner. Maybe we should leave the 
+    # the vesalius code style behind
+    clusters_df = pd.DataFrame({
+        'barcode': adata.obs.index,
+        'Segment': clusters
+    })
+
     
-    return clusters, combined_data
+    tile_colors = pd.DataFrame(np.array(adata.obsm[embedding])[:, dimensions])
+    tile_colors['barcode'] = adata.obs.index
+    tiles = adata.uns['tiles'][adata.uns['tiles']['origin'] == 1]
+    
+    embeddings_df = pd.merge(tiles, tile_colors, on="barcode", how="right").dropna().reset_index(drop=True)
+    embeddings_df = embeddings_df.drop(columns=['barcode',"x", "y", "origin"])
+    embeddings_df.index = adata.obs.index
+    pseudo_centroids = create_pseudo_centroids(
+        embeddings_df,
+        clusters_df,
+        dimensions
+    )
+    adata.obsm['X_embedding_segment'] = pseudo_centroids
+    adata.obsm['X_embedding_scaled_for_segment'] = combined_data
+    
+    adata.obs[add_name] = pd.Categorical(clusters_df['Segment'])
+    return adata
+    
+    return adata
 
 
 
@@ -77,16 +103,16 @@ def get_exclusion_zone(
     
 
 def get_hotspot_index(
-    adata:AnnData,
     gene_set : list,
-    exclusion_zone : list,
-    max_spots: int = 100):
+    exclusion_zone : list):
     initial_index = []
-    for i in range(max_spots):
+    i = 0
+    while len(gene_set) > 0:
         expr_loc = gene_set.index(max(gene_set))
         initial_index.append(expr_loc)
         gene_set = [j for j in gene_set if j not in exclusion_zone[i]]
-        if len(gene_set) == 0 or len(initial_index) >= max_spots:
+        i += 1
+        if len(gene_set) == 0:
             break
         else:
             continue

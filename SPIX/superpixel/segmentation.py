@@ -129,6 +129,7 @@ def segment_image(
     
     # Store the clusters in adata.obs
     adata.obs[Segment] = pd.Categorical(clusters_df['Segment'])
+    return adata
 
 
 def segment_image_inner(

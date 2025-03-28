@@ -57,8 +57,7 @@ def slic_segmentation(
     # Combine embeddings and spatial coordinates
     combined_data = np.concatenate([embeddings_scaled, spatial_coords], axis=1)
 
-    if index_selection is None:
-        index_selection = 'bubble'
+    if isinstance(index_selection, str):
         indices = select_initial_indices(
             spatial_coords,
             n_centers=n_segments,
@@ -66,9 +65,11 @@ def slic_segmentation(
             max_iter=max_iter,
             verbose=verbose
         )
+        
         initial_centers = combined_data[indices]
     else :
-        initial_centers = index_selection
+        initial_centers = combined_data[index_selection]
+        n_segments = len(index_selection)
 
     if verbose:
         print("Running K-Means clustering...")
