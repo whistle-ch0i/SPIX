@@ -30,7 +30,7 @@ def generate_embeddings(
     library_id : str = 'library_id',
     dimensions: int = 30,
     tensor_resolution: float = 1,
-    filter_grid: float = 1,
+    filter_grid: float = 0.01,
     filter_threshold: float = 0.995,
     nfeatures: int = 2000,
     features: list = None,
@@ -104,6 +104,7 @@ def generate_embeddings(
     adata_proc = process_counts(
         adata,
         method=normalization,
+        dim_reduction=dim_reduction,
         use_counts=use_counts,
         nfeatures=nfeatures,
         min_cutoff=min_cutoff,
@@ -119,6 +120,7 @@ def generate_embeddings(
     embeds = embed_latent_space(
         adata_proc,
         dim_reduction=dim_reduction,
+        library_id=library_id,
         dimensions=dimensions,
         features=features,
         remove_lsi_1=remove_lsi_1,
@@ -139,6 +141,7 @@ def generate_embeddings(
 def process_counts(
     adata: AnnData,
     method: str = 'log_norm',
+    dim_reduction: str = 'PCA',
     use_counts: str = 'raw',
     nfeatures: int = 2000,
     min_cutoff: str = 'q5',
@@ -224,6 +227,7 @@ def process_counts(
 def embed_latent_space(
     adata_proc: AnnData,
     dim_reduction: str = 'PCA',
+    library_id : str = 'library_id',
     dimensions: int = 30,
     features: list = None,
     remove_lsi_1: bool = True,
