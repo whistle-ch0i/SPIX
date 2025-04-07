@@ -4,7 +4,7 @@ from anndata import AnnData
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.collections import LineCollection
-from shapely.geometry import MultiPoint, Polygon, LineString, MultiPolygon, GeometryCollection
+from shapely.geometry import MultiPoint, Polygon, LineString, MultiPolygon, GeometryCollection, MultiLineString
 from shapely.ops import unary_union
 from shapely.validation import explain_validity
 from scipy.spatial import ConvexHull, KDTree
@@ -179,32 +179,49 @@ def image_plot(
             if unique_points.shape[0] < 3 or is_collinear(unique_points):
                 logger.warning(f"Segment {seg} points are collinear or insufficient. Using LineString as boundary.")
                 line = LineString(unique_points)
+                
                 # Clip boundary to plot bounds
                 clipped_line = line.intersection(plot_boundary_polygon)
-                if not clipped_line.is_empty:
+                if clipped_line.is_empty:
+                    continue
+                
+                # Prepare to collect points from the clipped geometry
+                line_points = []
+                
+                # Handle different geometry types
+                if isinstance(clipped_line, (LineString)):
                     x, y = clipped_line.xy
-                    # Set color for each point of the boundary
                     line_points = np.column_stack((x, y))
-                    _, idx = tree.query(line_points)
-                    if fixed_boundary_color is not None:
-                        # Use fixed color
-                        line_colors = np.array([fixed_boundary_color] * len(line_points))
+                elif isinstance(clipped_line, (MultiLineString, GeometryCollection)):
+                    for geom in clipped_line.geoms:
+                        if isinstance(geom, LineString):
+                            x, y = geom.xy
+                            # Append points from each LineString segment
+                            line_points.extend(np.column_stack((x, y)))
+                    line_points = np.array(line_points)
+                else:
+                    logger.warning(f"Unsupported geometry type after clipping: {type(clipped_line)}")
+                    continue
+                
+                # Now, find nearest neighbors for each boundary point
+                _, idx = tree.query(line_points)
+                
+                # Determine boundary colors as before
+                if fixed_boundary_color is not None:
+                    line_colors = np.array([fixed_boundary_color] * len(line_points))
+                else:
+                    if len(dimensions) == 3:
+                        line_colors = coordinates.iloc[idx][['R', 'G', 'B']].values
                     else:
-                        if len(dimensions) == 3:
-                            # Extract RGB colors
-                            line_colors = coordinates.iloc[idx][['R', 'G', 'B']].values
-                        else:
-                            # Extract grayscale values and replicate to RGB
-                            grey = coordinates.iloc[idx]['Grey'].values
-                            line_colors = np.repeat(grey[:, np.newaxis], 3, axis=1)
+                        grey = coordinates.iloc[idx]['Grey'].values
+                        line_colors = np.repeat(grey[:, np.newaxis], 3, axis=1)
+                    line_colors = brighten_colors(np.clip(line_colors, 0, 1), factor=brighten_factor)
+                
+                # Create segments for LineCollection
+                segments_lines = np.array([line_points[i:i+2] for i in range(len(line_points)-1)])
+                lc = LineCollection(segments_lines, colors=line_colors[:-1], linewidth=boundary_linewidth, alpha=alpha, linestyle=linestyle)
+                ax.add_collection(lc)
 
-                        # Normalize and brighten colors
-                        line_colors = brighten_colors(np.clip(line_colors, 0, 1), factor=brighten_factor)
-
-                    # Create LineCollection
-                    segments_lines = np.array([line_points[i:i+2] for i in range(len(line_points)-1)])
-                    lc = LineCollection(segments_lines, colors=line_colors[:-1], linewidth=boundary_linewidth, alpha=alpha, linestyle=linestyle)
-                    ax.add_collection(lc)
                 continue
 
             # Calculate boundaries
