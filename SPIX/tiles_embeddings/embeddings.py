@@ -27,9 +27,10 @@ def generate_embeddings(
     dim_reduction: str = 'PCA',
     normalization: str = 'log_norm',
     use_counts: str = 'raw',
+    library_id : str = 'library_id',
     dimensions: int = 30,
     tensor_resolution: float = 1,
-    filter_grid: float = 0.01,
+    filter_grid: float = 1,
     filter_threshold: float = 0.995,
     nfeatures: int = 2000,
     features: list = None,
@@ -185,7 +186,10 @@ def process_counts(
     if method == 'log_norm':
         sc.pp.normalize_total(adata_proc, target_sum=1e4)
         sc.pp.log1p(adata_proc)
-        sc.pp.highly_variable_genes(adata_proc, n_top_genes=nfeatures)
+        if dim_reduction == 'Harmony':
+            sc.pp.highly_variable_genes(adata_proc, batch_key='library_id', inplace=True)
+        else:
+            sc.pp.highly_variable_genes(adata_proc, n_top_genes=nfeatures)
     elif method == 'SCT':
         raise NotImplementedError("SCTransform normalization is not implemented in this code.")
     elif method == 'TFIDF':
@@ -303,7 +307,7 @@ def embed_latent_space(
         # Perform PCA before Harmony integration
         sc.tl.pca(adata_proc, n_comps=dimensions)
         # Run Harmony integration using 'library_id' as the batch key
-        sc.external.pp.harmony_integrate(adata_proc, key='library_id')
+        sc.external.pp.harmony_integrate(adata_proc, key=library_id)
         # Retrieve the Harmony integrated embeddings; these are stored in 'X_pca_harmony'
         embeds = adata_proc.obsm['X_pca_harmony']
         embeds = MinMaxScaler().fit_transform(embeds)
