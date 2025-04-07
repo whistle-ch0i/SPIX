@@ -23,13 +23,13 @@ def perform_pseudo_bulk_analysis(
 ) -> sc.AnnData:
     """
     Perform Pseudo-Bulk Aggregation, preprocess data, and calculate Moran's I.
-
+    
     Parameters
     ----------
     adata : AnnData
         The AnnData object to analyze.
     segment_key : str, optional (default='Segment')
-        The key in `adata.obs` to use for pseudo-bulk aggregation.
+        The key in adata.obs to use for pseudo-bulk aggregation.
     min_cells : int, optional (default=1)
         Minimum number of cells required for filtering genes.
     normalize_total : bool, optional (default=True)
@@ -41,9 +41,9 @@ def perform_pseudo_bulk_analysis(
     mode : str, optional (default="moran")
         Mode for Moran's I calculation.
     neighbors_kwargs : dict, optional
-        Additional arguments to pass to `squidpy.gr.spatial_neighbors`.
+        Additional arguments to pass to squidpy.gr.spatial_neighbors.
     autocorr_kwargs : dict, optional
-        Additional arguments to pass to `squidpy.gr.spatial_autocorr`.
+        Additional arguments to pass to squidpy.gr.spatial_autocorr.
     aggregate_expression : bool, optional (default=False)
         Whether to enable aggregation of expression data (commented-out code).
     add_bulk_layer : bool, optional (default=False)
@@ -53,14 +53,14 @@ def perform_pseudo_bulk_analysis(
     perform_pca : bool, optional (default=True)
         Whether to perform PCA.
     neighbors_params : dict, optional
-        Additional arguments to pass to `scanpy.pp.neighbors`.
-
+        Additional arguments to pass to scanpy.pp.neighbors.
+    
     Returns
     -------
     new_adata : AnnData
         A new AnnData object with pseudo-bulk aggregation applied.
     superpixel_moranI : pandas.DataFrame
-        A DataFrame of genes with Moran's I values above `moranI_threshold`.
+        A DataFrame of genes with Moran's I values above moranI_threshold.
     """
 
     # Set default arguments if not provided
@@ -104,6 +104,7 @@ def perform_pseudo_bulk_analysis(
         aggregated_data = []
         for seg in unique_segments:
             idx = segment_indices[seg]
+            # mean_expr = adata_X[idx].sum(axis=0)
             mean_expr = adata_X[idx].mean(axis=0)
             if isinstance(mean_expr, np.matrix):
                 mean_expr = np.array(mean_expr).flatten()
@@ -114,6 +115,7 @@ def perform_pseudo_bulk_analysis(
         X_bulk = csr_matrix(np.vstack(aggregated_data).astype('float32'))
     else:
         # For dense matrix
+        # X_bulk = pd.DataFrame(adata_X, index=adata_index).groupby(segments, observed=True).sum().values.astype('float32')
         X_bulk = pd.DataFrame(adata_X, index=adata_index).groupby(segments, observed=True).mean().values.astype('float32')
         X_bulk = csr_matrix(X_bulk)
     print("Expression data aggregation complete.")
@@ -129,13 +131,23 @@ def perform_pseudo_bulk_analysis(
         X=X_bulk,
         var=var_bulk
     )
+    # Set the obs index to be the aggregated segments
+    new_adata.obs_names = pseudo_bulk_coords.index
 
-    # Add spatial coordinates
+    # Add spatial coordinates to obsm
     new_adata.obsm['spatial'] = pseudo_bulk_coords.values
 
     # Add 'counts' layer
     new_adata.layers['counts'] = new_adata.X.copy()
     print("New AnnData object creation complete.")
+
+    # Add library_id from original adata.obs if present
+    if 'library_id' in adata.obs.columns:
+        # Group by segment and take the first library_id for each segment.
+        library_ids = adata.obs.groupby(adata.obs[segment_key], observed=True)['library_id'].first()
+        # Ensure the index of library_ids matches the new_adata.obs_names
+        new_adata.obs['library_id'] = library_ids.loc[new_adata.obs_names]
+        print("library_id added to new_adata.obs.")
 
     # Optional: Aggregate expression data and add to layers
     if aggregate_expression or add_bulk_layer:
@@ -191,16 +203,19 @@ def perform_pseudo_bulk_analysis(
 
     # Additional preprocessing: Highly Variable Genes and PCA
     if highly_variable:
-        sc.pp.highly_variable_genes(new_adata, inplace=True)
+        if 'library_id' in adata.obs.columns:
+            sc.pp.highly_variable_genes(new_adata, batch_key='library_id', inplace=True)
+        else:
+            sc.pp.highly_variable_genes(new_adata, inplace=True)
         print("Highly Variable Genes calculation complete.")
 
     if perform_pca:
         sc.tl.pca(new_adata)
+        sc.external.pp.harmony_integrate(new_adata, key='library_id')
         print("PCA complete.")
 
-        sc.pp.neighbors(new_adata, use_rep='X_pca', **neighbors_kwargs)
+        sc.pp.neighbors(new_adata, use_rep='X_pca_harmony', **neighbors_kwargs)
         print("Neighbors computation complete.")
 
     print("Pseudo-Bulk analysis complete.")
-
     return new_adata, superpixel_moranI
