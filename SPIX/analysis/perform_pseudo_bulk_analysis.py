@@ -140,7 +140,10 @@ def perform_pseudo_bulk_analysis(
     # Add 'counts' layer
     new_adata.layers['counts'] = new_adata.X.copy()
     print("New AnnData object creation complete.")
-
+    
+    # Ensure features
+    sc.pp.filter_genes(new_adata, min_cells=0)
+    
     # Add library_id from original adata.obs if present
     if 'library_id' in adata.obs.columns:
         # Group by segment and take the first library_id for each segment.
