@@ -6,6 +6,8 @@ import numpy.typing as npt
 from anndata import AnnData
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
+from scipy.spatial import distance
+from scipy.stats import pearsonr
 from .slic_segmentation import slic_segmentation
 from ..utils.utils import create_pseudo_centroids
 
@@ -19,6 +21,7 @@ def find_hotspots(
     compactness: float = 1,
     scaling: float = 0.3,
     max_iter: int = 1000,
+    dist_method = 'cosine',
     add_name: str = 'Hotspots',
     verbose: bool = True) -> AnnData:
     #-------------------------------------------------------------------------#
@@ -35,6 +38,7 @@ def find_hotspots(
     hotspots_index = get_hotspot_index(
         gene_set,
         exclusion_zone)
+    hotspot_locs = assign_hotspot(hotspots_index, exclusion_zone)
     #-------------------------------------------------------------------------#
     # SLIC using hotspots
     # At the moment not sure how we should include the other points
@@ -61,7 +65,7 @@ def find_hotspots(
         'barcode': adata.obs.index,
         'Segment': clusters
     })
-
+    score_matrix = score_hotspots(clusters_df, adata, dist_method)
     
     tile_colors = pd.DataFrame(np.array(adata.obsm[embedding])[:, dimensions])
     tile_colors['barcode'] = adata.obs.index
@@ -77,11 +81,9 @@ def find_hotspots(
     )
     adata.obsm['X_embedding_segment'] = pseudo_centroids
     adata.obsm['X_embedding_scaled_for_segment'] = combined_data
-    
+    adata.obsm[add_name] = hotspot_locs
     adata.obs[add_name] = pd.Categorical(clusters_df['Segment'])
-    return adata
-    
-    return adata
+    return adata, score_matrix
 
 
 
@@ -106,14 +108,49 @@ def get_hotspot_index(
     gene_set : list,
     exclusion_zone : list):
     initial_index = []
-    i = 0
+    idx = 0
     while len(gene_set) > 0:
-        expr_loc = gene_set.index(max(gene_set))
+        expr_loc = gene_set[0]
         initial_index.append(expr_loc)
-        gene_set = [j for j in gene_set if j not in exclusion_zone[i]]
-        i += 1
+        gene_set = [j for j in gene_set if j not in exclusion_zone[expr_loc]]
+        idx += 1
         if len(gene_set) == 0:
             break
         else:
             continue
     return initial_index
+
+def assign_hotspot(initial_index, exclusion_zone):
+    hotspot_locs = np.zeros(len(exclusion_zone))
+    initial_index = initial_index[::-1]
+    for idx, val in enumerate(initial_index):
+        hotspot_locs[exclusion_zone[val]] = idx
+    return hotspot_locs
+
+def score_hotspots(cluster_df, adata, dist_method='cosine'):
+    hotspots_index = sorted(set(cluster_df['Segment']))
+    n = len(hotspots_index)
+
+   
+    mean_vectors = {}
+    for segment in hotspots_index:
+        barcodes = cluster_df.loc[cluster_df['Segment'] == segment, 'barcode']
+        data = adata[barcodes, :].X
+        mean_vectors[segment] = data.mean(axis=0)
+
+   
+    score_matrix = np.zeros((n, n))
+
+    
+    for i, seg1 in enumerate(hotspots_index):
+        vec1 = mean_vectors[seg1]
+        for j, seg2 in enumerate(hotspots_index):
+            vec2 = mean_vectors[seg2]
+            if dist_method == 'cosine':
+                score_matrix[i, j] = distance.cosine(vec1, vec2)
+            elif dist_method == 'pearson':
+                score_matrix[i, j] = pearsonr(vec1, vec2)[0]
+            else:
+                raise ValueError(f"Unsupported dist_method: {dist_method}")
+
+    return score_matrix
