@@ -17,6 +17,9 @@ from ..utils.utils import (
     process_single_dimension_smooth
 )
 
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
