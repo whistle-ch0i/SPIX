@@ -203,7 +203,7 @@ def perform_pseudo_bulk_analysis(
 
     # Additional preprocessing: Highly Variable Genes and PCA
     if highly_variable:
-        if 'library_id' in adata.obs.columns:
+        if 'library_id' in new_adata.obs.columns:
             sc.pp.highly_variable_genes(new_adata, batch_key='library_id', inplace=True)
         else:
             sc.pp.highly_variable_genes(new_adata, inplace=True)
@@ -211,10 +211,12 @@ def perform_pseudo_bulk_analysis(
 
     if perform_pca:
         sc.tl.pca(new_adata)
-        sc.external.pp.harmony_integrate(new_adata, key='library_id')
+        if 'library_id' in new_adata.obs.columns:
+            sc.external.pp.harmony_integrate(new_adata, key='library_id')
+            new_adata.obsm['X_pca'] = new_adata.obsm['X_pca_harmony'].copy()
         print("PCA complete.")
 
-        sc.pp.neighbors(new_adata, use_rep='X_pca_harmony', **neighbors_kwargs)
+        sc.pp.neighbors(new_adata, use_rep='X_pca', **neighbors_kwargs)
         print("Neighbors computation complete.")
 
     print("Pseudo-Bulk analysis complete.")
