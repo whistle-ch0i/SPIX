@@ -133,7 +133,6 @@ def segment_image_parameter(args):
             # X_bulk = pd.DataFrame(adata_X, index=adata_index).groupby(segments, observed=True).sum().values.astype('float32')
             X_bulk = pd.DataFrame(adata_X, index=adata_index).groupby(segments, observed=True).mean().values.astype('float32')
             X_bulk = csr_matrix(X_bulk)
-        print("Expression data aggregation complete.")
 
         # Prepare `var` DataFrame (variable annotations remain the same)
         var_bulk = pd.DataFrame(index=adata_var_index)
