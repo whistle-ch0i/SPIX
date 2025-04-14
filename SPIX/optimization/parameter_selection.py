@@ -110,30 +110,30 @@ def segment_image_parameter(args):
         pseudo_bulk_coords = pd.DataFrame(adata_obsm_coords, index=adata_index)
         pseudo_bulk_coords = pseudo_bulk_coords.groupby(segments, observed=True).mean()
 
-        # Efficiently aggregate expression data
         if issparse(adata_X):
-            # Aggregate sparse matrix by segments
-            unique_segments = pd.Series(segments.cat.categories.astype(int)).sort_values().astype(str)
+            # For sparse matrix
+            unique_segments = segments.cat.categories
             segment_indices = {seg: np.where(segments == seg)[0] for seg in unique_segments}
             aggregated_data = []
             for seg in unique_segments:
                 idx = segment_indices[seg]
-                # Compute mean for each gene
+                # mean_expr = adata_X[idx].sum(axis=0)
                 mean_expr = adata_X[idx].mean(axis=0)
                 if isinstance(mean_expr, np.matrix):
                     mean_expr = np.array(mean_expr).flatten()
                 else:
-                    mean_expr = mean_expr.A1  # Convert to 1D array if it's a matrix
+                    mean_expr = mean_expr.A1  # Convert to 1D array
                 aggregated_data.append(mean_expr)
-            # Convert to sparse matrix
+            # Convert to dense matrix, then back to sparse
             X_bulk = csr_matrix(np.vstack(aggregated_data).astype('float32'))
+            del aggregated_data
+            gc.collect()
         else:
-            # Handle dense matrices if necessary
-            pseudo_bulk_expression = adata_X.toarray()[segments.cat.codes].reshape(len(segments.cat.categories), -1)
-            X_bulk = csr_matrix(pseudo_bulk_expression.astype('float32'))
-
-        del aggregated_data
-        gc.collect()
+            # For dense matrix
+            # X_bulk = pd.DataFrame(adata_X, index=adata_index).groupby(segments, observed=True).sum().values.astype('float32')
+            X_bulk = pd.DataFrame(adata_X, index=adata_index).groupby(segments, observed=True).mean().values.astype('float32')
+            X_bulk = csr_matrix(X_bulk)
+        print("Expression data aggregation complete.")
 
         # Prepare `var` DataFrame (variable annotations remain the same)
         var_bulk = pd.DataFrame(index=adata_var_index)
