@@ -113,6 +113,8 @@ def perform_pseudo_bulk_analysis(
             aggregated_data.append(mean_expr)
         # Convert to dense matrix, then back to sparse
         X_bulk = csr_matrix(np.vstack(aggregated_data).astype('float32'))
+        del aggregated_data
+        gc.collect()
     else:
         # For dense matrix
         # X_bulk = pd.DataFrame(adata_X, index=adata_index).groupby(segments, observed=True).sum().values.astype('float32')
@@ -120,8 +122,7 @@ def perform_pseudo_bulk_analysis(
         X_bulk = csr_matrix(X_bulk)
     print("Expression data aggregation complete.")
 
-    del aggregated_data
-    gc.collect()
+
 
     # Prepare var DataFrame
     var_bulk = pd.DataFrame(index=adata_var_index)
