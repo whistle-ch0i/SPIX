@@ -248,6 +248,83 @@ def write_background_enrichment_file(
 
     return df
 
+def write_background_enrichment(
+    genes: List[str],
+    background: List[str],
+    database: str,
+    verbose: bool = True
+) -> pd.DataFrame:
+    """
+    Perform background enrichment analysis using SpeedRICHr and return the results as a DataFrame.
+    (No file export.)
+
+    Parameters
+    ----------
+    genes : List[str]
+        List of gene symbols to analyze.
+    background : List[str]
+        List of background gene symbols.
+    database : str
+        Name of the SpeedRICHr background database to use (e.g., "GO_Biological_Process_2023").
+    verbose : bool, optional
+        If True, enable detailed logging. Default is True.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame containing the enrichment results.
+    """
+    set_logger_verbosity(verbose)
+    base_url = "https://maayanlab.cloud/speedrichr"
+    description = "Sample gene set with background"
+
+    # Add gene list
+    logger.info("Adding gene list to SpeedRICHr.")
+    res = requests.post(
+        f"{base_url}/api/addList",
+        files={
+            'list': (None, '\n'.join(genes)),
+            'description': (None, description),
+        }
+    )
+    res.raise_for_status()
+    userlist_id = res.json()['userListId']
+
+    # Add background
+    logger.info("Adding background gene list to SpeedRICHr.")
+    res = requests.post(
+        f"{base_url}/api/addbackground",
+        data={'background': '\n'.join(background)}
+    )
+    res.raise_for_status()
+    background_id = res.json()['backgroundid']
+
+    # Perform background enrichment
+    logger.info("Performing background enrichment analysis.")
+    res = requests.post(
+        f"{base_url}/api/backgroundenrich",
+        data={
+            'userListId': userlist_id,
+            'backgroundid': background_id,
+            'backgroundType': database,
+        }
+    )
+    res.raise_for_status()
+    results = res.json()
+    logger.info("Background enrichment analysis completed.")
+
+    # Build DataFrame
+    df = pd.DataFrame(results)
+    df['Term'] = df[database].apply(lambda x: x[1])
+    df['P-value'] = df[database].apply(lambda x: x[2])
+    df['Genes'] = df[database].apply(lambda x: ';'.join(x[5]))
+    df['Adjusted P-value'] = df[database].apply(lambda x: x[6])
+    df.drop(columns=[database], inplace=True)
+    df.set_index('Term', inplace=False)
+
+    return df
+
+
 
 def get_enrichment_dataframe(
     genes: List[str],
@@ -326,10 +403,12 @@ def get_enrichment_dataframe(
 def generate_enrichment_results(
     gene_groups: Dict[str, List[str]],
     databases: List[str],
+    background: Optional[List[str]] = None,
     verbose: bool = True
 ) -> Dict[str, Dict[str, pd.DataFrame]]:
     """
     Perform enrichment analysis for multiple gene groups across multiple databases.
+    If a background gene list is provided, use background enrichment; otherwise, use standard enrichment.
 
     Parameters
     ----------
@@ -337,8 +416,10 @@ def generate_enrichment_results(
         Dictionary where keys are group names and values are lists of gene symbols.
     databases : List[str]
         List of database names to perform enrichment analysis.
+    background : List[str], optional
+        Background gene list for background enrichment analysis. Default is None.
     verbose : bool, optional
-        If True, enable detailed logging. Default is True.
+        If True, set logger to DEBUG level. Default is True.
 
     Returns
     -------
@@ -348,19 +429,31 @@ def generate_enrichment_results(
         and the value is the corresponding enrichment DataFrame.
     """
     set_logger_verbosity(verbose)
-    enrichment_results = {}
+    enrichment_results: Dict[str, Dict[str, pd.DataFrame]] = {}
 
-    # Perform enrichment analysis
     for group_name, genes in gene_groups.items():
         enrichment_results[group_name] = {}
         for db in databases:
-            logger.info(f"Analyzing {group_name} with database {db}...")
+            use_bg = background is not None
+            logger.info(f"Analyzing '{group_name}' with database '{db}' (background={'yes' if use_bg else 'no'}).")
             try:
-                df = get_enrichment_dataframe(genes, db, verbose=verbose)
+                if use_bg:
+                    df = write_background_enrichment(
+                        genes=genes,
+                        background=background,
+                        database=db,
+                        verbose=verbose
+                    )
+                else:
+                    df = get_enrichment_dataframe(
+                        genes=genes,
+                        database=db,
+                        verbose=verbose
+                    )
                 enrichment_results[group_name][db] = df
-                logger.info(f"Analysis completed for {group_name} with {db}.")
+                logger.info(f"Completed analysis for '{group_name}' with '{db}'.")
             except Exception as e:
-                logger.error(f"Error analyzing {group_name} with {db}: {e}")
+                logger.error(f"Error analyzing '{group_name}' with '{db}': {e}")
 
     return enrichment_results
 
@@ -420,6 +513,81 @@ def subset_enrichment_results(
     logger.info(f"Merged DataFrame created with shape: {merged_df.shape}")
 
     return merged_df
+
+def subset_enrichment_results_by_group(
+    enrichment_results: Dict[str, Dict[str, pd.DataFrame]],
+    significance_threshold: float = 0.05,
+    verbose: bool = True
+) -> pd.DataFrame:
+    """
+    Aggregate enrichment results across all databases, keeping only gene-group columns.
+    For each group, take the maximum –log10(p-value) over all databases for each term.
+
+    Parameters
+    ----------
+    enrichment_results : Dict[str, Dict[str, pd.DataFrame]]
+        Nested dict mapping each gene group to a dict of {database_name: enrichment_df}.
+    significance_threshold : float, optional
+        P-value cutoff for significance (default=0.05).
+    verbose : bool, optional
+        If True, enable logging (default=True).
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with index=Term and one column per gene group.
+        Values are max(–log10(p)) across databases if p ≤ threshold, else 0.
+    """
+    # Optional logging setup (assumes set_logger_verbosity and logger exist)
+    if verbose:
+        set_logger_verbosity(True)
+        logger.info(f"Aggregating enrichment across all DBs with p ≤ {significance_threshold}")
+
+    merged_df = pd.DataFrame()
+
+    # Iterate over each gene group
+    for group_name, db_dict in enrichment_results.items():
+        # Collect series of –log10(p) for each DB
+        mlogp_series_list = []
+
+        for db_name, df in db_dict.items():
+            # work on a copy to avoid side-effects
+            tmp = df.copy()
+
+            # flag significant terms
+            tmp['Significant'] = tmp['P-value'] <= significance_threshold
+            # compute –log10(p-value)
+            tmp['mlogP'] = -np.log10(tmp['P-value'])
+            # set non-significant to NaN
+            tmp.loc[~tmp['Significant'], 'mlogP'] = np.nan
+
+            # extract Series indexed by Term
+            s = tmp.set_index('Term')['mlogP']
+            mlogp_series_list.append(s)
+
+        if not mlogp_series_list:
+            # skip if no DB results for this group
+            continue
+
+        # combine all DB series and take the max per term
+        combined = pd.concat(mlogp_series_list, axis=1)
+        max_ser = combined.max(axis=1)
+        max_ser.name = group_name
+
+        # merge into the overall DataFrame
+        if merged_df.empty:
+            merged_df = max_ser.to_frame()
+        else:
+            merged_df = merged_df.join(max_ser, how='outer')
+
+    # replace NaN (non-significant or missing) with 0
+    merged_df = merged_df.fillna(0)
+
+    if verbose:
+        logger.info(f"Final aggregated DataFrame shape: {merged_df.shape}")
+
+    return merged_df
+
 
 def create_enrichment_clustermap(
     heatmap_df: pd.DataFrame,
