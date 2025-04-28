@@ -10,6 +10,8 @@ from scipy.spatial import distance
 from scipy.stats import pearsonr
 from .slic_segmentation import slic_segmentation
 from ..utils.utils import create_pseudo_centroids
+from scipy.cluster.hierarchy import dendrogram, linkage, fcluster, leaves_list
+from scipy.spatial.distance import squareform
 
 
 def find_hotspots(
@@ -65,7 +67,7 @@ def find_hotspots(
         'barcode': adata.obs.index,
         'Segment': clusters
     })
-    score_matrix = score_hotspots(clusters_df, adata, dist_method)
+    score_matrix = score_hotspots(clusters_df, adata)
     
     tile_colors = pd.DataFrame(np.array(adata.obsm[embedding])[:, dimensions])
     tile_colors['barcode'] = adata.obs.index
@@ -81,7 +83,7 @@ def find_hotspots(
     )
     adata.obsm['X_embedding_segment'] = pseudo_centroids
     adata.obsm['X_embedding_scaled_for_segment'] = combined_data
-    adata.obsm[add_name] = hotspot_locs
+    adata.obs[f'{add_name}_locations'] = hotspot_locs
     adata.obs[add_name] = pd.Categorical(clusters_df['Segment'])
     return adata, score_matrix
 
@@ -127,30 +129,43 @@ def assign_hotspot(initial_index, exclusion_zone):
         hotspot_locs[exclusion_zone[val]] = idx
     return hotspot_locs
 
-def score_hotspots(cluster_df, adata, dist_method='cosine'):
+def score_hotspots(cluster_df, adata):
     hotspots_index = sorted(set(cluster_df['Segment']))
-    n = len(hotspots_index)
-
-   
-    mean_vectors = {}
+    n_hotspots = len(hotspots_index)
+    n_genes = adata.X.shape[1] # might need to change this for variable genes
+    mean_vectors = np.zeros((n_hotspots,n_genes))
     for segment in hotspots_index:
         barcodes = cluster_df.loc[cluster_df['Segment'] == segment, 'barcode']
         data = adata[barcodes, :].X
         mean_vectors[segment] = data.mean(axis=0)
 
-   
-    score_matrix = np.zeros((n, n))
-
-    
-    for i, seg1 in enumerate(hotspots_index):
-        vec1 = mean_vectors[seg1]
-        for j, seg2 in enumerate(hotspots_index):
-            vec2 = mean_vectors[seg2]
-            if dist_method == 'cosine':
-                score_matrix[i, j] = distance.cosine(vec1, vec2)
-            elif dist_method == 'pearson':
-                score_matrix[i, j] = pearsonr(vec1, vec2)[0]
-            else:
-                raise ValueError(f"Unsupported dist_method: {dist_method}")
-
+    # For now we will use this method.
+    score_matrix = np.corrcoef(mean_vectors)
     return score_matrix
+
+
+def group_hotspots(score_matrix, threshold = 0.7):
+    condensed_score = squareform(score_matrix, checks = False)
+    grouped = linkage(condensed_score, 'ward')
+    cluster_labels = fcluster(grouped, 0.3, criterion='distance')
+    return 0
+
+import numpy as np
+import networkx as nx
+
+def group_by_correlation(corr_matrix, threshold):
+    # Create graph
+    G = nx.Graph()
+    n = corr_matrix.shape[0]
+    G.add_nodes_from(range(n))
+    
+    # Add edges for correlations above threshold (excluding diagonal)
+    for i in range(n):
+        for j in range(i+1, n):
+            if corr_matrix[i, j] >= threshold:
+                G.add_edge(i, j)
+    
+    # Get connected components (groups)
+    groups = [list(comp) for comp in nx.connected_components(G)]
+    
+    return groups
