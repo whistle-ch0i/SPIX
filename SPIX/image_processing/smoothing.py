@@ -1,217 +1,282 @@
 import numpy as np
-import pandas as pd
-import scanpy as sc
-from anndata import AnnData
-from scipy.ndimage import gaussian_filter
-from joblib import Parallel, delayed
-from tqdm_joblib import tqdm_joblib
+from scipy.spatial import cKDTree
+from scipy.sparse import csr_matrix, diags
 from tqdm import tqdm
 import logging
-from sklearn.preprocessing import MinMaxScaler
-import cv2
-import gc
-from typing import List
 
-from ..utils.utils import (
-    process_single_dimension_fill_nan,
-    process_single_dimension_smooth
-)
-
-# Configure logging
+# Logging setup (can be configured to desired level and format)
+# By default, it prints INFO level messages.
+# Other levels include WARNING, ERROR, CRITICAL, etc.
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-
 def smooth_image(
-    adata: AnnData,
-    dimensions: List[int] = [0, 1, 2],
-    embedding: str = 'last',
-    method: List[str] = ['iso'],
-    iter: int = 1,
-    sigma: float = 1.0,
-    box: int = 20,
-    threshold: float = 0.0,
-    neuman: bool = True,
-    gaussian: bool = True,
-    na_rm: bool = False,
-    across_levels: str = 'min',
-    output_embedding: str = 'X_embedding_smooth',
-    n_jobs: int = 1,
-    verbose: bool = True,
-    multi_method: str = 'threading',  # 'loky', 'multiprocessing', 'threading'
-    max_image_size: int = 10000 
-) -> AnnData:
+    adata,
+    methods           = ['bilateral'],        # list of methods in order: 'knn', 'graph', 'bilateral'
+    embedding         = 'X_embedding',  # key for raw embeddings in adata.obsm
+    embedding_dims    = None,         # list of embedding dimensions to use (None for all)
+    output            = 'X_embedding_smooth', # key for smoothed embeddings in adata.obsm
+    # K-NN smoothing parameters
+    knn_k             = 35,           # Number of neighbors for KNN
+    knn_sigma         = 2.0,          # Kernel width for KNN spatial distance
+    knn_chunk         = 10_000,       # Chunk size for KNN neighbor search (to save memory)
+    knn_n_jobs        = -1,           # Number of jobs for KNN neighbor search (-1 means all)
+    # Graph-diffusion smoothing parameters
+    graph_k           = 30,           # Number of neighbors for graph construction
+    graph_t           = 2,            # Number of diffusion steps
+    graph_n_jobs      = -1,           # Number of jobs for graph neighbor search (-1 means all)
+    # Bilateral filtering parameters
+    bilateral_k       = 30,           # Number of neighbors for bilateral filtering
+    bilateral_sigma_r = 0.3,          # Kernel width for embedding space distance
+    bilateral_t       = 3,            # Number of diffusion steps
+    bilateral_n_jobs  = -1            # Number of jobs for bilateral neighbor search (-1 means all)
+):
     """
-    Apply iterative smoothing to embeddings in the AnnData object and store the results in a new embedding.
+    Sequentially apply one or more smoothing methods to an embedding and store
+    the final smoothed embedding in adata.obsm[output].
+
+    Smoothing methods:
+    - 'knn': K-Nearest Neighbors weighted averaging based on spatial distance.
+    - 'graph': Graph diffusion based on spatial distance-weighted graph.
+    - 'bilateral': Graph diffusion based on both spatial and embedding distance-weighted graph (bilateral filter).
+
+    Args:
+        adata (anndata.AnnData): An AnnData object containing spatial coordinates
+                                 in adata.uns['tiles'] and embeddings in adata.obsm.
+        methods (list): A list of smoothing methods to apply in sequence.
+                        Supported methods: 'knn', 'graph', 'bilateral'.
+        embedding (str): The key in adata.obsm where the raw embedding is stored.
+        embedding_dims (list or None): A list of integer indices specifying which
+                                       dimensions of the embedding to use. If None, uses all dimensions.
+        output (str): The key in adata.obsm where the smoothed embedding will be stored.
+        knn_k (int): Number of neighbors for KNN smoothing.
+        knn_sigma (float): Spatial kernel width for KNN smoothing.
+        knn_chunk (int): Chunk size for KNN neighbor queries.
+        knn_n_jobs (int): Number of jobs for KNN neighbor queries.
+        graph_k (int): Number of neighbors for graph construction (graph diffusion).
+        graph_t (int): Number of diffusion steps (graph diffusion).
+        graph_n_jobs (int): Number of jobs for graph neighbor queries.
+        bilateral_k (int): Number of neighbors for bilateral filtering.
+        bilateral_sigma_r (float): Embedding kernel width for bilateral filtering.
+        bilateral_t (int): Number of diffusion steps (bilateral filtering).
+        bilateral_n_jobs (int): Number of jobs for bilateral neighbor queries.
+
+    Returns:
+        anndata.AnnData: The AnnData object with the smoothed embedding added
+                         to adata.obsm[output].
     """
-    if verbose:
-        logging.info("Starting smooth_image...")
+    logging.info("Starting embedding smoothing process.")
+    logging.info(f"Input embedding key: '{embedding}'")
+    logging.info(f"Output embedding key: '{output}'")
+    logging.info(f"Smoothing methods to apply (in order): {methods}")
 
-    # Determine which embedding to use
-    if embedding == 'last':
-        embedding_key = list(adata.obsm.keys())[-1]
-    else:
-        embedding_key = embedding
-        if embedding_key not in adata.obsm:
-            raise ValueError(f"Embedding '{embedding_key}' not found in adata.obsm.")
+    # 1) Data Preparation: Extract only tiles with origin == 1 and load coordinates and embedding.
+    #    adata.uns['tiles'] contains information for all tiles; filter by the 'origin' column.
+    #    Tiles with origin == 1 are the original tiles used for analysis.
+    try:
+        tiles = adata.uns['tiles'][adata.uns['tiles']['origin'] == 1]
+        coords = tiles[['x','y']].values.astype('float32')
+        logging.info(f"Extracted coordinates for {len(coords)} tiles with origin=1.")
+    except KeyError as e:
+        logging.error(f"Missing expected key in adata.uns: {e}")
+        raise
+    except Exception as e:
+        logging.error(f"Error extracting coordinates: {e}")
+        raise
 
-    embeddings = adata.obsm[embedding_key]
-    if verbose:
-        logging.info(f"Using embedding '{embedding_key}' with shape {embeddings.shape}.")
+    # 2) Embedding Initialization: Use specified embedding dimensions or all dimensions.
+    #    `E` will store the embedding data used in the current smoothing step.
+    try:
+        raw_embedding = adata.obsm[embedding]
+        if embedding_dims is not None:
+            # Use only specified dimensions
+            E = raw_embedding[:, embedding_dims].astype('float32')
+            logging.info(f"Using specified embedding dimensions: {embedding_dims}")
+        else:
+             # Use all dimensions
+             E = raw_embedding.astype('float32')
+             logging.info("Using all embedding dimensions.")
 
-    # Access tiles
-    if 'tiles' not in adata.uns:
-        raise ValueError("Tiles not found in adata.uns['tiles'].")
+        n, dim = E.shape
+        logging.info(f"Initial embedding shape: ({n}, {dim})")
+        if n == 0 or dim == 0:
+             logging.error("Embedding data is empty.")
+             raise ValueError("Embedding data is empty.")
 
-    tiles = adata.uns['tiles'][['x', 'y', 'barcode']]
-    if not isinstance(tiles, pd.DataFrame):
-        raise ValueError("Tiles should be a pandas DataFrame.")
+    except KeyError as e:
+        logging.error(f"Input embedding key '{embedding}' not found in adata.obsm.")
+        raise
+    except Exception as e:
+        logging.error(f"Error loading initial embedding: {e}")
+        raise
 
-    required_columns = {'x', 'y', 'barcode'}
-    if not required_columns.issubset(tiles.columns):
-        raise ValueError(f"Tiles DataFrame must contain columns: {required_columns}")
 
-    adata_obs_names = adata.obs_names
+    # Apply each requested smoothing method in sequence
+    for method in methods:
+        logging.info(f"--- Applying smoothing method: '{method}' ---")
 
-    # Precompute shifts and image size
-    min_x = tiles['x'].min()
-    min_y = tiles['y'].min()
-    shift_x = -min_x
-    shift_y = -min_y
+        if method == 'knn':
+            # KNN smoothing: Weighted averaging based on spatial proximity
+            logging.info(f"KNN parameters: k={knn_k}, sigma={knn_sigma}, chunk={knn_chunk}, n_jobs={knn_n_jobs}")
+            # Build KD-tree for spatial coordinates (for fast nearest neighbor search)
+            tree = cKDTree(coords, balanced_tree=True, compact_nodes=True)
+            logging.info("Built cKDTree for spatial coordinates.")
 
-    if verbose:
-        logging.info(f"Shifting coordinates by ({shift_x}, {shift_y}) to start from 0.")
+            new_E = np.empty_like(E) # Initialize array to store smoothing results
 
-    # Shift coordinates to start from 0
-    tiles_shifted = tiles.copy()
-    tiles_shifted['x'] += shift_x
-    tiles_shifted['y'] += shift_y
-    del tiles
-    gc.collect()
-    max_x = tiles_shifted['x'].max()
-    max_y = tiles_shifted['y'].max()
-    image_width = int(np.ceil(max_x)) + 1
-    image_height = int(np.ceil(max_y)) + 1
+            # Process data in chunks to reduce memory usage
+            logging.info(f"Processing in chunks of size {knn_chunk}...")
+            for start in tqdm(range(0, n, knn_chunk), desc=f'KNN smooth (k={knn_k}, σ={knn_sigma})'):
+                end = min(start + knn_chunk, n)
+                # Query k nearest neighbors for the current chunk
+                dists, idx = tree.query(coords[start:end], k=knn_k, workers=knn_n_jobs)
+                # Calculate weights based on spatial distance (Gaussian kernel)
+                w = np.exp(- (dists**2) / (2 * knn_sigma**2))
+                # Normalize weights (so they sum to 1)
+                w_sum = w.sum(axis=1, keepdims=True)
+                # Prevent division by zero by replacing very small sums
+                w_sum[w_sum < 1e-12] = 1e-12
+                w /= w_sum
 
-    if verbose:
-        logging.info(f"Image size: width={image_width}, height={image_height}")
+                # Calculate weighted average: The new embedding for each point is the weighted average of neighbor embeddings
+                # w[:,:,None] is shaped (chunk_size, k, 1) for broadcasting
+                # E[idx] is shaped (chunk_size, k, embedding_dim)
+                # (w[:,:,None] * E[idx]) is (chunk_size, k, embedding_dim)
+                # .sum(axis=1) sums along the k dimension, resulting in (chunk_size, embedding_dim)
+                new_E[start:end] = (w[:,:,None] * E[idx]).sum(axis=1)
 
-    if image_width > max_image_size or image_height > max_image_size:
-        logging.warning(f"Image size ({image_width}x{image_height}) exceeds the maximum allowed size of {max_image_size}x{max_image_size}. Consider downscaling or processing in smaller tiles.")
+            E = new_E # Update current embedding with smoothed result
+            logging.info("KNN smoothing completed.")
 
-    # Parallel processing of dimensions with progress bar
-    if verbose:
-        logging.info("Starting parallel processing of dimensions...")
+        elif method == 'graph':
+            # Graph Diffusion: Diffuse embedding information over a spatial graph
+            logging.info(f"Graph diffusion parameters: k={graph_k}, t={graph_t}, n_jobs={graph_n_jobs}")
+            # Build KD-tree for spatial coordinates
+            tree = cKDTree(coords, balanced_tree=True)
+            # Query k+1 neighbors including self, then drop self (distance 0)
+            dists, neigh = tree.query(coords, k=graph_k+1, workers=graph_n_jobs)
+            dists = dists[:,1:]; neigh = neigh[:,1:] # Drop self
+            logging.info(f"Queried {graph_k} spatial neighbors for graph construction.")
 
-    # Initialize the dictionary to store filled images
-    if 'na_filled_images_dict' not in adata.uns:
-        args_list_fill_nan = []
-        for dim in dimensions:
-            if dim >= embeddings.shape[1]:
-                raise ValueError(f"Dimension {dim} is out of bounds for embeddings with shape {embeddings.shape}.")
+            # Calculate local scale (sigma_loc) per point
+            # Typically uses the median distance to neighbors
+            sigma_loc = np.median(dists, axis=1) + 1e-9 # Prevent zeros
+            logging.info("Calculated local spatial scale (sigma_loc).")
 
-            embeddings_dim = embeddings[:, dim]
-            args = (
-                dim,
-                embeddings_dim,
-                adata_obs_names,
-                tiles_shifted,
-                method,
-                iter,
-                sigma,
-                box,
-                threshold,
-                neuman,
-                na_rm,
-                across_levels,
-                image_height,
-                image_width,
-                verbose
-            )
-            args_list_fill_nan.append(args)
+            # Build spatial distance-based weight graph (W)
+            logging.info("Building spatial affinity matrix W...")
+            rows, cols, data = [], [], []
+            for i in tqdm(range(n), desc=f'Graph W (k={graph_k}, σ_loc)'):
+                si = sigma_loc[i]
+                dij = dists[i] # Distance to neighbors
+                # Calculate weights using Gaussian kernel
+                wij = np.exp(- (dij**2) / (2 * si*si))
+                rows.append(np.full(graph_k, i, dtype=int))
+                cols.append(neigh[i]) # Indices of neighbors
+                data.append(wij)
 
-        with tqdm_joblib(tqdm(total=len(args_list_fill_nan), desc="Filling NaNs")):
-            results_fill_nan = Parallel(n_jobs=n_jobs, backend=multi_method)(
-                delayed(process_single_dimension_fill_nan)(args) for args in args_list_fill_nan
-            )
+            # Convert to sparse matrix format
+            rows = np.concatenate(rows); cols = np.concatenate(cols); data = np.concatenate(data)
+            W = csr_matrix((data, (rows, cols)), shape=(n,n))
+            logging.info(f"Built sparse affinity matrix W with {W.nnz} non-zero elements.")
 
-        na_filled_images_dict = {}
-        for dim, image_filled in results_fill_nan:
-            if dim == -1:
-                continue  # Skip invalid results
-            na_filled_images_dict[dim] = image_filled
+            # Symmetrize graph (remove directionality)
+            W = 0.5*(W + W.T)
+            logging.info("Symmetrized W.")
 
-        adata.uns['na_filled_images_dict'] = na_filled_images_dict
-        del results_fill_nan
-        gc.collect()
+            # Calculate transition matrix (P): P = D^-1 * W (row-normalized)
+            invdeg = 1.0/(W.sum(1).A1 + 1e-12) # Calculate inverse degree (prevent zeros)
+            P = diags(invdeg).dot(W)
+            logging.info("Computed transition matrix P (row-normalized W).")
 
-    # Now proceed to smoothing
-    args_list_smooth = []
-    for dim in dimensions:
-        if dim >= embeddings.shape[1]:
-            raise ValueError(f"Dimension {dim} is out of bounds for embeddings with shape {embeddings.shape}.")
-        image_filled = adata.uns['na_filled_images_dict'][dim]
-        args = (
-            dim,
-            tiles_shifted,
-            method,
-            iter,
-            sigma,
-            box,
-            threshold,
-            neuman,
-            across_levels,
-            verbose,
-            image_filled  # **Pass the filled image as part of the arguments**
-        )
-        args_list_smooth.append(args)
+            # Apply graph diffusion
+            logging.info(f"Performing graph diffusion for {graph_t} steps...")
+            new_E = E.copy() # Diffusion is performed by repeatedly multiplying the current embedding by P
+            for step in range(graph_t):
+                 # new_E = P * new_E (matrix multiplication)
+                new_E = P.dot(new_E)
+                logging.debug(f"Graph diffusion step {step+1}/{graph_t} completed.") # Detailed logging
+            E = new_E # Update current embedding with diffused result
+            logging.info("Graph diffusion completed.")
 
-    with tqdm_joblib(tqdm(total=len(args_list_smooth), desc="Smoothing dimensions")):
-        results_smooth = Parallel(n_jobs=n_jobs, backend=multi_method)(
-            delayed(process_single_dimension_smooth)(args) for args in args_list_smooth
-        )
+        elif method == 'bilateral':
+            # Bilateral Filtering: Weighted graph diffusion considering both spatial and embedding distance
+            logging.info(f"Bilateral parameters: k={bilateral_k}, sigma_r={bilateral_sigma_r}, t={bilateral_t}, n_jobs={bilateral_n_jobs}")
+            # Build KD-tree for spatial coordinates
+            tree = cKDTree(coords, balanced_tree=True)
+            # Query k+1 neighbors including self
+            dists, idx = tree.query(coords, k=bilateral_k+1, workers=bilateral_n_jobs)
+            # dists: (n, k+1) - spatial distance from each point to its neighbors
+            # idx:   (n, k+1) - indices of the k+1 neighbors for each point
+            logging.info(f"Queried {bilateral_k+1} spatial neighbors for bilateral graph construction.")
 
-    # Initialize a DataFrame to hold all smoothed embeddings
-    smoothed_df = pd.DataFrame(index=adata.obs_names)
+            # Calculate spatial distance scale (sigma_s) (using median distance to neighbors excluding self)
+            sigma_s = np.median(dists[:,1:], axis=1) + 1e-9 # Prevent zeros
+            logging.info("Calculated spatial scale (sigma_s).")
 
-    smoothed_images_dict = {}
+            # Build weight graph (W) considering both spatial and embedding distance
+            logging.info("Building bilateral affinity matrix W...")
+            rows, cols, vals = [], [], []
+            for i in tqdm(range(n), desc=f'Bilateral W (k={bilateral_k}, σ_r={bilateral_sigma_r})'):
+                si = sigma_s[i]       # Spatial scale for the current point
+                neigh = idx[i]        # Indices of neighbors for the current point (including self)
+                sd = dists[i]         # Spatial distance from current point to neighbors (including self)
 
-    # Iterate through results and assign to smoothed_df and adata.uns
-    for result in results_smooth:
-        dim, smoothed_barcode_grouped, combined_image = result
+                # Calculate distance between the current point's embedding E[i] and neighbor embeddings E[neigh]
+                # E[neigh] is shape (k+1, dim)
+                # E[i] is shape (dim,). E[i] - E[neigh] broadcasts to (k+1, dim)
+                # np.linalg.norm(..., axis=1) calculates the L2 norm for each row (per neighbor)
+                ed = np.linalg.norm(E[i] - E[neigh], axis=1) # Embedding space distance
 
-        if dim == -1:
-            continue  # Skip invalid results
+                # Calculate weights: exp(-(spatial_dist^2)/(2*sigma_s^2) - (embedding_dist^2)/(2*sigma_r^2))
+                w  = np.exp(- sd**2/(2*si*si) - ed**2/(2*bilateral_sigma_r**2))
 
-        smoothed_images_dict[dim] = combined_image
+                rows.append(np.full(bilateral_k+1, i, dtype=int))
+                cols.append(neigh)
+                vals.append(w)
 
-        # Ensure the order matches adata.obs_names
-        try:
-            smoothed_barcode_grouped = smoothed_barcode_grouped.set_index('barcode').loc[adata.obs_names].reset_index()
-        except KeyError as ke:
-            logging.error(f"KeyError for dimension {dim}: {ke}")
-            continue  # Skip this dimension if barcode mapping fails
+            # Convert to sparse matrix format
+            rows = np.concatenate(rows); cols = np.concatenate(cols); vals = np.concatenate(vals)
+            W = csr_matrix((vals, (rows, cols)), shape=(n,n))
+            logging.info(f"Built sparse bilateral affinity matrix W with {W.nnz} non-zero elements.")
 
-        # Assign to the DataFrame
-        smoothed_df.loc[:, f"dim_{dim}"] = smoothed_barcode_grouped['smoothed_embed'].values
+            # Symmetrize W
+            W = 0.5*(W + W.T)
+            logging.info("Symmetrized W.")
 
-    adata.uns['smoothed_images_dict'] = smoothed_images_dict
-    del results_smooth
-    gc.collect()
+            # Calculate transition matrix (P)
+            invdeg = 1.0/(W.sum(1).A1 + 1e-12) # Calculate inverse degree (prevent zeros)
+            P = diags(invdeg).dot(W)
+            logging.info("Computed transition matrix P (row-normalized W).")
 
-    # Perform Min-Max Scaling using scikit-learn's MinMaxScaler
-    if verbose:
-        logging.info("Applying Min-Max scaling to the smoothed embeddings.")
+            # Apply diffusion
+            logging.info(f"Performing bilateral diffusion for {bilateral_t} steps...")
+            new_E = E.copy()
+            for step in range(bilateral_t):
+                new_E = P.dot(new_E)
+                logging.debug(f"Bilateral diffusion step {step+1}/{bilateral_t} completed.") # Detailed logging
+            E = new_E # Update current embedding with diffused result
+            logging.info("Bilateral diffusion completed.")
 
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    smoothed_scaled = scaler.fit_transform(smoothed_df)
+        else:
+            logging.error(f"Unknown smoothing method specified: '{method}'")
+            raise ValueError(f"Unknown method '{method}'. Supported methods are 'knn', 'graph', 'bilateral'.")
 
-    # Assign the scaled smoothed embeddings to the new embedding key
-    adata.obsm[output_embedding] = smoothed_scaled
+        # Apply min-max scaling after each smoothing step
+        # Prevents embedding values from diverging or going out of a certain range
+        logging.info("Applying min-max scaling to current embedding E...")
+        mn, mx = E.min(axis=0), E.max(axis=0)
+        # Add small value to denominator to prevent division by zero
+        denominator = (mx - mn)
+        denominator[denominator < 1e-12] = 1e-12 # Replace with small value to prevent division by zero
+        E = (E - mn) / denominator
+        # Check if values are between 0 and 1 after scaling (for debugging)
+        # logging.debug(f"Min after scaling: {E.min()}, Max after scaling: {E.max()}")
+        logging.info("Min-max scaling completed.")
 
-    if verbose:
-        logging.info(f"Smoothed embeddings stored in adata.obsm['{output_embedding}'].")
 
-    if verbose:
-        logging.info("Smoothing completed and embeddings updated in AnnData object.")
+    # Store the final smoothed embedding result in adata.obsm
+    adata.obsm[output] = E
+    logging.info(f"Final smoothed embedding stored in adata.obsm['{output}'] with shape {E.shape}.")
 
+    logging.info("Embedding smoothing process finished successfully.")
     return adata
