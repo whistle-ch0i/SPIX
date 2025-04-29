@@ -12,6 +12,7 @@ def slic_segmentation(
     compactness: float = 1.0,
     scaling: float = 0.3,
     index_selection: Optional[Union[str, list]] = None,
+    weights: Optional[Union[None, np.ndarray]] = None,
     max_iter: int = 1000,
     verbose: bool = True
 ) -> np.ndarray:
@@ -88,7 +89,10 @@ def slic_segmentation(
     num_cores = multiprocessing.cpu_count()
     num_jobs = min(16, num_cores)  # Adjust based on system capacity
     with parallel_backend("threading", n_jobs=num_jobs):
-        kmeans.fit(combined_data)
+        if weights is None:
+            kmeans.fit(combined_data)
+        else:
+            kmeans.fit(combined_data, sample_weight = weights)
     # kmeans.fit(combined_data)
     clusters = kmeans.labels_
     if verbose:

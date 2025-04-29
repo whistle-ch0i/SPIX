@@ -10,6 +10,7 @@ from shapely.validation import explain_validity
 from scipy.spatial import ConvexHull, KDTree
 import alphashape
 import logging
+import seaborn as sns
 
 # Import helper functions from utils.py
 from ..utils.utils import (
@@ -747,3 +748,4 @@ def image_plot_with_spatial_image(
     # Show plot
     plt.show()
     # Do not return plot object to avoid auto display
+
