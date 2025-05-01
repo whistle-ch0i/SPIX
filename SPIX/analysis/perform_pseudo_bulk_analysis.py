@@ -41,7 +41,7 @@ def perform_pseudo_bulk_analysis(
     sc_neighbors_params: Optional[Dict[str, Any]] = None
 ) -> Tuple[sc.AnnData, pd.DataFrame]:
     """
-    Perform Pseudo-Bulk Aggregation (by mean), preprocess data,
+    Perform Pseudo-Bulk Aggregation (by sum), preprocess data,
     calculate Moran's I on the aggregated data, and optionally
     add aggregated data back to the original object. Includes optional
     batch correction (HVG, Harmony) on the pseudo-bulk data.
@@ -63,7 +63,7 @@ def perform_pseudo_bulk_analysis(
         batch correction steps.
     min_genes_in_segment : int, optional (default=1)
         Minimum number of segments a gene must be detected in (count > 0)
-        in the pseudo-bulk mean matrix before normalization) to be retained
+        in the pseudo-bulk sum matrix before normalization) to be retained
         in the pseudo-bulk AnnData object (`new_adata`).
     normalize_total : bool, optional (default=True)
         Whether to normalize the total counts (sum to 1e4) in the pseudo-bulk data
@@ -82,12 +82,12 @@ def perform_pseudo_bulk_analysis(
     sq_autocorr_kwargs : dict, optional
         Additional arguments to pass to `squidpy.gr.spatial_autocorr`.
     add_bulked_layer_to_original_adata : bool, optional (default=False)
-        If True, calculate the mean expression for each gene within each segment
-        and add this segment-level mean expression back to the *original* `adata`
+        If True, calculate the sum expression for each gene within each segment
+        and add this segment-level sum expression back to the *original* `adata`
         object as a layer named `'bulked'`. Each cell in the original `adata`
-        will get the mean expression of the segment it belongs to.
+        will get the sum expression of the segment it belongs to.
         This step is performed *after* aggregation but *before* normalization/log1p
-        of the pseudo-bulk data, using the mean values.
+        of the pseudo-bulk data, using the sum values.
     highly_variable : bool, optional (default=True)
         Whether to calculate Highly Variable Genes on the pseudo-bulk data (`new_adata`).
         Uses `new_adata.X` (normalized/log1p if applied). If `batch_key` is provided,
@@ -171,8 +171,8 @@ def perform_pseudo_bulk_analysis(
     del pseudo_bulk_coords_df
     gc.collect() # Clean up temporary DataFrame
 
-    # Aggregate expression data (Mean)
-    _logger.info("Aggregating expression data (mean)...")
+    # Aggregate expression data (sum)
+    _logger.info("Aggregating expression data (sum)...")
     # Use a more memory-efficient approach for sparse matrices
     if issparse(adata_X):
         _logger.info("Input data is sparse. Using sparse-aware aggregation.")
@@ -204,22 +204,22 @@ def perform_pseudo_bulk_analysis(
         indicator_matrix_csc = indicator_matrix.tocsc()
         X_bulk_sum = indicator_matrix_csc.T @ adata_X # Result is (bulked_segments x genes) sparse matrix
 
-        # Calculate mean by dividing by cell counts per segment
-        # Get counts per segment based on the original_to_bulked_row_indices for valid cells
-        counts_per_segment = np.bincount(original_to_bulked_row_indices[valid_cell_mask], minlength=num_bulked_segments)
-        counts_col_vector = counts_per_segment.reshape(-1, 1)
+        # # Calculate mean by dividing by cell counts per segment
+        # # Get counts per segment based on the original_to_bulked_row_indices for valid cells
+        # counts_per_segment = np.bincount(original_to_bulked_row_indices[valid_cell_mask], minlength=num_bulked_segments)
+        # counts_col_vector = counts_per_segment.reshape(-1, 1)
 
-        # Avoid division by zero for segments with 0 cells (shouldn't happen with observed=True and valid_mask but safer)
-        safe_counts = np.maximum(counts_col_vector, 1)
+        # # Avoid division by zero for segments with 0 cells (shouldn't happen with observed=True and valid_mask but safer)
+        # safe_counts = np.maximum(counts_col_vector, 1)
 
-        # Element-wise division using sparse matrix multiplication (identity matrix with inverse counts)
-        # Result = Diag(1/counts) @ X_bulk_sum
-        inv_counts_diag = csr_matrix((1.0 / safe_counts.flatten(), (np.arange(num_bulked_segments), np.arange(num_bulked_segments))), shape=(num_bulked_segments, num_bulked_segments))
-        X_bulk_mean = inv_counts_diag @ X_bulk_sum # Result is (bulked_segments x genes) sparse matrix
+        # # Element-wise division using sparse matrix multiplication (identity matrix with inverse counts)
+        # # Result = Diag(1/counts) @ X_bulk_sum
+        # inv_counts_diag = csr_matrix((1.0 / safe_counts.flatten(), (np.arange(num_bulked_segments), np.arange(num_bulked_segments))), shape=(num_bulked_segments, num_bulked_segments))
+        # X_bulk_mean = inv_counts_diag @ X_bulk_sum # Result is (bulked_segments x genes) sparse matrix
 
-        X_bulk = csr_matrix(X_bulk_mean) # Ensure final format is CSR
+        X_bulk = csr_matrix(X_bulk_sum) # Ensure final format is CSR
 
-        del indicator_matrix, indicator_matrix_csc, X_bulk_sum, X_bulk_mean, counts_per_segment, counts_col_vector, safe_counts, inv_counts_diag, original_to_bulked_row_indices, segments_cat_ordered, valid_cell_mask
+        del indicator_matrix, indicator_matrix_csc, X_bulk_sum, counts_per_segment, counts_col_vector, safe_counts, inv_counts_diag, original_to_bulked_row_indices, segments_cat_ordered, valid_cell_mask
         gc.collect()
 
     else:
