@@ -219,7 +219,7 @@ def perform_pseudo_bulk_analysis(
 
         X_bulk = csr_matrix(X_bulk_sum) # Ensure final format is CSR
 
-        del indicator_matrix, indicator_matrix_csc, X_bulk_sum, counts_per_segment, counts_col_vector, safe_counts, inv_counts_diag, original_to_bulked_row_indices, segments_cat_ordered, valid_cell_mask
+        del indicator_matrix, indicator_matrix_csc, X_bulk_sum, original_to_bulked_row_indices, segments_cat_ordered, valid_cell_mask
         gc.collect()
 
     else:
