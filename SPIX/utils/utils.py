@@ -10,9 +10,11 @@ from scipy.spatial import Voronoi
 from shapely.geometry import MultiPoint, Polygon, LineString, MultiPolygon, GeometryCollection
 from shapely.ops import polygonize, unary_union
 from shapely.validation import explain_validity
+from shapely.vectorized import contains as shapely_contains
+from shapely.geometry import Polygon
 from collections import Counter
 from tqdm import tqdm
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import logging
 import itertools
 from sklearn.decomposition import PCA
@@ -28,9 +30,110 @@ from typing import Tuple, List, Optional
 from joblib import Parallel, delayed
 from tqdm_joblib import tqdm_joblib
 
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+_GLOBAL_VOR: Voronoi = None
+_GLOBAL_COORDS_VALUES: np.ndarray = None
+_GLOBAL_COORDS_INDEX: List = None
+
+def _init_filter_worker(vor: Voronoi, coords_values: np.ndarray, coords_index: List):
+    """
+    Worker initializer: store shared Voronoi and coordinate data in globals.
+    """
+    global _GLOBAL_VOR, _GLOBAL_COORDS_VALUES, _GLOBAL_COORDS_INDEX
+    _GLOBAL_VOR = vor
+    _GLOBAL_COORDS_VALUES = coords_values
+    _GLOBAL_COORDS_INDEX = coords_index
+
+def _compute_region_area(args: Tuple[int, int]):
+    """
+    Compute area of a single Voronoi region and return
+    (area, region_vertices, point, barcode). Returns None on invalid region.
+    """
+    idx, region_index = args
+    vor = _GLOBAL_VOR
+    regions = vor.regions
+    vertices = vor.vertices
+
+    # invalid region
+    if region_index < 0 or region_index >= len(regions):
+        return None
+    region = regions[region_index]
+    if -1 in region or len(region) == 0:
+        return None
+
+    # compute polygon area
+    poly = Polygon(vertices[region])
+    area = poly.area
+
+    # grab original point & its barcode/index
+    point = _GLOBAL_COORDS_VALUES[idx]
+    barcode = _GLOBAL_COORDS_INDEX[idx]
+
+    return area, region, point, barcode
+    
+def _init_raster_worker(vor: Voronoi):
+    """
+    Worker initializer: store the shared Voronoi object in a global variable.
+    This avoids pickling it for every single tile.
+    """
+    global _GLOBAL_VOR
+    _GLOBAL_VOR = vor
+
+def _rasterise_chunk(
+    chunk_args: list[tuple[list[int], np.ndarray, int]]
+) -> pd.DataFrame:
+    """
+    Process a batch of tiles in one go.
+    This reduces the number of pickles between main <-> worker.
+    """
+    dfs = []
+    for region, point, idx in chunk_args:
+        # exactly the same per‐tile logic as before
+        try:
+            verts = _GLOBAL_VOR.vertices[region]
+            poly = Polygon(verts)
+
+            minx, miny, maxx, maxy = poly.bounds
+            xs = np.arange(int(np.floor(minx)), int(np.ceil(maxx)) + 1)
+            ys = np.arange(int(np.floor(miny)), int(np.ceil(maxy)) + 1)
+            gx, gy = np.meshgrid(xs, ys)
+            pts = np.vstack([gx.ravel(), gy.ravel()]).T
+
+            mask = shapely_contains(poly, pts[:,0], pts[:,1])
+            pixels = pts[mask]
+            if pixels.size == 0:
+                continue
+
+            ox, oy = int(round(point[0])), int(round(point[1]))
+            origin_flags = ((pixels[:,0]==ox) & (pixels[:,1]==oy)).astype(int)
+
+            df = pd.DataFrame({
+                'x':       pixels[:,0],
+                'y':       pixels[:,1],
+                'barcode': str(idx),
+                'origin':  origin_flags
+            })
+            # ensure we mark the generating point
+            if df['origin'].sum() == 0:
+                df = pd.concat([
+                    df,
+                    pd.DataFrame({
+                        'x': [ox], 'y': [oy],
+                        'barcode': [str(idx)], 'origin': [1]
+                    })
+                ], ignore_index=True)
+            dfs.append(df)
+        except Exception as e:
+            logging.error(f"Error in tile {idx}: {e}")
+
+    if dfs:
+        return pd.concat(dfs, ignore_index=True)
+    else:
+        # return empty with correct columns
+        return pd.DataFrame(columns=['x','y','barcode','origin'])
 
 def filter_grid_function(coordinates: pd.DataFrame, filter_grid: float) -> pd.DataFrame:
     """
@@ -105,83 +208,39 @@ def reduce_tensor_resolution(coordinates: pd.DataFrame, tensor_resolution: float
     return filtered_coordinates
 
 
-def filter_tiles(vor, coordinates: pd.DataFrame, filter_threshold: float) -> Tuple[List[List[int]], np.ndarray, List]:
+def filter_tiles(
+    vor: Voronoi,
+    coordinates: pd.DataFrame,
+    filter_threshold: float,
+    n_jobs: int = None,
+    chunksize: int = None,
+    verbose: bool = True
+) -> Tuple[List[List[int]], np.ndarray, List]:
     """
-    Filter Voronoi regions based on area threshold.
+    Parallel filtering of Voronoi regions by area threshold.
 
     Parameters
     ----------
     vor : Voronoi
-        The Voronoi tessellation object.
+        Voronoi tessellation object.
     coordinates : pd.DataFrame
-        DataFrame containing spatial coordinates with columns ['x', 'y'].
+        Spatial coordinates with columns ['x','y'] and index=barcodes.
     filter_threshold : float
-        Threshold to filter tiles based on area (quantile, e.g., 0.995).
+        Quantile threshold (e.g. 0.995) to cut large regions.
+    n_jobs : int, optional
+        Number of processes (None → os.cpu_count()).
+    chunksize : int, optional
+        Tasks per chunk for executor.map (None → total//(n_jobs*4)).
+    verbose : bool, optional
+        Print progress logs.
 
     Returns
     -------
-    Tuple[List[List[int]], np.ndarray, List]
-        Filtered regions, filtered coordinates, and their indices.
-    """
-    point_region = vor.point_region
-    regions = vor.regions
-    vertices = vor.vertices
-
-    areas = []
-    valid_points = []
-    valid_regions = []
-    index = []
-    # Calculate areas of Voronoi regions
-    for idx, region_index in tqdm(enumerate(point_region), total=len(point_region), desc="Calculating Voronoi region areas"):
-        region = regions[region_index]
-        if -1 in region or len(region) == 0:
-            continue  # Skip regions with infinite vertices or empty regions
-        polygon = Polygon(vertices[region])
-        area = polygon.area
-        areas.append(area)
-        valid_points.append(coordinates.iloc[idx].values)
-        valid_regions.append(region)
-        index.append(coordinates.index[idx])
-    areas = np.array(areas)
-    max_area = np.quantile(areas, filter_threshold)
-
-    filtered_regions = []
-    filtered_points = []
-    filtered_index = []
-    # Filter regions based on area
-    for area, region, point, idx in tqdm(zip(areas, valid_regions, valid_points, index), total=len(areas), desc="Filtering tiles by area"):
-        if area <= max_area:
-            filtered_regions.append(region)
-            filtered_points.append(point)
-            filtered_index.append(idx)
-
-    return filtered_regions, np.array(filtered_points), filtered_index
-
-
-def rasterise(filtered_regions: List[List[int]], filtered_points: np.ndarray, index: List, vor, chunksize: int = 1000, n_jobs: int = None) -> pd.DataFrame:
-    """
-    Rasterize Voronoi regions into grid tiles.
-
-    Parameters
-    ----------
     filtered_regions : List[List[int]]
-        List of regions (vertex indices) to rasterize.
-    filtered_points : np.ndarray
-        Array of spatial coordinates corresponding to the regions.
-    index : List
-        List of indices for each region.
-    vor : Voronoi
-        The Voronoi tessellation object.
-    chunksize : int, optional (default=1000)
-        Number of tiles per chunk for parallel processing.
-    n_jobs : int, optional (default=None)
-        Number of parallel jobs to run. If None, uses all available CPUs.
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame containing rasterized tiles with x, y coordinates, barcode, and origin flags.
+    filtered_points : np.ndarray  # shape=(M,2)
+    filtered_index : List        # length=M
     """
+    # ── determine n_jobs ────────────────────────────────────────────────
     if n_jobs is None:
         n_jobs = os.cpu_count()
     elif n_jobs < 0:
@@ -189,26 +248,131 @@ def rasterise(filtered_regions: List[List[int]], filtered_points: np.ndarray, in
     elif n_jobs == 0:
         n_jobs = 1
 
-    iterable = zip(filtered_regions, filtered_points, index, itertools.repeat(vor))
-    desc = "Rasterising tiles"
+    total = len(vor.point_region)
+
+    # ── determine chunksize ─────────────────────────────────────────────
+    if chunksize is None:
+        chunksize = max(1, total // (n_jobs * 4))
+
+    if verbose:
+        logging.info(f"filter_tiles: n_jobs={n_jobs}, chunksize={chunksize}")
+
+    # ── prepare data for workers ───────────────────────────────────────
+    coords_values = coordinates.values
+    coords_index = coordinates.index.tolist()
+    tasks = list(enumerate(vor.point_region))
+
+    # ── parallel area computation ──────────────────────────────────────
+    with ProcessPoolExecutor(
+        max_workers=n_jobs,
+        initializer=_init_filter_worker,
+        initargs=(vor, coords_values, coords_index)
+    ) as executor:
+        results = list(tqdm(
+            executor.map(_compute_region_area, tasks, chunksize=chunksize),
+            total=total,
+            desc="Calculating Voronoi region areas"
+        ))
+
+    # ── collect valid results ──────────────────────────────────────────
+    valid = [r for r in results if r is not None]
+    if not valid:
+        return [], np.array([]), []
+
+    areas, regions, points, indices = zip(*valid)
+    areas = np.array(areas)
+
+    # ── compute threshold and filter ───────────────────────────────────
+    max_area = np.quantile(areas, filter_threshold)
+    mask = areas <= max_area
+
+    filtered_regions = [reg for reg, m in zip(regions, mask) if m]
+    filtered_points  = np.array([pt  for pt,  m in zip(points, mask)  if m])
+    filtered_index   = [idx for idx, m in zip(indices, mask) if m]
+
+    if verbose:
+        logging.info(f"filter_tiles: kept {len(filtered_regions)}/{total} regions (≤{filter_threshold*100:.1f}th pctile).")
+
+    return filtered_regions, filtered_points, filtered_index
+
+
+def rasterise(
+    filtered_regions: list[list[int]],
+    filtered_points: np.ndarray,
+    index: list,
+    vor: Voronoi,
+    chunksize: int = None,
+    n_jobs: int = None
+) -> pd.DataFrame:
+    """
+    Rasterize Voronoi regions into pixels, in parallel by batch.
+
+    Parameters
+    ----------
+    filtered_regions : list of list of int
+        Vertex indices of each region.
+    filtered_points : np.ndarray
+        Nx2 array of original point coords.
+    index : list
+        Region identifiers.
+    vor : Voronoi
+        Shared tessellation.
+    chunksize : int, optional
+        Number of tiles per worker‐job. None -> auto = total/(n_jobs*4).
+    n_jobs : int or None
+        Number of processes. None -> all CPUs.
+
+    Returns
+    -------
+    pd.DataFrame
+        All pixels from all tiles.
+    """
+    # ―――― determine n_jobs ――――
+    if n_jobs is None:
+        n_jobs = os.cpu_count()
+    elif n_jobs < 0:
+        n_jobs = max(1, os.cpu_count() + n_jobs)
+    elif n_jobs == 0:
+        n_jobs = 1
 
     total = len(filtered_regions)
+    # ―――― determine chunksize ――――
+    if chunksize is None:
+        chunksize = max(1, total // (n_jobs * 4))
 
-    tiles_list = _process_in_parallel_map(
-        rasterise_single_tile,
-        iterable,
-        desc,
-        n_jobs,
-        chunksize,
-        total=total
-    )
+    logging.info(f"Rasterise: n_jobs={n_jobs}, tiles={total}, chunksize={chunksize}")
 
-    if tiles_list:
-        tiles = pd.concat(tiles_list, ignore_index=True)
+    # prepare batches
+    tasks = list(zip(filtered_regions, filtered_points, index))
+    batches = [tasks[i:i + chunksize] for i in range(0, total, chunksize)]
+    total_batches = len(batches)
+
+    results = []
+    desc = "Rasterising tiles"
+
+    if n_jobs == 1:
+        # serial fallback
+        for batch in tqdm(batches, total=total_batches, desc=desc):
+            results.append(_rasterise_chunk(batch))
     else:
-        tiles = pd.DataFrame(columns=['x', 'y', 'barcode', 'origin'])
+        # parallel with one init per worker
+        with ProcessPoolExecutor(
+            max_workers=n_jobs,
+            initializer=_init_raster_worker,
+            initargs=(vor,)
+        ) as exe:
+            for df in tqdm(
+                exe.map(_rasterise_chunk, batches),
+                total=total_batches,
+                desc=desc
+            ):
+                results.append(df)
 
-    return tiles
+    # concat all batch‐DFs
+    if results:
+        return pd.concat(results, ignore_index=True)
+    else:
+        return pd.DataFrame(columns=['x','y','barcode','origin'])
 
 
 def _process_in_parallel_map(function, iterable, desc, n_jobs, chunksize: int = 1000, total: int = None) -> List[pd.DataFrame]:
@@ -247,83 +411,6 @@ def _process_in_parallel_map(function, iterable, desc, n_jobs, chunksize: int = 
                 results.append(result)
     return results
 
-
-def rasterise_single_tile(args: Tuple[List[int], np.ndarray, int, Voronoi]) -> pd.DataFrame:
-    """
-    Rasterize a single Voronoi region into grid tiles.
-
-    Parameters
-    ----------
-    args : Tuple[List[int], np.ndarray, int, Voronoi]
-        Tuple containing:
-        - region: List[int] - Indices of the vertices forming the region.
-        - point: np.ndarray - Coordinates of the generating point.
-        - index: int - Index of the region.
-        - vor: Voronoi - The Voronoi tessellation object.
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame containing rasterized tile with x, y coordinates, barcode, and origin flag.
-    """
-    try:
-        region, point, index, vor = args
-        vertices = vor.vertices[region]
-        polygon = Polygon(vertices)
-
-        # Compute bounding box of the polygon
-        minx, miny, maxx, maxy = polygon.bounds
-
-        # Generate grid points within the bounding box
-        x_range = np.arange(int(np.floor(minx)), int(np.ceil(maxx)) + 1)
-        y_range = np.arange(int(np.floor(miny)), int(np.ceil(maxy)) + 1)
-        grid_x, grid_y = np.meshgrid(x_range, y_range)
-        grid_points = np.vstack((grid_x.ravel(), grid_y.ravel())).T
-
-        # Vectorized point-in-polygon test using shapely
-        mask = contains(polygon, grid_points[:, 0], grid_points[:, 1])
-        pixels = grid_points[mask]
-
-        if len(pixels) == 0:
-            # Return an empty DataFrame with required columns
-            return pd.DataFrame(columns=['x', 'y', 'barcode', 'origin'])
-
-        # Calculate origin flags using vectorized operations
-        origin_x = int(np.round(point[0]))
-        origin_y = int(np.round(point[1]))
-        origins = ((pixels[:, 0] == origin_x) & (pixels[:, 1] == origin_y)).astype(int)
-
-        # Create DataFrame for the rasterized tile
-        tile_df = pd.DataFrame({
-            'x': pixels[:, 0],
-            'y': pixels[:, 1],
-            'barcode': str(index),
-            'origin': origins
-        })
-
-        # If the origin pixel is not present, add it manually
-        if not tile_df['origin'].any():
-            # Create a DataFrame for the origin pixel
-            origin_df = pd.DataFrame({
-                'x': [origin_x],
-                'y': [origin_y],
-                'barcode': [str(index)],
-                'origin': [1]
-            })
-
-            # Concatenate the origin pixel to the existing tile_df
-            tile_df = pd.concat([tile_df, origin_df], ignore_index=True)
-
-        return tile_df
-
-    except Exception as e:
-        # Log the error with relevant information
-        logging.error(f"Error processing tile with point {args[1]}: {e}")
-        # Return an empty DataFrame with required columns to maintain consistency
-        return pd.DataFrame(columns=['x', 'y', 'barcode', 'origin'])
-
-
-from shapely.vectorized import contains as shapely_contains
 def contains(polygon: Polygon, x: np.ndarray, y: np.ndarray) -> np.ndarray:
     """
     Vectorized point-in-polygon test using shapely.
