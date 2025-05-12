@@ -12,7 +12,7 @@ import itertools
 from scipy.spatial import Voronoi
 import os
 
-from ..utils.utils import filter_grid_function, reduce_tensor_resolution, filter_tiles, rasterise, rasterise_single_tile
+from ..utils.utils import filter_grid_function, reduce_tensor_resolution, filter_tiles, rasterise
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -93,7 +93,14 @@ def generate_tiles(
     # Filter tiles based on area
     if verbose:
         logging.info("Filtering tiles...")
-    filtered_regions, filtered_coordinates, index = filter_tiles(vor, coordinates, filter_threshold)
+    filtered_regions, filtered_coordinates, index = filter_tiles(
+        vor,
+        coordinates,
+        filter_threshold,
+        n_jobs=n_jobs,
+        chunksize=chunksize,
+        verbose=verbose
+    )
     if verbose:
         logging.info(f"Filtered regions: {len(filtered_regions)}, Filtered coordinates: {filtered_coordinates.shape}")
 
