@@ -1,5 +1,6 @@
 # SPIX/utils.py
 
+import os
 import numpy as np
 import pandas as pd
 import matplotlib.patches as patches
@@ -37,6 +38,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 _GLOBAL_VOR: Voronoi = None
 _GLOBAL_COORDS_VALUES: np.ndarray = None
 _GLOBAL_COORDS_INDEX: List = None
+_GLOBAL_BOUNDARY: Polygon | None = None
 
 def _init_filter_worker(vor: Voronoi, coords_values: np.ndarray, coords_index: List):
     """
@@ -74,16 +76,17 @@ def _compute_region_area(args: Tuple[int, int]):
 
     return area, region, point, barcode
     
-def _init_raster_worker(vor: Voronoi):
+def _init_raster_worker(vor: Voronoi, boundary: Polygon | None = None):
     """
     Worker initializer: store the shared Voronoi object in a global variable.
     This avoids pickling it for every single tile.
     """
-    global _GLOBAL_VOR
+    global _GLOBAL_VOR, _GLOBAL_BOUNDARY
     _GLOBAL_VOR = vor
+    _GLOBAL_BOUNDARY = boundary
 
 def _rasterise_chunk(
-    chunk_args: list[tuple[list[int], np.ndarray, int]]
+    chunk_args: list[tuple[list[int], np.ndarray, int]],
 ) -> pd.DataFrame:
     """
     Process a batch of tiles in one go.
@@ -95,6 +98,10 @@ def _rasterise_chunk(
         try:
             verts = _GLOBAL_VOR.vertices[region]
             poly = Polygon(verts)
+            if _GLOBAL_BOUNDARY is not None:
+                poly = poly.intersection(_GLOBAL_BOUNDARY)
+                if poly.is_empty:
+                    continue
 
             minx, miny, maxx, maxy = poly.bounds
             xs = np.arange(int(np.floor(minx)), int(np.ceil(maxx)) + 1)
@@ -102,29 +109,33 @@ def _rasterise_chunk(
             gx, gy = np.meshgrid(xs, ys)
             pts = np.vstack([gx.ravel(), gy.ravel()]).T
 
-            mask = shapely_contains(poly, pts[:,0], pts[:,1])
+            mask = shapely_contains(poly, pts[:, 0], pts[:, 1])
             pixels = pts[mask]
             if pixels.size == 0:
                 continue
 
             ox, oy = int(round(point[0])), int(round(point[1]))
-            origin_flags = ((pixels[:,0]==ox) & (pixels[:,1]==oy)).astype(int)
+            origin_flags = ((pixels[:, 0] == ox) & (pixels[:, 1] == oy)).astype(int)
 
-            df = pd.DataFrame({
-                'x':       pixels[:,0],
-                'y':       pixels[:,1],
-                'barcode': str(idx),
-                'origin':  origin_flags
-            })
+            df = pd.DataFrame(
+                {
+                    "x": pixels[:, 0],
+                    "y": pixels[:, 1],
+                    "barcode": str(idx),
+                    "origin": origin_flags,
+                }
+            )
             # ensure we mark the generating point
-            if df['origin'].sum() == 0:
-                df = pd.concat([
-                    df,
-                    pd.DataFrame({
-                        'x': [ox], 'y': [oy],
-                        'barcode': [str(idx)], 'origin': [1]
-                    })
-                ], ignore_index=True)
+            if df["origin"].sum() == 0:
+                df = pd.concat(
+                    [
+                        df,
+                        pd.DataFrame(
+                            {"x": [ox], "y": [oy], "barcode": [str(idx)], "origin": [1]}
+                        ),
+                    ],
+                    ignore_index=True,
+                )
             dfs.append(df)
         except Exception as e:
             logging.error(f"Error in tile {idx}: {e}")
@@ -133,7 +144,7 @@ def _rasterise_chunk(
         return pd.concat(dfs, ignore_index=True)
     else:
         # return empty with correct columns
-        return pd.DataFrame(columns=['x','y','barcode','origin'])
+        return pd.DataFrame(columns=["x", "y", "barcode", "origin"])
 
 def filter_grid_function(coordinates: pd.DataFrame, filter_grid: float) -> pd.DataFrame:
     """
@@ -174,7 +185,9 @@ def filter_grid_function(coordinates: pd.DataFrame, filter_grid: float) -> pd.Da
     return filtered_coordinates
 
 
-def reduce_tensor_resolution(coordinates: pd.DataFrame, tensor_resolution: float = 1) -> pd.DataFrame:
+def reduce_tensor_resolution(
+    coordinates: pd.DataFrame, tensor_resolution: float = 1
+) -> pd.DataFrame:
     """
     Reduce tensor resolution of spatial coordinates.
 
@@ -196,14 +209,16 @@ def reduce_tensor_resolution(coordinates: pd.DataFrame, tensor_resolution: float
     coordinates[1] = np.round(coordinates[1] * tensor_resolution) + 1
 
     # Group by reduced coordinates and compute mean
-    coords_df = coordinates.rename(columns={0: 'x', 1: 'y'})
-    coords_df['coords'] = coords_df['x'].astype(str) + '_' + coords_df['y'].astype(str)
-    coords_df['original_index'] = coords_df.index
-    
-    coords_grouped = coords_df.groupby('coords').mean(numeric_only=True).reset_index()
-    coords_grouped['original_index'] = coords_df.groupby('coords')['original_index'].first().values
-    coords_grouped.set_index('original_index', inplace=True)
-    filtered_coordinates = coords_grouped[['x', 'y']]
+    coords_df = coordinates.rename(columns={0: "x", 1: "y"})
+    coords_df["coords"] = coords_df["x"].astype(str) + "_" + coords_df["y"].astype(str)
+    coords_df["original_index"] = coords_df.index
+
+    coords_grouped = coords_df.groupby("coords").mean(numeric_only=True).reset_index()
+    coords_grouped["original_index"] = (
+        coords_df.groupby("coords")["original_index"].first().values
+    )
+    coords_grouped.set_index("original_index", inplace=True)
+    filtered_coordinates = coords_grouped[["x", "y"]]
 
     return filtered_coordinates
 
@@ -214,7 +229,7 @@ def filter_tiles(
     filter_threshold: float,
     n_jobs: int = None,
     chunksize: int = None,
-    verbose: bool = True
+    verbose: bool = True,
 ) -> Tuple[List[List[int]], np.ndarray, List]:
     """
     Parallel filtering of Voronoi regions by area threshold.
@@ -266,13 +281,15 @@ def filter_tiles(
     with ProcessPoolExecutor(
         max_workers=n_jobs,
         initializer=_init_filter_worker,
-        initargs=(vor, coords_values, coords_index)
+        initargs=(vor, coords_values, coords_index),
     ) as executor:
-        results = list(tqdm(
-            executor.map(_compute_region_area, tasks, chunksize=chunksize),
-            total=total,
-            desc="Calculating Voronoi region areas"
-        ))
+        results = list(
+            tqdm(
+                executor.map(_compute_region_area, tasks, chunksize=chunksize),
+                total=total,
+                desc="Calculating Voronoi region areas",
+            )
+        )
 
     # ── collect valid results ──────────────────────────────────────────
     valid = [r for r in results if r is not None]
@@ -287,11 +304,13 @@ def filter_tiles(
     mask = areas <= max_area
 
     filtered_regions = [reg for reg, m in zip(regions, mask) if m]
-    filtered_points  = np.array([pt  for pt,  m in zip(points, mask)  if m])
-    filtered_index   = [idx for idx, m in zip(indices, mask) if m]
+    filtered_points = np.array([pt for pt, m in zip(points, mask) if m])
+    filtered_index = [idx for idx, m in zip(indices, mask) if m]
 
     if verbose:
-        logging.info(f"filter_tiles: kept {len(filtered_regions)}/{total} regions (≤{filter_threshold*100:.1f}th pctile).")
+        logging.info(
+            f"filter_tiles: kept {len(filtered_regions)}/{total} regions (≤{filter_threshold*100:.1f}th pctile)."
+        )
 
     return filtered_regions, filtered_points, filtered_index
 
@@ -301,8 +320,9 @@ def rasterise(
     filtered_points: np.ndarray,
     index: list,
     vor: Voronoi,
+    boundary: Polygon | None = None,
     chunksize: int = None,
-    n_jobs: int = None
+    n_jobs: int = None,
 ) -> pd.DataFrame:
     """
     Rasterize Voronoi regions into pixels, in parallel by batch.
@@ -317,6 +337,8 @@ def rasterise(
         Region identifiers.
     vor : Voronoi
         Shared tessellation.
+    boundary : Polygon or None
+        Optional polygon to clip each tile. If None, tiles are not clipped.
     chunksize : int, optional
         Number of tiles per worker‐job. None -> auto = total/(n_jobs*4).
     n_jobs : int or None
@@ -344,7 +366,7 @@ def rasterise(
 
     # prepare batches
     tasks = list(zip(filtered_regions, filtered_points, index))
-    batches = [tasks[i:i + chunksize] for i in range(0, total, chunksize)]
+    batches = [tasks[i : i + chunksize] for i in range(0, total, chunksize)]
     total_batches = len(batches)
 
     results = []
@@ -352,6 +374,7 @@ def rasterise(
 
     if n_jobs == 1:
         # serial fallback
+        _init_raster_worker(vor, boundary)
         for batch in tqdm(batches, total=total_batches, desc=desc):
             results.append(_rasterise_chunk(batch))
     else:
@@ -359,12 +382,10 @@ def rasterise(
         with ProcessPoolExecutor(
             max_workers=n_jobs,
             initializer=_init_raster_worker,
-            initargs=(vor,)
+            initargs=(vor, boundary),
         ) as exe:
             for df in tqdm(
-                exe.map(_rasterise_chunk, batches),
-                total=total_batches,
-                desc=desc
+                exe.map(_rasterise_chunk, batches), total=total_batches, desc=desc
             ):
                 results.append(df)
 
@@ -372,10 +393,12 @@ def rasterise(
     if results:
         return pd.concat(results, ignore_index=True)
     else:
-        return pd.DataFrame(columns=['x','y','barcode','origin'])
+        return pd.DataFrame(columns=["x", "y", "barcode", "origin"])
 
 
-def _process_in_parallel_map(function, iterable, desc, n_jobs, chunksize: int = 1000, total: int = None) -> List[pd.DataFrame]:
+def _process_in_parallel_map(
+    function, iterable, desc, n_jobs, chunksize: int = 1000, total: int = None
+) -> List[pd.DataFrame]:
     """
     Helper function to process tasks in parallel with a progress bar using map.
 
@@ -407,7 +430,11 @@ def _process_in_parallel_map(function, iterable, desc, n_jobs, chunksize: int = 
     else:
         # Parallel processing with progress bar using map
         with ProcessPoolExecutor(max_workers=n_jobs) as executor:
-            for result in tqdm(executor.map(function, iterable, chunksize=chunksize), desc=desc, total=total):
+            for result in tqdm(
+                executor.map(function, iterable, chunksize=chunksize),
+                desc=desc,
+                total=total,
+            ):
                 results.append(result)
     return results
 
