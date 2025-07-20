@@ -2,15 +2,9 @@ import numpy as np
 import pandas as pd
 import scanpy as sc
 from anndata import AnnData
-from shapely.geometry import Polygon
-from shapely.ops import polygonize, unary_union
-from collections import Counter
-from tqdm import tqdm
-from concurrent.futures import ProcessPoolExecutor
+from shapely.geometry import Polygon, MultiPoint
 import logging
-import itertools
 from scipy.spatial import Voronoi
-import os
 
 from ..utils.utils import filter_grid_function, reduce_tensor_resolution, filter_tiles, rasterise
 
@@ -21,10 +15,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 def generate_tiles(
     adata: AnnData,
     tensor_resolution: float = 1,
-    filter_grid: float = 0.01,
+    filter_grid: float = 1,
     filter_threshold: float = 0.995,
     verbose: bool = True,
     chunksize: int = 1000,
+    force: bool = False,
     n_jobs: int = None
 ) -> AnnData:
     """
@@ -53,10 +48,14 @@ def generate_tiles(
         The updated AnnData object with generated tiles.
     """
     # Check if tiles are already generated
-    if 'tiles_generated' in adata.uns and adata.uns['tiles_generated']:
+    tiles_exist = adata.uns.get('tiles_generated', False)
+    if tiles_exist and not force:
         if verbose:
             logging.info("Tiles have already been generated. Skipping tile generation.")
         return adata
+    elif tiles_exist and force:
+        if verbose:
+            logging.info("Force regeneration enabled: regenerating tiles...")
 
     if verbose:
         logging.info("Starting generate_tiles...")
@@ -99,32 +98,47 @@ def generate_tiles(
         filter_threshold,
         n_jobs=n_jobs,
         chunksize=chunksize,
-        verbose=verbose
+        verbose=verbose,
     )
     if verbose:
-        logging.info(f"Filtered regions: {len(filtered_regions)}, Filtered coordinates: {filtered_coordinates.shape}")
+        logging.info(
+            f"Filtered regions: {len(filtered_regions)}, Filtered coordinates: {filtered_coordinates.shape}"
+        )
+
+    # Compute boundary polygon for clipping based on filtered points
+    boundary_polygon = MultiPoint(filtered_coordinates).convex_hull
 
     # Rasterize tiles with parallel processing
     if verbose:
         logging.info("Rasterising tiles...")
-    tiles = rasterise(filtered_regions, filtered_coordinates, index, vor, chunksize, n_jobs=n_jobs)
+    tiles = rasterise(
+        filtered_regions,
+        filtered_coordinates,
+        index,
+        vor,
+        boundary_polygon,
+        chunksize,
+        n_jobs=n_jobs,
+    )
     if verbose:
         logging.info(f"Rasterisation completed. Number of tiles: {len(tiles)}")
 
     # Store tiles in AnnData object
-    adata.uns['tiles'] = tiles
-    adata.uns['tiles_generated'] = True
+    adata.uns["tiles"] = tiles
+    adata.uns["tiles_generated"] = True
     if verbose:
         logging.info("Tiles have been stored in adata.uns['tiles'].")
 
     # Subset adata based on filtered tiles
-    filtered_barcodes = tiles['barcode'].unique()
+    filtered_barcodes = tiles["barcode"].unique()
     initial_obs = adata.n_obs
     adata = adata[filtered_barcodes, :].copy()
     final_obs = adata.n_obs
 
     if verbose:
-        logging.info(f"adata has been subset from {initial_obs} to {final_obs} observations based on filtered tiles.")
+        logging.info(
+            f"adata has been subset from {initial_obs} to {final_obs} observations based on filtered tiles."
+        )
 
     if verbose:
         logging.info("generate_tiles completed.")
