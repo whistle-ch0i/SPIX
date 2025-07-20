@@ -20,6 +20,7 @@ def equalize_image(
     adata: AnnData,
     dimensions: List[int] = [0, 1, 2],
     embedding: str = 'X_embedding',
+    output: str = 'X_embedding_equalize',
     method: str = 'BalanceSimplest',
     N: int = 1,
     smax: float = 1.0,
@@ -42,6 +43,8 @@ def equalize_image(
         List of embedding dimensions to equalize.
     embedding : str, optional (default='X_embedding')
         Key in adata.obsm where the embeddings are stored.
+    output : str, optional (default='X_embedding_equalize')
+        Key in adata.obsm where the equalized embedding will be stored.
     method : str, optional (default='BalanceSimplest')
         Equalization method: 'BalanceSimplest', 'EqualizePiecewise', 'SPE', 
         'EqualizeDP', 'EqualizeADP', 'ECDF', 'histogram', 'adaptive'.
@@ -113,7 +116,7 @@ def equalize_image(
     if 'X_embedding_equalize' not in adata.obsm:
         adata.obsm['X_embedding_equalize'] = np.full((adata.n_obs, len(dimensions)), np.nan)
     # Update the embeddings in adata
-    adata.obsm['X_embedding_equalize'][:, dimensions] = embeddings
+    adata.obsm[output] = embeddings
     
     # Log changes
     if verbose:
