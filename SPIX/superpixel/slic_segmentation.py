@@ -1,4 +1,5 @@
 import numpy as np
+import scanpy as sc
 from sklearn.cluster import KMeans
 import multiprocessing
 from joblib import parallel_backend
@@ -12,7 +13,8 @@ def slic_segmentation(
     scaling: float = 0.3,
     index_selection: str = 'bubble',
     max_iter: int = 1000,
-    verbose: bool = True
+    verbose: bool = True,
+    use_gpu: bool = False,
 ) -> np.ndarray:
     """
     Perform SLIC-like segmentation using K-Means clustering with spatial and feature data.
@@ -35,7 +37,10 @@ def slic_segmentation(
         Maximum number of iterations for convergence in initial cluster selection.
     verbose : bool, optional (default=True)
         Whether to display progress messages.
-    
+    use_gpu : bool, optional (default=False)
+        If ``True``, attempt to use ``rapids-singlecell`` for GPU-accelerated
+        k-means. Falls back to CPU if the package is unavailable.
+
     Returns
     -------
     np.ndarray
@@ -70,23 +75,46 @@ def slic_segmentation(
     if verbose:
         print("Running K-Means clustering...")
 
-    # Run K-Means clustering
-    kmeans = KMeans(
-        n_clusters=n_segments,
-        init=initial_centers,
-        n_init=1,
-        max_iter=max_iter,
-        verbose=0,
-        random_state=42
-    )
-    
-    
-    num_cores = multiprocessing.cpu_count()
-    num_jobs = min(16, num_cores)  # Adjust based on system capacity
-    with parallel_backend("threading", n_jobs=num_jobs):
+    clusters = None
+    if use_gpu:
+        try:
+            import rapids_singlecell
+            if verbose:
+                print("Using rapids-singlecell kmeans")
+            temp_adata = sc.AnnData(X=combined_data)
+            rapids_singlecell.tl.kmeans(
+                temp_adata,
+                n_clusters=n_segments,
+                n_pcs=0,
+                use_rep="X",
+                n_init=1,
+                random_state=42,
+                key_added="slic",
+                copy=False,
+                init=initial_centers,
+                max_iter=max_iter,
+            )
+            clusters = temp_adata.obs["slic"].astype(int).values
+        except ImportError:
+            print(
+                "GPU option selected but 'rapids-singlecell' is not installed.\n"
+                "Install it with `pip install 'SPIX[gpu]'` or `pip install rapids-singlecell`.\n"
+                "Falling back to CPU implementation."
+            )
+
+    if clusters is None:
+        kmeans = KMeans(
+            n_clusters=n_segments,
+            init=initial_centers,
+            n_init=1,
+            max_iter=max_iter,
+            verbose=0,
+            random_state=42,
+        )
         kmeans.fit(combined_data)
-    # kmeans.fit(combined_data)
-    clusters = kmeans.labels_
+        clusters = kmeans.labels_
+
+    
     if verbose:
         print("SLIC segmentation completed.")
 
