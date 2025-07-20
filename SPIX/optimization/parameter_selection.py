@@ -89,7 +89,13 @@ def segment_image_parameter(args):
             segment_col,
             index_selection,
             max_iter,
-            False
+            False,
+            figsize=(10, 10),
+            imshow_tile_size=None,
+            imshow_scale_factor=1.0,
+            enforce_connectivity=False,
+            pixel_shape="circle",
+            show_image=False,
         )
 
         # Calculate the number of unique segments
