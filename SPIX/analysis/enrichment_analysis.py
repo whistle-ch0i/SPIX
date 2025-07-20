@@ -493,9 +493,11 @@ def subset_enrichment_results(
         if selected_database in db_results:
             df = db_results[selected_database].copy()
             # Apply p-value threshold
-            df['Significant'] = df['P-value'] <= significance_threshold
+            # df['Significant'] = df['P-value'] <= significance_threshold
+            df['Significant'] = df['Adjusted P-value'] <= significance_threshold
             # Retain p-values if significant, else set to NaN or a placeholder (e.g., 1 for non-significant)
-            df['mlogP'] = -np.log10(df['P-value'])
+            # df['mlogP'] = -np.log10(df['P-value'])
+            df['mlogP'] = -np.log10(df['Adjusted P-value'])
             df['mlogP'] = df.apply(lambda row: row['mlogP'] if row['Significant'] else np.nan, axis=1)
             df = df[['Term', 'mlogP']]
             df = df.rename(columns={'mlogP': f'{group_name}'})
