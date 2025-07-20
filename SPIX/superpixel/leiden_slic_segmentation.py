@@ -8,7 +8,8 @@ def leiden_slic_segmentation(
     compactness=1.0,
     scaling=0.3,
     n_neighbors=15,
-    random_state=42
+    random_state=42,
+    use_gpu=False
 ):
     """
     Perform Leiden clustering on embeddings scaled with spatial coordinates and compactness.
@@ -29,7 +30,10 @@ def leiden_slic_segmentation(
         Number of neighbors for constructing the nearest neighbor graph.
     random_state : int, optional (default=42)
         Random seed for reproducibility.
-    
+    use_gpu : bool, optional (default=False)
+        If ``True``, use ``rapids-singlecell`` to construct the neighbor graph.
+        Falls back to the CPU implementation if the package is missing.
+
     Returns
     -------
     np.ndarray
@@ -50,8 +54,31 @@ def leiden_slic_segmentation(
     
     # Create AnnData object
     temp_adata = sc.AnnData(X=combined_data)
-    sc.pp.neighbors(temp_adata, n_neighbors=n_neighbors, use_rep='X')
-    sc.tl.leiden(temp_adata, flavor='igraph', n_iterations=2, resolution=resolution, random_state=random_state)
+
+    if use_gpu:
+        try:
+            import rapids_singlecell
+            print('Using rapids-singlecell for neighbor graph')
+            rapids_singlecell.pp.neighbors(
+                temp_adata, n_neighbors=n_neighbors, use_rep='X'
+            )
+        except ImportError:
+            print(
+                "GPU option selected but 'rapids-singlecell' is not installed.\n"
+                "Install it with `pip install 'SPIX[gpu]'` or `pip install rapids-singlecell` and proper cuml version.\n"
+                "Falling back to CPU implementation."
+            )
+            sc.pp.neighbors(temp_adata, n_neighbors=n_neighbors, use_rep='X')
+    else:
+        sc.pp.neighbors(temp_adata, n_neighbors=n_neighbors, use_rep='X')
+
+    sc.tl.leiden(
+        temp_adata,
+        flavor='igraph',
+        n_iterations=2,
+        resolution=resolution,
+        random_state=random_state,
+    )
     clusters = temp_adata.obs['leiden'].astype(int).values
 
     return clusters, combined_data
