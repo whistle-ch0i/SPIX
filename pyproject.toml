@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "SPIX"
-version = "0.1.0"
+version = "0.1.1"
 description = "A Python package using Super Pixels for efficient multi-scale Spatial omics analysis"
 authors = [
-    { name = "Your Name", email = "your.email@example.com" },
+    { name = "Hwisoo Choi", email = "chs1181@gmail.com" },
     { name = "Patrick CN Martin", email = "patrick.martin@cshs.org"}
 ]
 license = { text = "MIT" }
@@ -28,7 +28,6 @@ dependencies = [
     "joblib",
     "tqdm_joblib",
     "opencv-python",
-    "opencv-python",
     "NaiveDE",
     "minisom",
     "networkx",
@@ -36,10 +35,11 @@ dependencies = [
     "tqdm",
     "alphashape",
     "igraph",
-    'harmonypy'
+    "harmonypy"
 ]
 
-
+[project.optional-dependencies]
+gpu = ["rapids-singlecell"]
 
 [tool.setuptools]
 packages = { find = { where = ["."] } }
