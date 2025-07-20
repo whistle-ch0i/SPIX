@@ -30,7 +30,7 @@ def generate_embeddings(
     library_id : str = 'library_id',
     dimensions: int = 30,
     tensor_resolution: float = 1,
-    filter_grid: float = 0.01,
+    filter_grid: float = 1,
     filter_threshold: float = 0.995,
     nfeatures: int = 2000,
     features: list = None,
@@ -38,6 +38,7 @@ def generate_embeddings(
     remove_lsi_1: bool = True,
     n_jobs: int = None,
     chunksize: int = 5000,
+    force: bool = False,
     verbose: bool = True
 ) -> AnnData:
     """
@@ -85,7 +86,8 @@ def generate_embeddings(
         logging.info("Starting generate_embeddings...")
 
     # Generate tiles if not already present
-    if 'tiles_generated' not in adata.uns or not adata.uns['tiles_generated']:
+    tiles_exist = adata.uns.get('tiles_generated', False)
+    if force or not tiles_exist:
         if verbose:
             logging.info("Tiles not found. Generating tiles...")
         adata = generate_tiles(
@@ -95,6 +97,7 @@ def generate_embeddings(
             filter_threshold=filter_threshold,
             verbose=verbose,
             chunksize=chunksize,
+            force=force,
             n_jobs=n_jobs
         )
 
