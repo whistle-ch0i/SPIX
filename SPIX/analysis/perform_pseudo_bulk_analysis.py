@@ -10,7 +10,7 @@ import logging
 # Set up logging 
 # This checks if handlers are already configured to avoid adding duplicates
 if not logging.getLogger('').handlers:
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Get a logger instance for this module/script
 _logger = logging.getLogger(__name__)
@@ -18,7 +18,7 @@ _logger = logging.getLogger(__name__)
 # Ensure scanpy.external is available for harmony
 try:
     import scanpy.external.pp as sce
-    _logger.info("scanpy.external.pp imported successfully.")
+    _logger.debug("scanpy.external.pp imported successfully.")
 except ImportError:
     sce = None
     _logger.warning("scanpy.external not found. Harmony integration will not be available.")
