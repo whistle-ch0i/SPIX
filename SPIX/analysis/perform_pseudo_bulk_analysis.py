@@ -27,6 +27,7 @@ except ImportError:
 def perform_pseudo_bulk_analysis(
     adata: sc.AnnData,
     segment_key: str = 'Segment',
+    expr_agg: str = "sum",         # "sum" or "mean"
     batch_key: Optional[str] = None,
     min_genes_in_segment: int = 1,
     normalize_total: bool = True,
@@ -55,6 +56,8 @@ def perform_pseudo_bulk_analysis(
     segment_key : str, optional (default='Segment')
         The key in `adata.obs` to use for pseudo-bulk aggregation.
         Each unique value in this column will become a pseudo-bulk observation.
+    expr_agg : str, optional (default='sum')
+        Aggregation method for expression data. One of 'sum' or 'mean'.
     batch_key : str or None, optional (default=None)
         The key in `adata.obs` to use for batch information. If provided (not None)
         and present in `adata.obs`, this column will be added to `new_adata.obs`
@@ -131,6 +134,9 @@ def perform_pseudo_bulk_analysis(
         sc_neighbors_params = {}
 
     # --- Input Validation ---
+    if expr_agg not in ("sum", "mean"):
+        _logger.error(f"Invalid expr_agg '{expr_agg}'. Must be 'sum' or 'mean'.")
+        raise ValueError(f"Invalid expr_agg '{expr_agg}'. Must be 'sum' or 'mean'.")
     if segment_key not in adata.obs:
         _logger.error(f"'{segment_key}' key is not present in adata.obs.")
         raise ValueError(f"'{segment_key}' key is not present in adata.obs.")
@@ -146,6 +152,7 @@ def perform_pseudo_bulk_analysis(
 
     _logger.info("--- Starting Pseudo-Bulk Aggregation and Analysis ---")
     _logger.info(f"Segmenting based on key: '{segment_key}'")
+    _logger.info(f"Segment key: '{segment_key}', expr_agg: '{expr_agg}'")
     if batch_key:
         _logger.info(f"Batch key specified for correction: '{batch_key}'")
 
@@ -171,8 +178,8 @@ def perform_pseudo_bulk_analysis(
     del pseudo_bulk_coords_df
     gc.collect() # Clean up temporary DataFrame
 
-    # Aggregate expression data (sum)
-    _logger.info("Aggregating expression data (sum)...")
+    # Aggregate expression data
+    _logger.info(f"Aggregating expression data ({expr_agg})...")
     # Use a more memory-efficient approach for sparse matrices
     if issparse(adata_X):
         _logger.info("Input data is sparse. Using sparse-aware aggregation.")
@@ -204,20 +211,24 @@ def perform_pseudo_bulk_analysis(
         indicator_matrix_csc = indicator_matrix.tocsc()
         X_bulk_sum = indicator_matrix_csc.T @ adata_X # Result is (bulked_segments x genes) sparse matrix
 
-        # # Calculate mean by dividing by cell counts per segment
-        # # Get counts per segment based on the original_to_bulked_row_indices for valid cells
-        # counts_per_segment = np.bincount(original_to_bulked_row_indices[valid_cell_mask], minlength=num_bulked_segments)
-        # counts_col_vector = counts_per_segment.reshape(-1, 1)
+        if expr_agg == "mean":
+            _logger.info("Calculating mean expression per segment...")
+            # Calculate mean by dividing by cell counts per segment
+            # Get counts per segment based on the original_to_bulked_row_indices for valid cells
+            counts_per_segment = np.bincount(original_to_bulked_row_indices[valid_cell_mask], minlength=num_bulked_segments)
+            counts_col_vector = counts_per_segment.reshape(-1, 1)
 
-        # # Avoid division by zero for segments with 0 cells (shouldn't happen with observed=True and valid_mask but safer)
-        # safe_counts = np.maximum(counts_col_vector, 1)
+            # Avoid division by zero for segments with 0 cells (shouldn't happen with observed=True and valid_mask but safer)
+            safe_counts = np.maximum(counts_col_vector, 1)
 
-        # # Element-wise division using sparse matrix multiplication (identity matrix with inverse counts)
-        # # Result = Diag(1/counts) @ X_bulk_sum
-        # inv_counts_diag = csr_matrix((1.0 / safe_counts.flatten(), (np.arange(num_bulked_segments), np.arange(num_bulked_segments))), shape=(num_bulked_segments, num_bulked_segments))
-        # X_bulk_mean = inv_counts_diag @ X_bulk_sum # Result is (bulked_segments x genes) sparse matrix
+            # Element-wise division using sparse matrix multiplication (identity matrix with inverse counts)
+            # Result = Diag(1/counts) @ X_bulk_sum
+            inv_counts_diag = csr_matrix((1.0 / safe_counts.flatten(), (np.arange(num_bulked_segments), np.arange(num_bulked_segments))), shape=(num_bulked_segments, num_bulked_segments))
+            X_bulk = inv_counts_diag @ X_bulk_sum
 
-        X_bulk = csr_matrix(X_bulk_sum) # Ensure final format is CSR
+        else:
+            _logger.info("Calculating sum expression per segment...")
+            X_bulk = csr_matrix(X_bulk_sum) # Ensure final format is CSR
 
         del indicator_matrix, indicator_matrix_csc, X_bulk_sum, original_to_bulked_row_indices, segments_cat_ordered, valid_cell_mask
         gc.collect()
