@@ -7,6 +7,8 @@ from anndata import AnnData
 from scipy.sparse.csgraph import dijkstra
 from .slic_segmentation import slic_segmentation
 from typing import Union, Optional
+from scipy.sparse import csr_matrix
+from collections import deque
 
 
 def find_hotspots(
@@ -21,6 +23,7 @@ def find_hotspots(
     scaling: float = 0.3,
     max_iter: int = 1000,
     weighted: bool = False,
+    chunk_size: int = 1000, 
     add_name: str = 'Hotspots',
     verbose: bool = True) -> AnnData:
     """
@@ -69,7 +72,7 @@ def find_hotspots(
     #-------------------------------------------------------------------------#
     # Creating Spatial Graph or distance matrix
     #-------------------------------------------------------------------------#
-    exclusion_zone = get_exclusion_zone(adata, depth_exclusion)
+    exclusion_zone = get_exclusion_zone(adata, depth_exclusion, chunk_size)
     #-------------------------------------------------------------------------#
     # Get initial indices from hotspots
     #-------------------------------------------------------------------------#
@@ -143,19 +146,63 @@ def find_hotspots(
 def get_gene_order(
     adata: AnnData,
     genes: list) -> list:
-    adata = adata[:, genes]
+    valid_genes = [g for g in genes if g in adata.var_names]
+    if not valid_genes:
+        raise ValueError("None of the selected genes are present in the dataset.")
+    adata = adata[:, valid_genes]
     gene_sum = adata.X.sum(axis = 1)
     gene_order = np.argsort(gene_sum)[::-1]
     return gene_order.tolist()
 
-def get_exclusion_zone(
+def get_exclusion_zone_d(
     adata : AnnData,
     depth_exclusion: int = 3):
     sq.gr.spatial_neighbors(adata, delaunay = True, coord_type = "generic")
+    import pdb;pdb.set_trace()
     graph_distances = dijkstra(adata.obsp['spatial_connectivities'], directed=False)
     neighbors = [np.where(graph_distances[i] <= depth_exclusion)[0].tolist() for i in range(graph_distances.shape[0])]
     return neighbors
-    
+
+
+def bfs_neighbors(graph: csr_matrix, start_node: int, depth: int) -> list[int]:
+    visited = set([start_node])
+    queue = deque([(start_node, 0)])
+    result = []
+
+    while queue:
+        node, d = queue.popleft()
+        if d > depth:
+            continue
+        result.append(node)
+        neighbors = graph.indices[graph.indptr[node]:graph.indptr[node + 1]]
+        for neighbor in neighbors:
+            if neighbor not in visited:
+                visited.add(neighbor)
+                queue.append((neighbor, d + 1))
+    return result
+
+def get_exclusion_zone(
+    adata: AnnData,
+    depth_exclusion: int = 3,
+    chunk_size: int = 1000) -> list[list[int]]:
+   
+    sq.gr.spatial_neighbors(adata, delaunay=True, coord_type="generic")
+    graph = adata.obsp['spatial_connectivities'].tocsr()
+    n = graph.shape[0]
+    if chunk_size > n:
+        chunk_size = n
+        
+    neighbors_all = []
+
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        chunk_neighbors = [
+            bfs_neighbors(graph, i, depth_exclusion)
+            for i in range(start, end)
+        ]
+        neighbors_all.extend(chunk_neighbors)
+
+    return neighbors_all
 
 def get_hotspot_index(
     gene_set : list,
