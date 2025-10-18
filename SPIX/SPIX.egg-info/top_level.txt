@@ -1,1 +1,1 @@
-SPIX
+SPIX_module
