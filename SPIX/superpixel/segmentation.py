@@ -5,6 +5,7 @@ from anndata import AnnData
 from sklearn.cluster import KMeans
 import logging
 import time
+import re
 
 from ..utils.utils import create_pseudo_centroids
 
@@ -91,6 +92,15 @@ def _aggregate_matrix_by_barcode(
     agg = val_df.groupby("barcode", observed=True).mean()
     agg = agg.reindex(pd.Series(unique_order, dtype=str).values)
     return agg.drop(columns=[c for c in agg.columns if c == "barcode"]).values
+
+
+def _sanitize_segment_name(name: str) -> str:
+    """Return a filesystem-safe suffix for storing obsm keys."""
+    sanitized = re.sub(r"[^0-9a-zA-Z_]+", "_", str(name))
+    sanitized = sanitized.strip("_")
+    if not sanitized:
+        return "Segment"
+    return sanitized
 
 
 def n_segments_from_size(
@@ -806,7 +816,11 @@ def segment_image(
     # Pseudo-centroids to numpy aligned to adata order
     if isinstance(pseudo_centroids, pd.DataFrame):
         pseudo_centroids = pseudo_centroids.reindex(adata.obs.index.astype(str)).values
-    adata.obsm["X_embedding_segment"] = pseudo_centroids
+    segment_suffix = _sanitize_segment_name(Segment)
+    base_obsm_key = "X_embedding_segment"
+    prefixed_obsm_key = f"X_embedding_{segment_suffix}"
+    adata.obsm[base_obsm_key] = pseudo_centroids
+    adata.obsm[prefixed_obsm_key] = pseudo_centroids
     # Combined data (if available) — align to adata order
     if combined_data is not None:
         if isinstance(combined_data, pd.DataFrame):
@@ -814,9 +828,14 @@ def segment_image(
         else:
             cd_df = pd.DataFrame(combined_data, index=clusters_df["barcode"].astype(str))
         cd_df = cd_df.reindex(adata.obs.index.astype(str))
-        adata.obsm["X_embedding_scaled_for_segment"] = cd_df.values
-    elif "X_embedding_scaled_for_segment" in adata.obsm:
-        del adata.obsm["X_embedding_scaled_for_segment"]
+        scaled_base_key = "X_embedding_scaled_for_segment"
+        scaled_prefixed_key = f"X_embedding_scaled_for_{segment_suffix}"
+        adata.obsm[scaled_base_key] = cd_df.values
+        adata.obsm[scaled_prefixed_key] = cd_df.values
+    else:
+        for key in ("X_embedding_scaled_for_segment", f"X_embedding_scaled_for_{segment_suffix}"):
+            if key in adata.obsm:
+                del adata.obsm[key]
 
 
 def segment_image_inner(
