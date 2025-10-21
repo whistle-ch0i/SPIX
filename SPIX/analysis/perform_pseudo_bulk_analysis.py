@@ -4,8 +4,9 @@ import pandas as pd
 import numpy as np
 from scipy.sparse import issparse, csr_matrix, vstack
 import gc
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 import logging
+from pandas.api.types import CategoricalDtype, is_numeric_dtype
 
 # Set up logging 
 # This checks if handlers are already configured to avoid adding duplicates
@@ -50,6 +51,12 @@ def perform_pseudo_bulk_analysis(
     collapse_compute_distances: bool = False,        # compute mean distances for segment pairs (slower)
     # Graph-based coordinate (layout) options
     segment_coords_graph_align: bool = True,         # align graph layout to centroid coords via Procrustes
+    # Segment-level feature aggregation
+    aggregate_tiles: bool = False,
+    tile_numeric_columns: Optional[List[str]] = None,
+    aggregate_obsm_keys: Optional[List[str]] = None,
+    obsm_aggregate_suffix: Optional[str] = None,
+    segment_obs_columns: Optional[List[str]] = None,
 ) -> Tuple[sc.AnnData, pd.DataFrame]:
     """
     Perform Pseudo-Bulk Aggregation (by sum), preprocess data,
@@ -146,6 +153,26 @@ def perform_pseudo_bulk_analysis(
         When using `segment_coords_strategy='graph_spectral'`, align the graph
         layout to the original centroid coordinates via orthogonal Procrustes
         (rigid + scale) for a more interpretable overlay.
+    aggregate_tiles : bool, optional (default=False)
+        If True, compute mean values of tile-level numeric columns per segment and
+        append them to `new_adata.obs` (prefixed with ``tile_mean_``). Requires
+        `adata.uns['tiles']` with a ``'barcode'`` column for mapping.
+    tile_numeric_columns : list of str or None, optional (default=None)
+        Columns from `adata.uns['tiles']` to aggregate when `aggregate_tiles=True`.
+        If None, all numeric columns (excluding ``'origin'``) are averaged.
+    aggregate_obsm_keys : list of str or None, optional (default=None)
+        Keys in `adata.obsm` whose values should be averaged per segment and stored
+        on the pseudo-bulk object. Useful for propagating embeddings such as
+        `'X_embedding'` or `'X_embedding_equalize'`.
+    obsm_aggregate_suffix : str or None, optional (default=None)
+        Optional suffix appended to aggregated embedding keys when they are stored
+        in `new_adata.obsm`. If None, the original key name is reused.
+    segment_obs_columns : list of str or None, optional (default=None)
+        Column names from `adata.obs` to summarize per segment and append to
+        `new_adata.obs`. Categorical columns are aggregated by majority vote
+        (ties broken alphabetically), whereas numeric columns are averaged.
+        When None, all columns whose names start with `'Segment'` except
+        `segment_key` are included.
 
     Returns
     -------
@@ -198,7 +225,7 @@ def perform_pseudo_bulk_analysis(
             f"Invalid collapse_method '{collapse_method}'. Must be 'bincount' or 'sparse_mm'."
         )
 
-    # --- Input Validation ---
+# --- Input Validation ---
     if expr_agg not in ("sum", "mean"):
         _logger.error(f"Invalid expr_agg '{expr_agg}'. Must be 'sum' or 'mean'.")
         raise ValueError(f"Invalid expr_agg '{expr_agg}'. Must be 'sum' or 'mean'.")
@@ -206,14 +233,13 @@ def perform_pseudo_bulk_analysis(
         _logger.error(f"'{segment_key}' key is not present in adata.obs.")
         raise ValueError(f"'{segment_key}' key is not present in adata.obs.")
     if 'spatial' not in adata.obsm:
-         _logger.error("'spatial' coordinates not found in adata.obsm.")
-         raise ValueError("'spatial' coordinates not found in adata.obsm.")
+        _logger.error("'spatial' coordinates not found in adata.obsm.")
+        raise ValueError("'spatial' coordinates not found in adata.obsm.")
     if batch_key is not None and batch_key not in adata.obs.columns:
-         _logger.error(f"'{batch_key}' key specified for batch correction is not present in adata.obs.")
-         raise ValueError(f"'{batch_key}' key specified for batch correction is not present in adata.obs.")
+        _logger.error(f"'{batch_key}' key specified for batch correction is not present in adata.obs.")
+        raise ValueError(f"'{batch_key}' key specified for batch correction is not present in adata.obs.")
     if perform_pca and batch_key is not None and sce is None:
-         _logger.warning("Harmony integration requested via batch_key but scanpy.external (needed for harmony) is not available.")
-
+        _logger.warning("Harmony integration requested via batch_key but scanpy.external (needed for harmony) is not available.")
 
     _logger.info("--- Starting Pseudo-Bulk Aggregation and Analysis ---")
     _logger.info(f"Segmenting based on key: '{segment_key}'")
@@ -323,10 +349,219 @@ def perform_pseudo_bulk_analysis(
     del pseudo_bulk_coords
     gc.collect()
 
+    # Create a minimal tiles table so plotting utilities expecting adata.uns['tiles'] work
+    try:
+        spatial_df = pd.DataFrame(
+            new_adata.obsm['spatial'],
+            index=new_adata.obs_names,
+        )
+        # Ensure at least x/y column names; fallback to generic if higher dimensional
+        coord_cols = ['x', 'y'] + [f'z{i}' for i in range(spatial_df.shape[1] - 2)]
+        spatial_df.columns = coord_cols[: spatial_df.shape[1]]
+        tiles_stub = spatial_df.reset_index().rename(columns={'index': 'barcode'})
+        tiles_stub['barcode'] = tiles_stub['barcode'].astype(str)
+        if 'origin' not in tiles_stub.columns:
+            tiles_stub['origin'] = 1
+        new_adata.uns['tiles'] = tiles_stub
+    except Exception as exc:
+        _logger.warning(f"Failed to initialize segment-level tiles table for plotting: {exc}")
+
     # Add 'counts' layer (the raw aggregated means before norm/log)
     # This is useful to keep the original mean values
     new_adata.layers['counts'] = new_adata.X.copy()
     _logger.info("Aggregated mean counts added to 'counts' layer.")
+
+    # Optionally aggregate additional obs columns (e.g., other Segment labels) to segment-level summaries
+    if segment_obs_columns is None:
+        segment_obs_columns = [
+            col for col in adata.obs.columns
+            if col != segment_key and isinstance(col, str) and col.startswith("Segment")
+        ]
+    if segment_obs_columns:
+        _logger.info(f"Aggregating supplemental obs columns per segment: {segment_obs_columns}")
+        available_cols = []
+        missing_cols = []
+        for col in segment_obs_columns:
+            if col in adata.obs.columns:
+                available_cols.append(col)
+            else:
+                missing_cols.append(col)
+
+        if missing_cols:
+            _logger.warning(f"Requested obs columns not found and skipped: {missing_cols}")
+
+        if available_cols:
+            obs_subset = adata.obs[available_cols].copy()
+            obs_subset["_segment_tmp"] = segments.astype(str).values
+            grouped = obs_subset.groupby("_segment_tmp", observed=True)
+
+            numeric_cols = [col for col in available_cols if is_numeric_dtype(obs_subset[col])]
+            if numeric_cols:
+                try:
+                    numeric_means = (
+                        grouped[numeric_cols]
+                        .mean()
+                        .reindex(new_adata.obs_names)
+                        .astype(np.float32)
+                    )
+                    new_adata.obs = new_adata.obs.join(numeric_means)
+                except Exception as exc:
+                    _logger.warning(f"Failed to aggregate numeric columns {numeric_cols}: {exc}")
+
+            cat_cols = [col for col in available_cols if col not in numeric_cols]
+            if cat_cols:
+                cat_results = {}
+                for col in cat_cols:
+                    series = obs_subset[col]
+                    try:
+                        df_counts = (
+                            pd.DataFrame(
+                                {
+                                    "_segment_tmp": obs_subset["_segment_tmp"],
+                                    "value": series,
+                                }
+                            )
+                            .dropna(subset=["value"])
+                            .groupby(["_segment_tmp", "value"], observed=True)
+                            .size()
+                            .unstack("value", fill_value=0)
+                        )
+                        if df_counts.empty:
+                            majority = pd.Series(np.nan, index=new_adata.obs_names)
+                        else:
+                            df_counts = df_counts.reindex(
+                                sorted(df_counts.columns, key=lambda x: str(x)),
+                                axis=1,
+                            )
+                            arr = df_counts.to_numpy()
+                            max_counts = arr.max(axis=1)
+                            mask = arr == max_counts[:, None]
+                            first_idx = mask.argmax(axis=1)
+                            winners = df_counts.columns.to_numpy()[first_idx]
+                            majority = pd.Series(winners, index=df_counts.index)
+                            majority = majority.reindex(new_adata.obs_names)
+                        cat_results[col] = majority
+                    except Exception as exc:
+                        _logger.warning(f"Failed to aggregate column '{col}' by segment: {exc}")
+
+                if cat_results:
+                    cat_df = pd.DataFrame(cat_results)
+                    new_adata.obs = new_adata.obs.join(cat_df)
+                    for col, series in cat_results.items():
+                        source = obs_subset[col]
+                        if isinstance(source.dtype, CategoricalDtype):
+                            new_adata.obs[col] = pd.Categorical(
+                                new_adata.obs[col],
+                                categories=list(source.cat.categories),
+                            )
+
+    # Optionally aggregate additional embeddings from obsm onto the pseudo-bulk object
+    if aggregate_obsm_keys:
+        _logger.info(f"Aggregating additional obsm keys per segment: {aggregate_obsm_keys}")
+        for key in aggregate_obsm_keys:
+            if key not in adata.obsm:
+                _logger.warning(f"Requested obsm key '{key}' not found in adata.obsm; skipping.")
+                continue
+            emb_data = adata.obsm[key]
+            if isinstance(emb_data, pd.DataFrame):
+                emb_df = emb_data.copy()
+            else:
+                emb_array = np.asarray(emb_data)
+                if emb_array.shape[0] != adata.n_obs:
+                    _logger.warning(
+                        f"obsm key '{key}' has shape {emb_array.shape}; expected first dimension to equal n_obs ({adata.n_obs}). Skipping aggregation."
+                    )
+                    continue
+                emb_df = pd.DataFrame(emb_array, index=adata.obs_names)
+
+            # Ensure only numeric columns are used for aggregation
+            numeric_cols = emb_df.select_dtypes(include=[np.number]).columns
+            if emb_df.shape[1] != len(numeric_cols):
+                if len(numeric_cols) == 0:
+                    _logger.warning(f"obsm key '{key}' does not contain numeric data; skipping aggregation.")
+                    continue
+                emb_df = emb_df[numeric_cols]
+                _logger.debug(f"Subset obsm '{key}' to numeric columns for aggregation: {list(numeric_cols)}")
+
+            emb_means = (
+                emb_df.groupby(segments, observed=True)
+                .mean()
+                .reindex(new_adata.obs_names)
+                .astype(np.float32)
+            )
+            key_out = key if obsm_aggregate_suffix is None else f"{key}{obsm_aggregate_suffix}"
+            new_adata.obsm[key_out] = emb_means
+            _logger.debug(f"Stored aggregated obsm key '{key_out}' with shape {emb_means.shape}.")
+
+    # Optionally aggregate tile-level information to segment summaries
+    if aggregate_tiles:
+        if 'tiles' not in adata.uns:
+            _logger.warning("aggregate_tiles=True but 'tiles' not found in adata.uns; skipping tile aggregation.")
+        else:
+            tiles_df = adata.uns['tiles']
+            if not isinstance(tiles_df, pd.DataFrame):
+                _logger.warning("adata.uns['tiles'] is not a pandas DataFrame; skipping tile aggregation.")
+            elif 'barcode' not in tiles_df.columns:
+                _logger.warning("adata.uns['tiles'] lacks 'barcode' column; cannot map tiles to segments.")
+            else:
+                tiles_df = tiles_df.copy()
+                tiles_df['barcode'] = tiles_df['barcode'].astype(str)
+                segment_map = pd.DataFrame({
+                    'barcode': adata.obs_names.astype(str),
+                    '_segment_tmp_key': segments.astype(str).values,
+                })
+                tiles_with_segments = tiles_df.merge(segment_map, on='barcode', how='inner')
+                if tiles_with_segments.empty:
+                    _logger.warning("No tiles matched to segments during aggregation; skipping.")
+                else:
+                    if tile_numeric_columns is None:
+                        numeric_cols = tiles_with_segments.select_dtypes(include=[np.number]).columns.tolist()
+                        # Remove helper or identifier columns
+                        if '_segment_tmp_key' in numeric_cols:
+                            numeric_cols.remove('_segment_tmp_key')
+                        # averaging origin flag is often not meaningful; drop unless explicitly requested
+                        if 'origin' in numeric_cols and tile_numeric_columns is None:
+                            numeric_cols.remove('origin')
+                    else:
+                        numeric_cols = [col for col in tile_numeric_columns if col in tiles_with_segments.columns]
+                        missing_cols = sorted(set(tile_numeric_columns) - set(numeric_cols))
+                        if missing_cols:
+                            _logger.warning(
+                                f"Requested tile columns {missing_cols} not found in tiles DataFrame; they were skipped."
+                            )
+
+                    if not numeric_cols:
+                        _logger.warning("No numeric tile columns available for aggregation after filtering; skipping.")
+                    else:
+                        aggregated_numeric = (
+                            tiles_with_segments.groupby('_segment_tmp_key', observed=True)[numeric_cols]
+                            .mean()
+                            .reindex(new_adata.obs_names.astype(str))
+                            .astype(np.float32)
+                        )
+                        aggregated_numeric.index = new_adata.obs_names  # ensure identical index object
+                        tile_means_pref = aggregated_numeric.add_prefix('tile_mean_')
+                        new_adata.obs = new_adata.obs.join(tile_means_pref)
+                        _logger.info(
+                            f"Aggregated tile columns per segment and added {tile_means_pref.shape[1]} columns to new_adata.obs."
+                        )
+                        # Assemble a segment-level tiles table using aggregated means
+                        tiles_table = aggregated_numeric.copy()
+                        # Ensure canonical coordinate columns exist; fallback to spatial centroids
+                        if not {'x', 'y'}.issubset(tiles_table.columns):
+                            spatial_cols = pd.DataFrame(
+                                new_adata.obsm['spatial'],
+                                index=new_adata.obs_names,
+                            )
+                            coord_cols = ['x', 'y'] + [f'z{i}' for i in range(spatial_cols.shape[1] - 2)]
+                            spatial_cols.columns = coord_cols[: spatial_cols.shape[1]]
+                            for col in spatial_cols.columns:
+                                if col not in tiles_table.columns:
+                                    tiles_table[col] = spatial_cols[col].astype(np.float32)
+                        tiles_table['origin'] = 1
+                        tiles_table = tiles_table.reset_index().rename(columns={'index': 'barcode'})
+                        tiles_table['barcode'] = tiles_table['barcode'].astype(str)
+                        new_adata.uns['tiles'] = tiles_table
 
     # Add batch_key from original adata.obs if provided and present
     perform_batch_correction = False
