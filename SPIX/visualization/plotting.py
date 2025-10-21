@@ -190,6 +190,7 @@ def image_plot(
     segment_pie_linewidth=0.8,
     # Segment-major coloring
     segment_color_by_major=False,  # If True, color all tiles in a segment by the segment-major of `color_by`
+    segment_key="Segment",         # obs column storing segment assignments
     # Per-spot alpha controls
     alpha_by=None,               # None|'embedding'|<obs column name>; per-spot alpha source
     alpha_range=(0.1, 1.0),      # min/max alpha for mapping to RGBA
@@ -237,14 +238,39 @@ def image_plot(
         .reset_index(drop=True)
     )
 
-    if "Segment" in adata.obs.columns:
-        coordinates_df["Segment"] = coordinates_df["barcode"].map(adata.obs["Segment"])
-        if coordinates_df["Segment"].isnull().any():
-            missing = coordinates_df["Segment"].isnull().sum()
+    seg_col = None
+    has_segments = False
+    if segment_key is not None:
+        candidate = segment_key
+        if candidate in adata.obs.columns:
+            seg_col = candidate
+            has_segments = True
+        elif candidate != "Segment" and "Segment" in adata.obs.columns:
             logger.warning(
-                f"'Segment' label for {missing} barcodes is missing. These rows will be dropped."
+                f"Segment key '{candidate}' not found; falling back to 'Segment' column."
             )
-            coordinates_df = coordinates_df.dropna(subset=["Segment"])
+            segment_key = "Segment"
+            seg_col = "Segment"
+            has_segments = True
+        else:
+            logger.warning(
+                f"Segment key '{candidate}' not found in adata.obs; disabling segment-specific annotations."
+            )
+    if has_segments and seg_col is not None:
+        coordinates_df[seg_col] = coordinates_df["barcode"].map(adata.obs[seg_col])
+        if coordinates_df[seg_col].isnull().any():
+            missing = coordinates_df[seg_col].isnull().sum()
+            logger.warning(
+                f"'{seg_col}' label for {missing} barcodes is missing. These rows will be dropped."
+            )
+            coordinates_df = coordinates_df.dropna(subset=[seg_col])
+        coordinates_df["Segment"] = coordinates_df[seg_col]
+    else:
+        coordinates_df = coordinates_df.drop(columns=["Segment"], errors="ignore")
+        has_segments = False
+        seg_col = None
+
+    segment_available = has_segments and "Segment" in coordinates_df.columns
 
     coordinates_df["x"] = pd.to_numeric(coordinates_df["x"], errors="coerce")
     coordinates_df["y"] = pd.to_numeric(coordinates_df["y"], errors="coerce")
@@ -347,7 +373,7 @@ def image_plot(
         coordinates = coordinates_df.copy()
 
         # Segment-major coloring
-        if segment_color_by_major and "Segment" in coordinates_df.columns:
+        if segment_color_by_major and segment_available:
             try:
                 seg_major = (
                     coordinates_df.groupby("Segment")[color_by]
@@ -419,7 +445,7 @@ def image_plot(
         fixed_boundary_color if fixed_boundary_color is not None else boundary_color
     )
 
-    if "Segment" in adata.obs.columns:
+    if segment_available:
         # Normalize highlight_segments input
         if highlight_segments is not None:
             if isinstance(highlight_segments, str):
@@ -499,11 +525,7 @@ def image_plot(
         img = np.zeros((h, w, 4), dtype=np.float32)  # start fully transparent
         value_buf = np.full((h, w), -np.inf, dtype=float)
         label_img = None
-        if (
-            plot_boundaries
-            and boundary_method == "pixel"
-            and "Segment" in coordinates_df.columns
-        ):
+        if plot_boundaries and boundary_method == "pixel" and segment_available:
             label_img = np.full((h, w), -1, dtype=int)
             seg_codes = pd.Categorical(coordinates_df["Segment"]).codes
 
@@ -605,7 +627,7 @@ def image_plot(
                 ax.legend(handles=handles, loc=legend_loc, ncol=legend_ncol, frameon=False, fontsize=auto_fs)
 
         # --- Segment pies (imshow path) ---
-        if segment_show_pie and (segment_annotate_by is not None) and ("Segment" in coordinates_df.columns):
+        if segment_show_pie and (segment_annotate_by is not None) and segment_available:
             seg_ser = coordinates_df["Segment"].astype("category")
             comp_ser = coordinates_df["barcode"].map(adata.obs[segment_annotate_by])
             comp_ser = pd.Categorical(comp_ser)
@@ -797,11 +819,7 @@ def image_plot(
                 ax.legend(handles=handles, loc=legend_loc, ncol=legend_ncol, frameon=False, fontsize=auto_fs)
 
         # Pixel-style boundaries from scatter points
-        if (
-            plot_boundaries
-            and boundary_method == "pixel"
-            and "Segment" in coordinates_df.columns
-        ):
+        if plot_boundaries and boundary_method == "pixel" and segment_available:
             fig_dpi = fig.get_dpi()
             w_pixels = int(np.ceil(figsize[0] * fig_dpi))
             h_pixels = int(np.ceil(figsize[1] * fig_dpi))
@@ -939,7 +957,7 @@ def image_plot(
         and show_legend
         and (segment_annotate_by is not None)
         and (not use_categorical)
-        and ("Segment" in adata.obs.columns)
+        and segment_available
     ):
         try:
             comp_ser = coordinates_df["barcode"].map(adata.obs[segment_annotate_by])
@@ -1029,11 +1047,7 @@ def image_plot(
     linestyle_options = {"solid": "-", "dashed": "--", "dotted": ":"}
     linestyle = linestyle_options.get(boundary_style, "-")
 
-    if (
-        "Segment" in adata.obs.columns
-        and plot_boundaries
-        and boundary_method != "pixel"
-    ):
+    if segment_available and plot_boundaries and boundary_method != "pixel":
         tree = KDTree(coordinates[["x", "y"]].values)
         segments = coordinates_df["Segment"].unique()
 
@@ -1355,6 +1369,7 @@ def image_plot_with_spatial_image(
     segment_pie_edgecolor="black",
     segment_pie_linewidth=0.8,
     segment_color_by_major=False,
+    segment_key="Segment",
     # Per-spot alpha controls
     alpha_by=None,               # None|'embedding'|<obs column name>
     alpha_range=(0.1, 1.0),
@@ -1418,14 +1433,38 @@ def image_plot_with_spatial_image(
         .reset_index(drop=True)
     )
 
-    if "Segment" in adata.obs.columns:
-        coordinates_df["Segment"] = coordinates_df["barcode"].map(adata.obs["Segment"])
-        if coordinates_df["Segment"].isnull().any():
-            missing = coordinates_df["Segment"].isnull().sum()
+    seg_col = None
+    has_segments = False
+    if segment_key is not None:
+        candidate = segment_key
+        if candidate in adata.obs.columns:
+            seg_col = candidate
+            has_segments = True
+        elif candidate != "Segment" and "Segment" in adata.obs.columns:
             logger.warning(
-                f"'Segment' label for {missing} barcodes is missing. These rows will be dropped."
+                f"Segment key '{candidate}' not found; falling back to 'Segment' column."
             )
-            coordinates_df = coordinates_df.dropna(subset=["Segment"])
+            seg_col = "Segment"
+            has_segments = True
+        else:
+            logger.warning(
+                f"Segment key '{candidate}' not found in adata.obs; disabling segment-specific annotations."
+            )
+    if has_segments and seg_col is not None:
+        coordinates_df[seg_col] = coordinates_df["barcode"].map(adata.obs[seg_col])
+        if coordinates_df[seg_col].isnull().any():
+            missing = coordinates_df[seg_col].isnull().sum()
+            logger.warning(
+                f"'{seg_col}' label for {missing} barcodes is missing. These rows will be dropped."
+            )
+            coordinates_df = coordinates_df.dropna(subset=[seg_col])
+        coordinates_df["Segment"] = coordinates_df[seg_col]
+    else:
+        coordinates_df = coordinates_df.drop(columns=["Segment"], errors="ignore")
+        has_segments = False
+        seg_col = None
+
+    segment_available = has_segments and "Segment" in coordinates_df.columns
 
     coordinates_df["x"] = pd.to_numeric(coordinates_df["x"], errors="coerce")
     coordinates_df["y"] = pd.to_numeric(coordinates_df["y"], errors="coerce")
@@ -1509,7 +1548,7 @@ def image_plot_with_spatial_image(
         codes = cats.codes
         cols = category_lut[codes]
         # Segment-major unification
-        if segment_color_by_major and "Segment" in coordinates_df.columns:
+        if segment_color_by_major and segment_available:
             try:
                 seg_major = coordinates_df.groupby("Segment")[color_by].agg(lambda s: s.value_counts().idxmax())
                 major_labels = coordinates_df["Segment"].map(seg_major)
@@ -1568,7 +1607,7 @@ def image_plot_with_spatial_image(
     color_for_pixel = (
         fixed_boundary_color if fixed_boundary_color is not None else boundary_color
     )
-    if "Segment" in adata.obs.columns:
+    if segment_available:
         # Normalize highlight_segments input
         if highlight_segments is not None:
             if isinstance(highlight_segments, str):
@@ -1672,11 +1711,7 @@ def image_plot_with_spatial_image(
         img_rgba = np.zeros((h, w, 4), dtype=np.float32)
         value_buf = np.full((h, w), -np.inf, dtype=float)
         label_img = None
-        if (
-            plot_boundaries
-            and boundary_method == "pixel"
-            and "Segment" in coordinates_df.columns
-        ):
+        if plot_boundaries and boundary_method == "pixel" and segment_available:
             label_img = np.full((h, w), -1, dtype=int)
             seg_codes = pd.Categorical(coordinates_df["Segment"]).codes
 
@@ -1838,11 +1873,7 @@ def image_plot_with_spatial_image(
                 ax.legend(handles=handles, loc=legend_loc, ncol=legend_ncol, frameon=False, fontsize=auto_fs)
 
         # Pixel boundary extraction for scatter
-        if (
-            plot_boundaries
-            and boundary_method == "pixel"
-            and "Segment" in coordinates_df.columns
-        ):
+        if plot_boundaries and boundary_method == "pixel" and segment_available:
             fig_dpi = fig.get_dpi()
             w_pixels = int(np.ceil(figsize[0] * fig_dpi))
             h_pixels = int(np.ceil(figsize[1] * fig_dpi))
