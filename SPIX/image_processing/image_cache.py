@@ -55,6 +55,7 @@ def cache_embedding_image(
     highlight_brighten_factor: float = 1.2,
     dim_other_segments: float = 0.3,
     dim_to_grey: bool = True,
+    segment_key: Optional[str] = "Segment",
     **plot_kwargs,
 ) -> Dict[str, Any]:
     """Rasterize embeddings + spatial coords to an image and cache in ``adata.uns``.
@@ -84,6 +85,36 @@ def cache_embedding_image(
 
     if len(coordinates_df) == 0:
         raise ValueError("No coordinates found after merging tiles with embeddings.")
+
+    segment_series = None
+    seg_col: Optional[str] = None
+    segment_available = False
+    if segment_key is not None:
+        candidate = segment_key
+        if candidate in adata.obs.columns:
+            seg_col = candidate
+            segment_available = True
+        elif candidate != "Segment" and "Segment" in adata.obs.columns:
+            if verbose:
+                print(f"[cache_embedding_image] segment_key '{candidate}' not found; using 'Segment' column instead.")
+            seg_col = "Segment"
+            segment_available = True
+        elif verbose:
+            print(f"[cache_embedding_image] segment_key '{candidate}' not found in adata.obs; segment overlays disabled.")
+
+    if segment_available and seg_col is not None:
+        coordinates_df[seg_col] = coordinates_df["barcode"].map(adata.obs[seg_col])
+        if coordinates_df[seg_col].isnull().any():
+            missing = int(coordinates_df[seg_col].isnull().sum())
+            if verbose:
+                print(f"[cache_embedding_image] '{seg_col}' labels missing for {missing} barcodes. Dropping them.")
+            coordinates_df = coordinates_df.dropna(subset=[seg_col])
+        coordinates_df["Segment"] = coordinates_df[seg_col]
+        segment_series = adata.obs[seg_col]
+    else:
+        coordinates_df = coordinates_df.drop(columns=["Segment"], errors="ignore")
+        segment_available = False
+        seg_col = None
 
     # Order mapping back to AnnData.obs positions
     obs_indexer = {bc: i for i, bc in enumerate(adata.obs.index.astype(str))}
@@ -190,10 +221,9 @@ def cache_embedding_image(
 
     # Optional: build label image for boundary overlay (preview only)
     label_img = None
-    if plot_boundaries and ("Segment" in adata.obs.columns):
+    if plot_boundaries and segment_available and segment_series is not None:
         # Map per-tile Segment labels
-        seg_series = adata.obs["Segment"]
-        seg_codes = pd.Categorical(coordinates_df["barcode"].map(seg_series)).codes
+        seg_codes = pd.Categorical(coordinates_df["barcode"].map(segment_series)).codes
         label_img = np.full((h, w), -1, dtype=int)
         for i in range(0, num_tiles, max(1, chunk_size)):
             idx = order_idx[i : min(i + chunk_size, num_tiles)]
@@ -267,6 +297,8 @@ def cache_embedding_image(
         "tile_obs_indices": tile_obs_indices.astype(np.int64),
         "barcodes": coordinates_df["barcode"].astype(str).to_list(),
         "origin_flags": coordinates_df.get("origin", pd.Series(index=coordinates_df.index, data=1)).astype(int).to_numpy(),
+        "segment_key": seg_col,
+        "segment_key_requested": segment_key,
         # provenance
         "created_by": "cache_embedding_image",
         "history": [],
@@ -297,6 +329,8 @@ def cache_embedding_image(
             "highlight_brighten_factor": float(highlight_brighten_factor),
             "dim_other_segments": float(dim_other_segments),
             "dim_to_grey": bool(dim_to_grey),
+            "segment_key": seg_col,
+            "segment_key_requested": segment_key,
             **plot_kwargs,
         },
     }
@@ -321,8 +355,8 @@ def cache_embedding_image(
             bmask = binary_dilation(bmask, iterations=lw - 1)
         # color setup
         base_col = np.array(mcolors.to_rgb(boundary_color), dtype=np.float32)
-        if highlight_segments is not None:
-            cats = pd.Categorical(adata.obs["Segment"]).categories
+        if highlight_segments is not None and segment_available and segment_series is not None:
+            cats = pd.Categorical(segment_series).categories
             codes = [cats.get_loc(seg) for seg in highlight_segments if seg in cats]
             if codes:
                 hmask = np.isin(label_img, np.array(codes, dtype=int)) & bmask
