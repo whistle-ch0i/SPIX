@@ -1746,3 +1746,85 @@ def select_initial_indices(
     else:
         raise ValueError(f"Unknown index selection method '{method}'")
     return indices
+
+import numpy as np
+import pandas as pd
+
+
+# Untested!!!! Will need to check this function first
+# Pushing to main so you can see it.
+def block_permutation_test(
+    adata,
+    gene,
+    cell_type_col='cell_type',
+    block_col='block',
+    n_permutations=1000,
+    stat_func=None,
+    random_state=0
+):
+    """
+    Test for cell-type-specific expression of a gene using block-aware permutation tests.
+
+    Parameters
+    ----------
+    adata : AnnData
+        Object containing .X (expression) and .obs with cell type and block columns.
+    gene : str
+        Gene name to test.
+    cell_type_col : str
+        Column name in adata.obs for cell-type labels.
+    block_col : str
+        Column name in adata.obs for block labels.
+    n_permutations : int
+        Number of block-permutations to run.
+    stat_func : callable, optional
+        Custom statistic function f(expr, is_type) -> float.
+        Default: mean(expr[is_type]) - mean(expr[~is_type]).
+    random_state : int
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: ['cell_type', 'observed', 'pval', 'zscore']
+    """
+    rng = np.random.default_rng(random_state)
+
+    expr = adata[:, gene].X
+    if hasattr(expr, "toarray"):  # handle sparse matrix
+        expr = expr.toarray().flatten()
+    else:
+        expr = np.asarray(expr).flatten()
+
+    cell_types = adata.obs[cell_type_col].values
+    blocks = adata.obs[block_col].values
+    unique_types = np.unique(cell_types)
+    unique_blocks = np.unique(blocks)
+
+    # default statistic: mean difference
+    if stat_func is None:
+        def stat_func(expr, mask):
+            return np.mean(expr[mask]) - np.mean(expr[~mask])
+
+    results = []
+
+    for ct in unique_types:
+        mask = (cell_types == ct)
+        observed = stat_func(expr, mask)
+
+        perm_stats = np.zeros(n_permutations)
+        for i in range(n_permutations):
+            perm_labels = cell_types.copy()
+            # shuffle labels within each block
+            for b in unique_blocks:
+                idx = np.where(blocks == b)[0]
+                perm_labels[idx] = rng.permutation(perm_labels[idx])
+            mask_perm = (perm_labels == ct)
+            perm_stats[i] = stat_func(expr, mask_perm)
+
+        # two-sided p-value
+        pval = np.mean(np.abs(perm_stats) >= np.abs(observed))
+        zscore = (observed - np.mean(perm_stats)) / np.std(perm_stats)
+        results.append((ct, observed, pval, zscore))
+
+    return pd.DataFrame(results, columns=['cell_type', 'observed', 'pval', 'zscore'])
