@@ -129,6 +129,50 @@ def n_segments_from_size(
     return n_segments
 
 
+def n_segments_for_targets(
+    tiles_df: pd.DataFrame, target_segment_ums: list[float], pitch_um: float = 2.0
+) -> dict[float, int]:
+    """Calculate ``n_segments`` for multiple target sizes."""
+
+    return {
+        float(target): n_segments_from_size(tiles_df, target, pitch_um=pitch_um)
+        for target in target_segment_ums
+    }
+
+
+def density_adjusted_segment_counts(
+    tiles_df: pd.DataFrame,
+    target_segment_ums: list[float],
+    pitch_um: float = 2.0,
+    group_col: str | None = None,
+) -> dict[str, dict[float, int]]:
+    """Estimate ``n_segments`` per region with a density-based target adjustment."""
+
+    if group_col is None:
+        grouped = {"global": tiles_df}
+    else:
+        grouped = {str(name): group for name, group in tiles_df.groupby(group_col, observed=False)}
+
+    counts = {name: len(group) for name, group in grouped.items() if len(group) > 0}
+    if not counts:
+        return {}
+    median_count = np.median(list(counts.values())) or 1.0
+
+    per_region = {}
+    for name, group in grouped.items():
+        if len(group) == 0:
+            continue
+        density_scale = np.sqrt(len(group) / median_count)
+        adjusted = {}
+        for target in target_segment_ums:
+            adjusted_target = float(target) / max(density_scale, 1e-6)
+            adjusted[target] = n_segments_from_size(
+                group, target_um=adjusted_target, pitch_um=pitch_um
+            )
+        per_region[str(name)] = adjusted
+    return per_region
+
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -836,6 +880,160 @@ def segment_image(
         for key in ("X_embedding_scaled_for_segment", f"X_embedding_scaled_for_{segment_suffix}"):
             if key in adata.obsm:
                 del adata.obsm[key]
+
+
+def multiscale_density_slic_segmentation(
+    adata: AnnData,
+    target_segment_ums: list[float],
+    dimensions: list[int] | None = None,
+    embedding: str = "X_embedding",
+    compactness: float = 1.0,
+    scaling: float = 0.3,
+    pitch_um: float = 2.0,
+    library_id: str | None = None,
+    grid_size_um: float | None = None,
+    origin: bool = True,
+    segment_key: str = "Segment_multi",
+    index_selection: str = "random",
+    max_iter: int = 1000,
+    verbose: bool = True,
+):
+    """Run multi-scale SLIC with density-aware ``n_segments`` and merged labels.
+
+    The function estimates ``n_segments`` for each target size per region (library or
+    spatial grid) using local spot density, runs SLIC for each region/scale, and merges
+    labels so that finer segments override coarser ones when they subdivide them. The
+    merged labels are stored in ``adata.obs[segment_key]`` and corresponding
+    pseudo-centroids are written to ``adata.obsm``.
+    """
+
+    if not target_segment_ums:
+        raise ValueError("target_segment_ums must contain at least one value")
+    if embedding not in adata.obsm:
+        raise ValueError(f"Embedding '{embedding}' not found in adata.obsm.")
+
+    if dimensions is None:
+        dimensions = list(range(adata.obsm[embedding].shape[1]))
+    target_segment_ums = [float(t) for t in target_segment_ums]
+
+    tiles_all = adata.uns["tiles"]
+    if origin:
+        tiles = tiles_all[tiles_all.get("origin", 1) == 1]
+    else:
+        tiles = tiles_all
+
+    tile_colors = pd.DataFrame(np.array(adata.obsm[embedding])[:, dimensions])
+    tile_colors["barcode"] = adata.obs.index
+    base_embeddings_df = tile_colors.drop(columns=["barcode"]).copy()
+    base_embeddings_df.index = tile_colors["barcode"].astype(str)
+
+    coordinates_df = (
+        pd.merge(tiles, tile_colors, on="barcode", how="right")
+        .dropna()
+        .reset_index(drop=True)
+    )
+
+    group_col = None
+    if library_id is not None:
+        if library_id not in adata.obs.columns:
+            raise ValueError(
+                f"Library ID column '{library_id}' not found in adata.obs."
+            )
+        lib_info = adata.obs[[library_id]].copy()
+        lib_info["barcode"] = lib_info.index
+        coordinates_df = pd.merge(coordinates_df, lib_info, on="barcode", how="left")
+        group_col = library_id
+    elif grid_size_um is not None:
+        if grid_size_um <= 0:
+            raise ValueError("grid_size_um must be positive when provided")
+        coordinates_df["grid_x"] = np.floor(coordinates_df["x"] / grid_size_um).astype(int)
+        coordinates_df["grid_y"] = np.floor(coordinates_df["y"] / grid_size_um).astype(int)
+        coordinates_df["region_id"] = (
+            coordinates_df["grid_x"].astype(str)
+            + "_"
+            + coordinates_df["grid_y"].astype(str)
+        )
+        group_col = "region_id"
+
+    global_segments = n_segments_for_targets(
+        coordinates_df, target_segment_ums, pitch_um=pitch_um
+    )
+    region_segments = density_adjusted_segment_counts(
+        coordinates_df, target_segment_ums, pitch_um=pitch_um, group_col=group_col
+    )
+
+    final_labels = np.full(len(coordinates_df), -1, dtype=int)
+    label_offset = 0
+    target_sorted = sorted(target_segment_ums, reverse=True)
+
+    if group_col is not None:
+        grouped_iter = coordinates_df.groupby(group_col, observed=False)
+    else:
+        grouped_iter = [("global", coordinates_df)]
+
+    for region_name, group in grouped_iter:
+        region_name = str(region_name)
+        group_indices = group.index.to_numpy()
+        spatial_coords = group[["x", "y"]].values
+        drop_cols = {"barcode", "x", "y", "origin", group_col, "grid_x", "grid_y", "region_id"}
+        embeddings = group.drop(columns=[c for c in drop_cols if c in group.columns]).values
+
+        for target in target_sorted:
+            n_seg = region_segments.get(region_name, {}).get(
+                target, global_segments.get(target, n_segments_from_size(group, target, pitch_um=pitch_um))
+            )
+            labels, _ = slic_segmentation(
+                embeddings,
+                spatial_coords,
+                n_segments=int(n_seg),
+                compactness=compactness,
+                scaling=scaling,
+                index_selection=index_selection,
+                max_iter=max_iter,
+                verbose=verbose,
+            )
+
+            unique_labels = np.unique(labels)
+            mapping = {lab: label_offset + i for i, lab in enumerate(unique_labels)}
+            remapped = np.array([mapping[l] for l in labels], dtype=int)
+            label_offset += len(unique_labels)
+
+            current = final_labels[group_indices]
+            if np.all(current == -1):
+                final_labels[group_indices] = remapped
+                continue
+
+            for old_label in np.unique(current):
+                mask = current == old_label
+                if not mask.any():
+                    continue
+                new_sub = remapped[mask]
+                if len(np.unique(new_sub)) > 1:
+                    final_labels[group_indices[mask]] = new_sub
+
+    clusters_df = _aggregate_labels_majority(
+        coordinates_df["barcode"],
+        final_labels,
+        origin_flags=coordinates_df.get("origin", pd.Series(index=coordinates_df.index, data=0)).values,
+    )
+    emb_base = base_embeddings_df.loc[clusters_df["barcode"].astype(str)].copy()
+    pseudo_centroids = create_pseudo_centroids(
+        emb_base,
+        clusters_df,
+        emb_base.columns,
+    )
+
+    seg_map = clusters_df.set_index("barcode")["Segment"].astype(object)
+    adata.obs[segment_key] = pd.Categorical(
+        pd.Series(adata.obs.index.astype(str)).map(seg_map).values
+    )
+    if isinstance(pseudo_centroids, pd.DataFrame):
+        pseudo_centroids = pseudo_centroids.reindex(adata.obs.index.astype(str)).values
+    segment_suffix = _sanitize_segment_name(segment_key)
+    base_obsm_key = "X_embedding_segment"
+    prefixed_obsm_key = f"X_embedding_{segment_suffix}"
+    adata.obsm[base_obsm_key] = pseudo_centroids
+    adata.obsm[prefixed_obsm_key] = pseudo_centroids
 
 
 def segment_image_inner(
