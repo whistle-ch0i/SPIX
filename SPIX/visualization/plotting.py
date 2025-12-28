@@ -196,6 +196,9 @@ def image_plot(
     alpha_range=(0.1, 1.0),      # min/max alpha for mapping to RGBA
     alpha_clip=None,             # (vmin, vmax) or None -> auto percentiles
     alpha_invert=False,          # invert mapping
+    # Brightness / mixing controls for continuous (3D) embeddings
+    brighten_continuous=False,   # If True, brighten 3D continuous colors
+    continuous_gamma=0.8,        # Gamma < 1 brightens mid-tones
 ):
     """Visualize embeddings as a raster image with optional boundaries and per-spot alpha.
 
@@ -420,6 +423,25 @@ def image_plot(
         coordinates = rebalance_colors(coordinates_df, dimensions)
         if len(dimensions) == 3:
             cols = coordinates[["R", "G", "B"]].values
+
+            # Optional brightening / "light mixing" for continuous 3D embeddings.
+            # This keeps existing behavior by default and only adjusts when explicitly requested.
+            if brighten_continuous:
+                # Per-pixel normalization so the strongest channel reaches 1.0,
+                # mimicking additive light mixing where strong multi-channel signals look brighter.
+                max_per_pixel = cols.max(axis=1, keepdims=True)
+                # Avoid division by zero; pixels with all zeros remain black.
+                scale = np.where(max_per_pixel > 0, 1.0 / max_per_pixel, 0.0)
+                cols = np.clip(cols * scale, 0.0, 1.0)
+
+                # Optional gamma brightening of mid-tones (continuous_gamma < 1 => brighter).
+                try:
+                    gamma = float(continuous_gamma)
+                    if gamma > 0 and gamma != 1.0:
+                        cols = np.clip(np.power(cols, gamma), 0.0, 1.0)
+                except Exception:
+                    # If gamma is invalid, fall back to normalized colors without gamma change.
+                    pass
         else:
             grey_vals = coordinates["Grey"].values
             if cmap is None:
