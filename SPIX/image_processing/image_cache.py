@@ -25,6 +25,11 @@ def cache_embedding_image(
     pixel_shape: str = "square",
     chunk_size: int = 50000,
     downsample_factor: float = 1.0,
+    # Storage control for large images
+    implementation: str = "auto",  # 'auto'|'optimized'|'legacy'
+    store: str = "auto",  # 'auto'|'memory'|'memmap'
+    memmap_dir: Optional[str] = None,
+    memmap_threshold_mb: float = 512.0,
     verbose: bool = False,
     show: bool = False,
     show_channels: Optional[Sequence[int]] = None,
@@ -69,22 +74,103 @@ def cache_embedding_image(
     if embedding not in adata.obsm:
         raise ValueError(f"Embedding '{embedding}' not found in adata.obsm.")
 
-    # Build coordinates_df in the same way as segmentation uses it
+    impl = (implementation or "auto").lower()
+    if impl not in {"auto", "optimized", "legacy"}:
+        raise ValueError("implementation must be one of {'auto','optimized','legacy'}.")
+    if impl == "legacy":
+        cache = _cache_embedding_image_legacy(
+            adata,
+            embedding=embedding,
+            dimensions=dimensions,
+            origin=origin,
+            key=key,
+            figsize=figsize,
+            fig_dpi=fig_dpi,
+            imshow_tile_size=imshow_tile_size,
+            imshow_scale_factor=imshow_scale_factor,
+            pixel_shape=pixel_shape,
+            chunk_size=chunk_size,
+            downsample_factor=downsample_factor,
+            verbose=verbose,
+            show=show,
+            show_channels=show_channels,
+            show_cmap=show_cmap,
+            color_by=color_by,
+            palette=palette,
+            alpha_by=alpha_by,
+            alpha_range=alpha_range,
+            alpha_clip=alpha_clip,
+            alpha_invert=alpha_invert,
+            prioritize_high_values=prioritize_high_values,
+            overlap_priority=overlap_priority,
+            segment_color_by_major=segment_color_by_major,
+            title=title,
+            use_imshow=use_imshow,
+            plot_boundaries=plot_boundaries,
+            boundary_method=boundary_method,
+            boundary_color=boundary_color,
+            boundary_linewidth=boundary_linewidth,
+            boundary_style=boundary_style,
+            boundary_alpha=boundary_alpha,
+            pixel_smoothing_sigma=pixel_smoothing_sigma,
+            highlight_segments=highlight_segments,
+            highlight_boundary_color=highlight_boundary_color,
+            highlight_linewidth=highlight_linewidth,
+            highlight_brighten_factor=highlight_brighten_factor,
+            dim_other_segments=dim_other_segments,
+            dim_to_grey=dim_to_grey,
+            segment_key=segment_key,
+            **plot_kwargs,
+        )
+        adata.uns[key] = cache
+        return cache
+
+    store = (store or "auto").lower()
+    if store not in {"auto", "memory", "memmap"}:
+        raise ValueError("store must be one of {'auto','memory','memmap'}.")
+
+    # Align tiles (coords) to obs order without a full pandas merge
     tiles_df = adata.uns["tiles"]
-    tiles = tiles_df[tiles_df["origin"] == 1] if origin else tiles_df
+    tiles = tiles_df[tiles_df.get("origin", 1) == 1] if origin else tiles_df
+    if "barcode" not in tiles.columns:
+        raise ValueError("adata.uns['tiles'] must contain a 'barcode' column.")
+    if "x" not in tiles.columns or "y" not in tiles.columns:
+        raise ValueError("adata.uns['tiles'] must contain 'x' and 'y' columns.")
 
-    emb = np.asarray(adata.obsm[embedding])[:, dimensions]
-    dim_cols = [f"dim{i}" for i, _ in enumerate(dimensions)]
-    tile_colors = pd.DataFrame(emb, columns=dim_cols)
-    tile_colors["barcode"] = adata.obs.index.astype(str)
-    coordinates_df = (
-        pd.merge(tiles, tile_colors, on="barcode", how="right")
-        .dropna()
-        .reset_index(drop=True)
-    )
+    obs_barcodes = adata.obs.index.astype(str)
+    tiles_idx = tiles.copy()
+    tiles_idx["barcode"] = tiles_idx["barcode"].astype(str)
+    if tiles_idx["barcode"].duplicated().any():
+        # Typical only when origin=False; keep first occurrence for caching.
+        tiles_idx = tiles_idx.drop_duplicates("barcode", keep="first")
+    tiles_aligned = tiles_idx.set_index("barcode").reindex(pd.Index(obs_barcodes))
+    xy = tiles_aligned[["x", "y"]]
+    valid_mask = (~xy.isna().any(axis=1)).to_numpy()
+    if not valid_mask.any():
+        raise ValueError("No coordinates found after aligning tiles to embeddings.")
+    if verbose:
+        missing = int((~valid_mask).sum())
+        if missing:
+            print(f"[cache_embedding_image] Dropping {missing} observations with missing coordinates.")
 
-    if len(coordinates_df) == 0:
-        raise ValueError("No coordinates found after merging tiles with embeddings.")
+    spatial_coords = xy.to_numpy(dtype=float)[valid_mask]
+    origin_flags = tiles_aligned.get("origin", pd.Series(index=tiles_aligned.index, data=1)).to_numpy()[valid_mask]
+
+    # Select embedding channels (support embeddings that already contain only these dims)
+    E_full = np.asarray(adata.obsm[embedding])
+    if E_full.ndim != 2:
+        raise ValueError(f"Embedding '{embedding}' must be a 2D array.")
+    if E_full.shape[0] != adata.n_obs:
+        raise ValueError(f"Embedding '{embedding}' must have n_obs rows.")
+    if E_full.shape[1] == len(dimensions):
+        emb = E_full
+    else:
+        emb = E_full[:, dimensions]
+    embeddings = emb[valid_mask]
+    # Tile->obs mapping is trivial now (tile order == obs order subset)
+    tile_obs_indices = np.flatnonzero(valid_mask).astype(np.int64)
+    barcodes = obs_barcodes.to_numpy()[valid_mask]
+    dim_cols = [f"dim{i}" for i, _ in enumerate(range(embeddings.shape[1]))]
 
     segment_series = None
     seg_col: Optional[str] = None
@@ -103,25 +189,23 @@ def cache_embedding_image(
             print(f"[cache_embedding_image] segment_key '{candidate}' not found in adata.obs; segment overlays disabled.")
 
     if segment_available and seg_col is not None:
-        coordinates_df[seg_col] = coordinates_df["barcode"].map(adata.obs[seg_col])
-        if coordinates_df[seg_col].isnull().any():
-            missing = int(coordinates_df[seg_col].isnull().sum())
+        segment_series = adata.obs[seg_col]
+        seg_vals = segment_series.to_numpy()[valid_mask]
+        seg_missing = pd.isna(seg_vals)
+        if seg_missing.any():
+            missing = int(seg_missing.sum())
             if verbose:
                 print(f"[cache_embedding_image] '{seg_col}' labels missing for {missing} barcodes. Dropping them.")
-            coordinates_df = coordinates_df.dropna(subset=[seg_col])
-        coordinates_df["Segment"] = coordinates_df[seg_col]
+            keep = ~seg_missing
+            spatial_coords = spatial_coords[keep]
+            embeddings = embeddings[keep]
+            tile_obs_indices = tile_obs_indices[keep]
+            barcodes = barcodes[keep]
+            origin_flags = origin_flags[keep]
         segment_series = adata.obs[seg_col]
     else:
-        coordinates_df = coordinates_df.drop(columns=["Segment"], errors="ignore")
         segment_available = False
         seg_col = None
-
-    # Order mapping back to AnnData.obs positions
-    obs_indexer = {bc: i for i, bc in enumerate(adata.obs.index.astype(str))}
-    tile_obs_indices = coordinates_df["barcode"].astype(str).map(obs_indexer).to_numpy()
-
-    spatial_coords = coordinates_df[["x", "y"]].to_numpy(dtype=float)
-    embeddings = coordinates_df[dim_cols].to_numpy(dtype=float)
 
     # Geometry and pixel scaling
     x_min, x_max = spatial_coords[:, 0].min(), spatial_coords[:, 0].max()
@@ -159,7 +243,23 @@ def cache_embedding_image(
     if verbose:
         print(f"Rasterizing → image size (h, w, C)=({h}, {w}, {dims}) | tile_px={s}")
 
-    img = np.ones((h, w, dims), dtype=np.float32)
+    est_mb = (float(h) * float(w) * float(dims) * 4.0) / (1024.0 * 1024.0)
+    use_memmap = store == "memmap" or (store == "auto" and est_mb >= float(memmap_threshold_mb))
+    img_path: Optional[str] = None
+    if use_memmap:
+        import os
+
+        cache_dir = memmap_dir or os.environ.get("SPIX_CACHE_DIR") or os.path.join(os.getcwd(), ".spix_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        safe_key = "".join(c if (c.isalnum() or c in ("-", "_")) else "_" for c in str(key))
+        safe_emb = "".join(c if (c.isalnum() or c in ("-", "_")) else "_" for c in str(embedding))
+        img_path = os.path.join(cache_dir, f"{safe_key}__{safe_emb}__{h}x{w}x{dims}.dat")
+        img = np.memmap(img_path, dtype=np.float32, mode="w+", shape=(h, w, dims))
+        img.fill(1.0)
+        if verbose:
+            print(f"[cache_embedding_image] Using memmap image at: {img_path} (~{est_mb:.1f} MB)")
+    else:
+        img = np.ones((h, w, dims), dtype=np.float32)
 
     # Precompute pixel offsets for square/circle tiles
     if pixel_shape == "circle":
@@ -201,8 +301,7 @@ def cache_embedding_image(
             if alpha_by not in adata.obs.columns:
                 raise ValueError(f"alpha_by '{alpha_by}' not found in adata.obs.")
             # Build aligned values for present barcodes
-            vals_map = adata.obs[alpha_by].astype(float)
-            alpha_source = coordinates_df["barcode"].map(vals_map).to_numpy(dtype=float)
+            alpha_source = adata.obs[alpha_by].astype(float).to_numpy()[tile_obs_indices]
         alpha_arr = _compute_alpha_from_values(alpha_source, arange=alpha_range, clip=alpha_clip, invert=alpha_invert)
         if prioritize_high_values:
             # draw high alphas last (front)
@@ -223,7 +322,7 @@ def cache_embedding_image(
     label_img = None
     if plot_boundaries and segment_available and segment_series is not None:
         # Map per-tile Segment labels
-        seg_codes = pd.Categorical(coordinates_df["barcode"].map(segment_series)).codes
+        seg_codes = pd.Categorical(segment_series.to_numpy()[tile_obs_indices]).codes
         label_img = np.full((h, w), -1, dtype=int)
         for i in range(0, num_tiles, max(1, chunk_size)):
             idx = order_idx[i : min(i + chunk_size, num_tiles)]
@@ -295,10 +394,13 @@ def cache_embedding_image(
         "cx": cx.astype(np.int32),
         "cy": cy.astype(np.int32),
         "tile_obs_indices": tile_obs_indices.astype(np.int64),
-        "barcodes": coordinates_df["barcode"].astype(str).to_list(),
-        "origin_flags": coordinates_df.get("origin", pd.Series(index=coordinates_df.index, data=1)).astype(int).to_numpy(),
+        "barcodes": [str(bc) for bc in barcodes.tolist()],
+        "origin_flags": np.asarray(origin_flags, dtype=int),
         "segment_key": seg_col,
         "segment_key_requested": segment_key,
+        "store": store,
+        "memmap": bool(use_memmap),
+        "img_path": img_path,
         # provenance
         "created_by": "cache_embedding_image",
         "history": [],
@@ -382,6 +484,331 @@ def cache_embedding_image(
     adata.uns[key] = cache
     if show:
         try:
+            show_cached_image(adata, key=key, channels=show_channels, cmap=show_cmap)
+        except Exception:
+            pass
+    return cache
+
+
+def _cache_embedding_image_legacy(
+    adata,
+    *,
+    embedding: str,
+    dimensions: List[int],
+    origin: bool,
+    key: str,
+    figsize: tuple,
+    fig_dpi: Optional[int],
+    imshow_tile_size: Optional[float],
+    imshow_scale_factor: float,
+    pixel_shape: str,
+    chunk_size: int,
+    downsample_factor: float,
+    verbose: bool,
+    show: bool,
+    show_channels: Optional[Sequence[int]],
+    show_cmap: Optional[str],
+    color_by: Optional[str],
+    palette: Optional[str | Sequence],
+    alpha_by: Optional[str],
+    alpha_range: Tuple[float, float],
+    alpha_clip: Optional[Tuple[Optional[float], Optional[float]]],
+    alpha_invert: bool,
+    prioritize_high_values: bool,
+    overlap_priority: Optional[str],
+    segment_color_by_major: bool,
+    title: Optional[str],
+    use_imshow: bool,
+    plot_boundaries: bool,
+    boundary_method: str,
+    boundary_color: str,
+    boundary_linewidth: float,
+    boundary_style: str,
+    boundary_alpha: float,
+    pixel_smoothing_sigma: float,
+    highlight_segments: Optional[Sequence[str]],
+    highlight_boundary_color: Optional[str],
+    highlight_linewidth: Optional[float],
+    highlight_brighten_factor: float,
+    dim_other_segments: float,
+    dim_to_grey: bool,
+    segment_key: Optional[str],
+    **plot_kwargs,
+) -> Dict[str, Any]:
+    """Legacy cache implementation (baseline for benchmarking)."""
+    if embedding not in adata.obsm:
+        raise ValueError(f"Embedding '{embedding}' not found in adata.obsm.")
+
+    tiles_df = adata.uns["tiles"]
+    tiles = tiles_df[tiles_df.get("origin", 1) == 1] if origin else tiles_df
+
+    E_full = np.asarray(adata.obsm[embedding])
+    if E_full.shape[1] == len(dimensions):
+        emb = E_full
+    else:
+        emb = E_full[:, dimensions]
+
+    dim_cols = [f"dim{i}" for i in range(emb.shape[1])]
+    tile_colors = pd.DataFrame(emb, columns=dim_cols)
+    tile_colors["barcode"] = adata.obs.index.astype(str)
+    coordinates_df = (
+        pd.merge(tiles, tile_colors, on="barcode", how="right")
+        .dropna()
+        .reset_index(drop=True)
+    )
+    if len(coordinates_df) == 0:
+        raise ValueError("No coordinates found after merging tiles with embeddings.")
+
+    segment_series = None
+    seg_col: Optional[str] = None
+    segment_available = False
+    if segment_key is not None:
+        candidate = segment_key
+        if candidate in adata.obs.columns:
+            seg_col = candidate
+            segment_available = True
+        elif candidate != "Segment" and "Segment" in adata.obs.columns:
+            if verbose:
+                print(
+                    f"[cache_embedding_image] segment_key '{candidate}' not found; using 'Segment' column instead."
+                )
+            seg_col = "Segment"
+            segment_available = True
+        elif verbose:
+            print(
+                f"[cache_embedding_image] segment_key '{candidate}' not found in adata.obs; segment overlays disabled."
+            )
+
+    if segment_available and seg_col is not None:
+        coordinates_df[seg_col] = coordinates_df["barcode"].map(adata.obs[seg_col])
+        if coordinates_df[seg_col].isnull().any():
+            missing = int(coordinates_df[seg_col].isnull().sum())
+            if verbose:
+                print(
+                    f"[cache_embedding_image] '{seg_col}' labels missing for {missing} barcodes. Dropping them."
+                )
+            coordinates_df = coordinates_df.dropna(subset=[seg_col])
+        coordinates_df["Segment"] = coordinates_df[seg_col]
+        segment_series = adata.obs[seg_col]
+    else:
+        coordinates_df = coordinates_df.drop(columns=["Segment"], errors="ignore")
+        segment_available = False
+        seg_col = None
+
+    obs_indexer = {bc: i for i, bc in enumerate(adata.obs.index.astype(str))}
+    tile_obs_indices = coordinates_df["barcode"].astype(str).map(obs_indexer).to_numpy()
+    spatial_coords = coordinates_df[["x", "y"]].to_numpy(dtype=float)
+    embeddings = coordinates_df[dim_cols].to_numpy(dtype=float)
+
+    # Geometry and pixel scaling
+    x_min, x_max = spatial_coords[:, 0].min(), spatial_coords[:, 0].max()
+    y_min, y_max = spatial_coords[:, 1].min(), spatial_coords[:, 1].max()
+
+    if imshow_tile_size is None:
+        s_data_units = 1.0
+        if len(spatial_coords) > 1:
+            sample_size = min(len(spatial_coords), 100000)
+            sample_idx = np.random.choice(len(spatial_coords), sample_size, replace=False)
+            tree = KDTree(spatial_coords[sample_idx])
+            d, _ = tree.query(spatial_coords[sample_idx], k=2)
+            nn = d[:, 1][d[:, 1] > 0]
+            if len(nn) > 0:
+                s_data_units = float(np.median(nn))
+    else:
+        s_data_units = float(imshow_tile_size)
+    s_data_units = max(0.1, s_data_units * float(imshow_scale_factor))
+
+    dpi_in = int(fig_dpi) if fig_dpi is not None else 100
+    w_pixels = int(np.ceil(figsize[0] * dpi_in))
+    h_pixels = int(np.ceil(figsize[1] * dpi_in))
+    x_range = (x_max - x_min) or 1.0
+    y_range = (y_max - y_min) or 1.0
+    scale = min(w_pixels / x_range, h_pixels / y_range)
+    w = max(1, int(np.ceil(x_range * scale)))
+    h = max(1, int(np.ceil(y_range * scale)))
+    s = max(1, int(np.ceil(s_data_units * scale)))
+
+    dims = embeddings.shape[1]
+    scaler = MinMaxScaler()
+    cols = scaler.fit_transform(embeddings.astype(np.float32))
+
+    if verbose:
+        print(f"Rasterizing → image size (h, w, C)=({h}, {w}, {dims}) | tile_px={s}")
+
+    img = np.ones((h, w, dims), dtype=np.float32)
+
+    # Precompute pixel offsets for square/circle tiles
+    if pixel_shape == "circle":
+        yy, xx = np.ogrid[:s, :s]
+        center = (s - 1) / 2
+        mask = (xx - center) ** 2 + (yy - center) ** 2 <= (s / 2) ** 2
+        dy, dx = np.nonzero(mask)
+    else:
+        rng = np.arange(s)
+        gx, gy = np.meshgrid(rng, rng)
+        dx, dy = gx.flatten(), gy.flatten()
+
+    def _compute_alpha_from_values(values, arange=(0.1, 1.0), clip=None, invert=False):
+        v = np.asarray(values, dtype=float)
+        if clip is None:
+            vmin, vmax = np.nanpercentile(v, 1), np.nanpercentile(v, 99)
+        else:
+            vmin, vmax = clip
+            if vmin is None:
+                vmin = np.nanmin(v)
+            if vmax is None:
+                vmax = np.nanmax(v)
+        if vmax <= vmin:
+            vmax = vmin + 1e-9
+        t = np.clip((v - vmin) / (vmax - vmin), 0.0, 1.0)
+        if invert:
+            t = 1.0 - t
+        a0, a1 = float(arange[0]), float(arange[1])
+        a = a0 + t * (a1 - a0)
+        return a.astype(np.float32)
+
+    order_idx = np.arange(spatial_coords.shape[0])
+    if alpha_by is not None:
+        if alpha_by == "embedding":
+            alpha_source = embeddings[:, 0]
+        else:
+            if alpha_by not in adata.obs.columns:
+                raise ValueError(f"alpha_by '{alpha_by}' not found in adata.obs.")
+            vals_map = adata.obs[alpha_by].astype(float)
+            alpha_source = coordinates_df["barcode"].map(vals_map).to_numpy(dtype=float)
+        alpha_arr = _compute_alpha_from_values(
+            alpha_source, arange=alpha_range, clip=alpha_clip, invert=alpha_invert
+        )
+        if prioritize_high_values:
+            order_idx = np.argsort(alpha_arr)
+
+    num_tiles = spatial_coords.shape[0]
+    for i in range(0, num_tiles, max(1, chunk_size)):
+        idx = order_idx[i : min(i + chunk_size, num_tiles)]
+        xi = ((spatial_coords[idx, 0] - x_min) * scale).astype(int)
+        yi = ((spatial_coords[idx, 1] - y_min) * scale).astype(int)
+        all_x = np.clip((xi[:, None] + dx).ravel(), 0, w - 1)
+        all_y = np.clip((yi[:, None] + dy).ravel(), 0, h - 1)
+        tile_idx_map = np.repeat(idx, len(dx))
+        img[all_y, all_x] = cols[tile_idx_map]
+
+    label_img = None
+    if plot_boundaries and segment_available and segment_series is not None:
+        seg_codes = pd.Categorical(coordinates_df["barcode"].map(segment_series)).codes
+        label_img = np.full((h, w), -1, dtype=int)
+        for i in range(0, num_tiles, max(1, chunk_size)):
+            idx = order_idx[i : min(i + chunk_size, num_tiles)]
+            xi = ((spatial_coords[idx, 0] - x_min) * scale).astype(int)
+            yi = ((spatial_coords[idx, 1] - y_min) * scale).astype(int)
+            if pixel_shape == "circle":
+                for j, t in enumerate(idx):
+                    lx = np.clip(xi[j] + dx, 0, w - 1)
+                    ly = np.clip(yi[j] + dy, 0, h - 1)
+                    label_img[ly, lx] = seg_codes[t]
+            else:
+                all_x = np.clip((xi[:, None] + dx).ravel(), 0, w - 1)
+                all_y = np.clip((yi[:, None] + dy).ravel(), 0, h - 1)
+                label_img[all_y, all_x] = np.repeat(seg_codes[idx], len(dx))
+
+    if downsample_factor and downsample_factor > 1.0:
+        factor = int(downsample_factor)
+        new_h = max(1, h // factor)
+        new_w = max(1, w // factor)
+        pooled = img[: new_h * factor, : new_w * factor]
+        pooled = pooled.reshape(new_h, factor, new_w, factor, dims).mean(axis=(1, 3))
+        img = pooled.astype(np.float32)
+        h, w = img.shape[:2]
+        scale /= factor
+        s = max(1, int(np.ceil(s_data_units * scale)))
+        dpi_effective = float(dpi_in) / float(factor)
+    else:
+        dpi_effective = float(dpi_in)
+
+    if label_img is not None and downsample_factor and downsample_factor > 1.0:
+        factor = int(downsample_factor)
+        new_h = max(1, label_img.shape[0] // factor)
+        new_w = max(1, label_img.shape[1] // factor)
+        label_img = label_img[: new_h * factor, : new_w * factor]
+        label_img = label_img.reshape(new_h, factor, new_w, factor).max(axis=(1, 3))
+
+    xi_final = ((spatial_coords[:, 0] - x_min) * scale).astype(int)
+    yi_final = ((spatial_coords[:, 1] - y_min) * scale).astype(int)
+    cx = np.clip(xi_final + s // 2, 0, w - 1)
+    cy = np.clip(yi_final + s // 2, 0, h - 1)
+
+    cache = {
+        "img": img,
+        "h": int(h),
+        "w": int(w),
+        "total_pixels": int(h * w),
+        "channels": int(dims),
+        "x_min": float(x_min),
+        "x_max": float(x_max),
+        "y_min": float(y_min),
+        "y_max": float(y_max),
+        "scale": float(scale),
+        "s_data_units": float(s_data_units),
+        "tile_px": int(s),
+        "pixel_shape": str(pixel_shape),
+        "embedding_key": str(embedding),
+        "dimensions": list(dimensions),
+        "origin": bool(origin),
+        "figsize": tuple(figsize),
+        "fig_dpi": None if fig_dpi is None else int(fig_dpi),
+        "raster_dpi": int(dpi_in),
+        "effective_dpi": float(dpi_effective),
+        "cx": cx.astype(np.int32),
+        "cy": cy.astype(np.int32),
+        "tile_obs_indices": tile_obs_indices.astype(np.int64),
+        "barcodes": coordinates_df["barcode"].astype(str).to_list(),
+        "origin_flags": coordinates_df.get("origin", pd.Series(index=coordinates_df.index, data=1))
+        .astype(int)
+        .to_numpy(),
+        "segment_key": seg_col,
+        "segment_key_requested": segment_key,
+        "store": "memory",
+        "memmap": False,
+        "img_path": None,
+        "created_by": "cache_embedding_image_legacy",
+        "history": [],
+        "image_plot_params": {
+            "color_by": color_by,
+            "palette": palette,
+            "alpha_by": alpha_by,
+            "alpha_range": tuple(alpha_range) if alpha_range is not None else None,
+            "alpha_clip": alpha_clip,
+            "alpha_invert": bool(alpha_invert),
+            "prioritize_high_values": bool(prioritize_high_values),
+            "overlap_priority": overlap_priority,
+            "segment_color_by_major": bool(segment_color_by_major),
+            "title": title,
+            "use_imshow": bool(use_imshow),
+            "plot_boundaries": bool(plot_boundaries),
+            "boundary_method": boundary_method,
+            "boundary_color": boundary_color,
+            "boundary_linewidth": float(boundary_linewidth),
+            "boundary_style": boundary_style,
+            "boundary_alpha": float(boundary_alpha),
+            "pixel_smoothing_sigma": float(pixel_smoothing_sigma),
+            "highlight_segments": list(highlight_segments)
+            if highlight_segments is not None
+            else None,
+            "highlight_boundary_color": highlight_boundary_color,
+            "highlight_linewidth": None
+            if highlight_linewidth is None
+            else float(highlight_linewidth),
+            "highlight_brighten_factor": float(highlight_brighten_factor),
+            "dim_other_segments": float(dim_other_segments),
+            "dim_to_grey": bool(dim_to_grey),
+            "segment_key": seg_col,
+            "segment_key_requested": segment_key,
+            **plot_kwargs,
+        },
+    }
+
+    if show:
+        try:
+            adata.uns[key] = cache
             show_cached_image(adata, key=key, channels=show_channels, cmap=show_cmap)
         except Exception:
             pass

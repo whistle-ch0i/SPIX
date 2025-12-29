@@ -103,6 +103,43 @@ def _sanitize_segment_name(name: str) -> str:
     return sanitized
 
 
+def _pseudo_centroids_from_segment_labels(
+    embeddings: np.ndarray, segment_labels: np.ndarray
+) -> np.ndarray:
+    """Compute per-observation pseudo-centroids (cluster means).
+
+    Parameters
+    ----------
+    embeddings
+        (n_obs, n_dims) numeric array.
+    segment_labels
+        (n_obs,) array-like with labels; missing values allowed (NaN/None).
+
+    Returns
+    -------
+    np.ndarray
+        (n_obs, n_dims) float32 array where each row is the mean embedding of
+        that observation's segment (NaN rows remain NaN).
+    """
+    labels = np.asarray(segment_labels, dtype=object)
+    mask = pd.notna(labels)
+    if not mask.any():
+        return np.full((embeddings.shape[0], embeddings.shape[1]), np.nan, dtype=np.float32)
+
+    codes, _ = pd.factorize(labels[mask], sort=False)
+    E = np.asarray(embeddings[mask], dtype=np.float64)
+    k = int(codes.max()) + 1
+    sums = np.zeros((k, E.shape[1]), dtype=np.float64)
+    counts = np.zeros(k, dtype=np.int64)
+    np.add.at(sums, codes, E)
+    np.add.at(counts, codes, 1)
+    means = sums / counts[:, None]
+
+    out = np.full((embeddings.shape[0], embeddings.shape[1]), np.nan, dtype=np.float32)
+    out[mask] = means[codes].astype(np.float32, copy=False)
+    return out
+
+
 def n_segments_from_size(
     tiles_df: pd.DataFrame, target_um: float = 100.0, pitch_um: float = 2.0
 ) -> int:
@@ -351,6 +388,7 @@ def segment_image(
     n_jobs: int | None = None,
     use_cached_image: bool = False,
     image_cache_key: str = "image_plot_slic",
+    cache_fast_path: bool = True,
 ):
     """
     Segment embeddings to find initial territories.
@@ -450,6 +488,83 @@ def segment_image(
         )
         if verbose:
             print(f"→ SLIC  n_segments = {resolution}")
+
+    # Fast path: cached image SLIC without building coordinates_df/embeddings_df
+    if (
+        method == "image_plot_slic"
+        and use_cached_image
+        and library_id is None
+        and cache_fast_path
+        and image_cache_key in adata.uns
+    ):
+        cache = adata.uns[image_cache_key]
+        cached_emb = cache.get("embedding_key", None)
+        cached_dims = cache.get("dimensions", None)
+        if (cached_emb is None or cached_emb == embedding) and (
+            cached_dims is None or list(cached_dims) == list(dimensions)
+        ):
+            if show_image:
+                cache_figsize = cache.get("figsize", None)
+                cache_figdpi = cache.get("fig_dpi", None)
+                print(
+                    f"[info] use_cached_image=True: showing with cached figsize={cache_figsize}, fig_dpi={cache_figdpi}"
+                )
+
+            t0 = time.perf_counter()
+            labels_tile, _ = slic_segmentation_from_cached_image(
+                cache,
+                n_segments=int(resolution),
+                compactness=compactness,
+                enforce_connectivity=enforce_connectivity,
+                show_image=show_image,
+                verbose=verbose,
+                figsize=None,
+                fig_dpi=None,
+            )
+            t1 = time.perf_counter()
+
+            cache_barcodes = pd.Series(cache.get("barcodes", []), dtype=str)
+            if cache_barcodes.empty:
+                raise ValueError(f"Cached image '{image_cache_key}' missing barcodes.")
+
+            if cache_barcodes.duplicated().any():
+                clusters_df = _aggregate_labels_majority(
+                    cache_barcodes,
+                    labels_tile,
+                    origin_flags=cache.get("origin_flags", None),
+                )
+                tile_barcodes = clusters_df["barcode"].astype(str).to_numpy()
+                tile_labels = clusters_df["Segment"].to_numpy()
+            else:
+                tile_barcodes = cache_barcodes.to_numpy()
+                tile_labels = np.asarray(labels_tile)
+
+            obs_barcodes = pd.Index(adata.obs.index.astype(str))
+            obs_pos = obs_barcodes.get_indexer(pd.Index(tile_barcodes))
+            ok = obs_pos >= 0
+            seg_vals = np.full(adata.n_obs, np.nan, dtype=object)
+            seg_vals[obs_pos[ok]] = tile_labels[ok]
+            adata.obs[Segment] = pd.Categorical(seg_vals)
+
+            # Compute pseudo-centroids in obs order
+            E_full = np.asarray(adata.obsm[embedding])
+            if E_full.shape[1] == len(dimensions):
+                E_use = E_full
+            else:
+                E_use = E_full[:, dimensions]
+            pseudo_centroids = _pseudo_centroids_from_segment_labels(E_use, seg_vals)
+            segment_suffix = _sanitize_segment_name(Segment)
+            adata.obsm["X_embedding_segment"] = pseudo_centroids
+            adata.obsm[f"X_embedding_{segment_suffix}"] = pseudo_centroids
+
+            # No combined_data for image_plot_slic
+            for key in ("X_embedding_scaled_for_segment", f"X_embedding_scaled_for_{segment_suffix}"):
+                if key in adata.obsm:
+                    del adata.obsm[key]
+
+            if verbose:
+                print(f"[perf] cached SLIC (fast path): {t1 - t0:.3f}s")
+            return
 
     # Create a DataFrame from the selected embedding dimensions and add barcode from adata.obs index
     tile_colors = pd.DataFrame(np.array(adata.obsm[embedding])[:, dimensions])

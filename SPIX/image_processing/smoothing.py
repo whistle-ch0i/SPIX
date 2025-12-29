@@ -42,7 +42,8 @@ def smooth_image(
     n_jobs = None,
     # Parallelization backend
     backend = 'processes',                    # 'processes' (default) or 'threads'
-    mp_start_method = None                    # None=auto; else one of {'fork','spawn','forkserver'}
+    mp_start_method = None,                   # None=auto; else one of {'fork','spawn','forkserver'}
+    implementation: str = "auto",             # 'auto'|'vectorized'|'legacy'
 ):
     """
     Sequentially apply one or more smoothing methods to an embedding and store
@@ -86,9 +87,15 @@ def smooth_image(
     logging.info(f"Input embedding key: '{embedding}'")
     logging.info(f"Output embedding key: '{output}'")
     logging.info(f"Smoothing methods to apply (in order): {methods}")
+    use_float32 = str(os.environ.get("SPIX_SMOOTH_FLOAT32", "0")).strip().lower() in {"1", "true", "yes"}
+    if use_float32:
+        logging.info("Smoothing precision: float32 (SPIX_SMOOTH_FLOAT32=1)")
     # 1) load embedding first (to get n)
     try:
-        raw_embedding = adata.obsm[embedding].astype('float32')
+        raw_embedding = np.asarray(adata.obsm[embedding])
+        # Avoid an unconditional full-matrix copy; only convert if needed.
+        if raw_embedding.dtype != np.float32:
+            raw_embedding = raw_embedding.astype(np.float32, copy=False)
     except KeyError:
         logging.error(f"Embedding key '{embedding}' not found in adata.obsm.")
         raise
@@ -132,33 +139,79 @@ def smooth_image(
     precomputed = {}
     tree_spatial = cKDTree(coords, balanced_tree=True, compact_nodes=True)
 
-    if 'graph' in methods:
+    need_graph = 'graph' in methods
+    need_knn = ('knn' in methods) or ('gaussian' in methods)
+
+    def _merge_workers(a: int, b: int) -> int:
+        # SciPy cKDTree: workers=-1 uses all cores
+        if a == -1 or b == -1:
+            return -1
+        return int(max(a, b))
+
+    # If both graph + (knn/gaussian) are requested, do a single KDTree query and
+    # slice it for both to avoid duplicate work and peak memory.
+    dists_all = None
+    neigh_all = None
+    if need_graph and need_knn:
+        k_all = int(max(1, min(max(graph_k + 1, knn_k), n)))
+        logging.info(f"Precomputing shared neighbors (k={k_all}) for graph+knn/gaussian...")
+        dists_all, neigh_all = tree_spatial.query(
+            coords, k=k_all, workers=_merge_workers(graph_n_jobs, knn_n_jobs)
+        )
+
+    if need_graph:
         logging.info("Precomputing spatial graph for diffusion...")
         k_graph = int(max(1, min(graph_k + 1, n)))
-        dists_g, neigh_g = tree_spatial.query(coords, k=k_graph, workers=graph_n_jobs)
+        if dists_all is not None and neigh_all is not None and dists_all.shape[1] >= k_graph:
+            dists_g, neigh_g = dists_all[:, :k_graph], neigh_all[:, :k_graph]
+        else:
+            dists_g, neigh_g = tree_spatial.query(coords, k=k_graph, workers=graph_n_jobs)
         if k_graph > 1:
             dists_g = dists_g[:, 1:]
             neigh_g = neigh_g[:, 1:]
             gk = dists_g.shape[1]
             sigma_loc = np.median(dists_g, axis=1) + 1e-9
 
-            rows = np.repeat(np.arange(n), gk)
-            cols = neigh_g.ravel()
-            data = np.exp(-(dists_g.ravel()**2) / (2 * (np.repeat(sigma_loc, gk) ** 2)))
-
-            Wg = csr_matrix((data, (rows, cols)), shape=(n, n))
+            # Build CSR directly from (data, indices, indptr) to avoid allocating
+            # an explicit `rows` array of length n*gk.
+            nnz = int(n) * int(gk)
+            use_int32 = nnz <= np.iinfo(np.int32).max and n <= np.iinfo(np.int32).max
+            index_dtype = np.int32 if use_int32 else np.int64
+            indptr = (np.arange(n + 1, dtype=index_dtype) * gk)
+            indices = neigh_g.reshape(-1).astype(index_dtype, copy=False)
+            if use_float32:
+                d32 = dists_g.astype(np.float32, copy=False)
+                s32 = sigma_loc.astype(np.float32, copy=False)
+                data = np.exp(-(d32 ** 2) / (2.0 * (s32[:, None] ** 2))).reshape(-1).astype(np.float32, copy=False)
+            else:
+                data = np.exp(-(dists_g ** 2) / (2.0 * (sigma_loc[:, None] ** 2))).reshape(-1)
+            Wg = csr_matrix((data, indices, indptr), shape=(n, n))
         else:
             Wg = csr_matrix((n, n))
         Wg = 0.5 * (Wg + Wg.T)
         invdeg = 1.0 / (Wg.sum(1).A1 + 1e-12)
-        precomputed['Pg'] = diags(invdeg).dot(Wg)
+        # Row-normalize without constructing an explicit diagonal matrix.
+        Pg = Wg.multiply(invdeg[:, None])
+        # SciPy may return COO from sparse.multiply; ensure CSR for fast dot.
+        if not hasattr(Pg, "indptr"):
+            Pg = Pg.tocsr()
+        if use_float32 and Pg.dtype != np.float32:
+            Pg = Pg.astype(np.float32, copy=False)
+        precomputed['Pg'] = Pg
         logging.info("Spatial graph ready.")
 
-    if 'knn' in methods or 'gaussian' in methods:
+    if need_knn:
         logging.info("Precomputing KNN neighbors for knn/gaussian...")
         k_knn = int(max(1, min(knn_k, n)))
-        d_knn, idx_knn = tree_spatial.query(coords, k=k_knn, workers=knn_n_jobs)
+        if dists_all is not None and neigh_all is not None and dists_all.shape[1] >= k_knn:
+            d_knn, idx_knn = dists_all[:, :k_knn], neigh_all[:, :k_knn]
+        else:
+            d_knn, idx_knn = tree_spatial.query(coords, k=k_knn, workers=knn_n_jobs)
         precomputed['knn'] = {'dists': d_knn.astype('float32'), 'idx': idx_knn.astype('int32')}
+
+    # Release the shared neighbor arrays (can be huge for VisiumHD)
+    dists_all = None
+    neigh_all = None
 
     if 'bilateral' in methods:
         logging.info("Precomputing neighbors for bilateral filter...")
@@ -176,6 +229,32 @@ def smooth_image(
         n_jobs = multiprocessing.cpu_count()
     max_workers = max(1, min(n_jobs, len(dims_to_use)))
     logging.info(f"Backend: {backend}; workers: {max_workers} (requested={n_jobs})")
+
+    # 5) Fast vectorized engine (huge win for graph/gaussian/knn)
+    impl = (implementation or "auto").lower()
+    if impl not in {"auto", "vectorized", "legacy"}:
+        raise ValueError("implementation must be one of {'auto','vectorized','legacy'}.")
+    can_vectorize = (
+        rescale_mode in {"final", "none"}  # per_step is kept on legacy path for strict compatibility
+        and ("bilateral" not in methods)   # bilateral would require huge (n,k,d) intermediates
+        and all(m in {"graph", "gaussian", "knn"} for m in methods)
+    )
+    if impl == "vectorized" or (impl == "auto" and can_vectorize):
+        logging.info("Using vectorized smoothing engine.")
+        E_smoothed = _smooth_matrix_vectorized(
+            raw_embedding[:, dims_to_use],
+            methods=methods,
+            precomputed=precomputed,
+            knn_sigma=knn_sigma,
+            knn_chunk=knn_chunk,
+            graph_t=graph_t,
+            gaussian_sigma=gaussian_sigma,
+            rescale_mode=rescale_mode,
+            n_workers=max_workers,
+        )
+        adata.obsm[output] = E_smoothed
+        logging.info(f"Finished. Stored smoothed embedding → adata.obsm['{output}']")
+        return adata
 
 
     # Prepare the dimension-processing function (pass only the column vector, not the full matrix)
@@ -273,6 +352,198 @@ def smooth_image(
     adata.obsm[output] = E_smoothed
     logging.info(f"Finished. Stored smoothed embedding → adata.obsm['{output}']")
     return adata
+
+
+def _smooth_matrix_vectorized(
+    E_in: np.ndarray,
+    *,
+    methods,
+    precomputed,
+    knn_sigma: float,
+    knn_chunk: int,
+    graph_t: int,
+    gaussian_sigma: float,
+    rescale_mode: str,
+    n_workers: int = 1,
+) -> np.ndarray:
+    """
+    Blocked vectorized smoothing for methods independent across channels
+    ('graph', 'gaussian', 'knn').
+
+    Key goals:
+    - Keep results consistent with the legacy per-dimension implementation.
+    - Reduce Python overhead by processing multiple dimensions per task.
+    - Control peak memory by processing dimension blocks of bounded size.
+
+    Matches legacy output dtype/rescaling:
+    - internal ops run in float32/float64 as induced by SciPy
+    - for rescale_mode='final', min-max scaling is done in float32
+    """
+    methods = list(methods)
+    E_src = np.asarray(E_in, dtype=np.float32)
+    n_obs, n_dim = E_src.shape
+    n_workers = int(max(1, n_workers))
+
+    # Control peak memory by limiting float64 block size. Users can tune via env vars.
+    try:
+        # Default is sized to allow processing many dims in one sparse×dense call
+        # for common n_dim=30 workflows, while still capping peak memory.
+        target_block_mb = float(os.environ.get("SPIX_SMOOTH_BLOCK_MB", "512"))
+    except Exception:
+        target_block_mb = 512.0
+    try:
+        block_max = int(os.environ.get("SPIX_SMOOTH_BLOCK_MAX", "64"))
+    except Exception:
+        block_max = 64
+
+    # float64 bytes per element = 8
+    target_bytes = max(1.0, target_block_mb) * 1024.0 * 1024.0
+    block_size_mem = int(target_bytes // max(1, n_obs) // 8)
+
+    # Choose a block size that:
+    # - caps peak memory (block_size_mem)
+    # - avoids too many tiny blocks (Python overhead)
+    # - still enables parallelism across blocks when beneficial
+    block_size_mem = max(1, int(block_size_mem))
+    try:
+        # Minimum dimensions per block when splitting work across blocks.
+        # Default=1 maximizes CPU utilization for the common n_dim=30 workflow.
+        block_min = int(os.environ.get("SPIX_SMOOTH_BLOCK_MIN", "1"))
+    except Exception:
+        block_min = 1
+    block_min = max(1, min(int(block_min), int(n_dim)))
+    n_blocks_cap = int(max(1, np.ceil(n_dim / block_min)))
+    n_blocks = int(min(n_workers, n_blocks_cap))
+    block_size_parallel = int(np.ceil(n_dim / max(1, n_blocks)))
+    block_size = min(block_size_mem, block_max, max(1, block_size_parallel))
+    block_size = max(1, min(n_dim, int(block_size)))
+
+    out = np.empty((n_obs, n_dim), dtype=np.float32)
+
+    def _rescale_inplace_float64(X: np.ndarray) -> np.ndarray:
+        mn = X.min(axis=0, keepdims=True)
+        mx = X.max(axis=0, keepdims=True)
+        denom = mx - mn
+        denom[denom < 1e-12] = 1e-12
+        return (X - mn) / denom
+
+    def _rescale_inplace_float32(X: np.ndarray) -> np.ndarray:
+        mn = X.min(axis=0, keepdims=True)
+        mx = X.max(axis=0, keepdims=True)
+        denom = mx - mn
+        denom[denom < 1e-12] = 1e-12
+        return (X - mn) / denom
+
+    def _process_block(col_start: int, col_end: int) -> None:
+        # Work on a view of the source embedding.
+        E_blk = E_src[:, col_start:col_end].astype(np.float32, copy=False)
+        E_work: np.ndarray = E_blk
+
+        for method in methods:
+            if method == "graph":
+                Pg = precomputed.get("Pg")
+                if Pg is None:
+                    raise RuntimeError("Graph transition matrix not precomputed but 'graph' requested.")
+                tmp = E_work
+                for _ in range(int(graph_t)):
+                    tmp = Pg.dot(tmp)
+                E_work = tmp
+            elif method == "knn":
+                knn_data = precomputed.get("knn")
+                if knn_data is None:
+                    raise RuntimeError("KNN neighbors not precomputed but 'knn' requested.")
+                E_work = _apply_weighted_neighbors_chunked(
+                    E_work,
+                    idx=knn_data["idx"],
+                    dists=knn_data["dists"],
+                    sigma=float(knn_sigma),
+                    chunk_rows=int(max(1, knn_chunk)),
+                )
+            elif method == "gaussian":
+                knn_data = precomputed.get("knn")
+                if knn_data is None:
+                    raise RuntimeError("KNN neighbors not precomputed but 'gaussian' requested.")
+                E_work = _apply_weighted_neighbors_chunked(
+                    E_work,
+                    idx=knn_data["idx"],
+                    dists=knn_data["dists"],
+                    sigma=float(gaussian_sigma),
+                    chunk_rows=int(max(1, knn_chunk)),
+                )
+            else:
+                raise ValueError(f"Unknown method '{method}'.")
+
+            if rescale_mode == "per_step":
+                E_work = _rescale_inplace_float64(np.asarray(E_work, dtype=np.float64))
+
+        E_out = np.asarray(E_work, dtype=np.float32)
+        if rescale_mode == "final":
+            E_out = _rescale_inplace_float32(E_out)
+        out[:, col_start:col_end] = E_out
+
+    blocks = [(s, min(s + block_size, n_dim)) for s in range(0, n_dim, block_size)]
+    try:
+        logging.info(
+            f"Vectorized smoothing blocks: n_dim={n_dim}, block_size={block_size}, blocks={len(blocks)}, workers={n_workers}"
+        )
+    except Exception:
+        pass
+    if n_workers <= 1 or len(blocks) <= 1:
+        for s, e in blocks:
+            _process_block(s, e)
+        return out
+
+    max_workers = int(min(n_workers, len(blocks)))
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_process_block, s, e) for s, e in blocks]
+        for fut in futures:
+            fut.result()
+    return out
+
+
+def _apply_weighted_neighbors_chunked(
+    E: np.ndarray,
+    *,
+    idx: np.ndarray,
+    dists: np.ndarray,
+    sigma: float,
+    chunk_rows: int,
+) -> np.ndarray:
+    """Apply Gaussian distance weights using precomputed neighbors (chunked rows).
+
+    This mirrors the legacy per-dimension implementation but operates on a
+    (n, b) block of dimensions at once to reduce overhead while keeping results
+    consistent per dimension.
+    """
+    if sigma <= 0:
+        raise ValueError("sigma must be > 0.")
+    idx = np.asarray(idx)
+    dists = np.asarray(dists)
+    X = np.asarray(E)
+    if X.ndim != 2:
+        raise ValueError("E must be a 2D array.")
+
+    n = X.shape[0]
+    chunk_rows = int(max(1, chunk_rows))
+    out = np.empty((n, X.shape[1]), dtype=np.float64)
+
+    for start in range(0, n, chunk_rows):
+        end = min(start + chunk_rows, n)
+        idx_chunk = idx[start:end]
+        # Match legacy numeric behavior: distances are float32, and the square is
+        # computed in float32 before promotion during division.
+        d_chunk = dists[start:end].astype(np.float32, copy=False)
+        w = np.exp(-(d_chunk ** 2) / (2.0 * (sigma ** 2)))
+        w_sum = w.sum(axis=1, keepdims=True)
+        w_sum[w_sum < 1e-12] = 1e-12
+        w /= w_sum
+        # Apply weights per-dimension to preserve legacy results while avoiding
+        # recomputing weights for each dimension.
+        for j in range(X.shape[1]):
+            neigh = X[:, j][idx_chunk]
+            out[start:end, j] = (w * neigh).sum(axis=1)
+    # Match legacy: weighted neighbor smoothing outputs float64 intermediates.
+    return out
 
 def _init_smoothing_worker(precomputed_or_none):
     """Initializer to set per-process global with heavy precomputed data."""

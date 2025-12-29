@@ -4,6 +4,7 @@ import scanpy as sc
 from anndata import AnnData
 from shapely.geometry import Polygon, MultiPoint
 import logging
+import time
 from scipy.spatial import Voronoi, cKDTree
 from typing import Optional
 
@@ -187,7 +188,8 @@ def generate_tiles(
             logging.info("Skipping Voronoi/rasterise; using coordinates as tiles with optional compaction.")
 
         # Use current coordinates (after optional filtering/reduction)
-        coords_used = coordinates.copy()
+        # Avoid an extra full DataFrame copy (coordinates is already a copy).
+        coords_used = coordinates
         if 0 in coords_used.columns and 1 in coords_used.columns:
             coords_used = coords_used.rename(columns={0: 'x', 1: 'y'})
         else:
@@ -277,9 +279,9 @@ def generate_tiles(
             capped_diffs = np.minimum(diffs, cap)
             # Reconstruct a monotonic mapping from old -> new positions
             new_positions = np.concatenate([[0.0], np.cumsum(capped_diffs)])
-            # Map back to original values via interpolation on uniq grid
-            mapping = dict(zip(uniq, new_positions))
-            return np.array([mapping[v] for v in vals])
+            # Vectorized map back to original values (much faster than Python dict loop).
+            idx = np.searchsorted(uniq, vals)
+            return new_positions[idx]
 
         def _rank_compact(vals: np.ndarray, step: float) -> np.ndarray:
             """
@@ -291,19 +293,35 @@ def generate_tiles(
             uniq = np.unique(vals)
             # Ensure deterministic order
             uniq_sorted = np.sort(uniq)
-            mapping = {v: i * step for i, v in enumerate(uniq_sorted)}
-            return np.array([mapping[v] for v in vals])
+            idx = np.searchsorted(uniq_sorted, vals)
+            return idx.astype(np.float64, copy=False) * step
 
-        tiles = coords_used.loc[:, ['x','y']].copy()
+        # Avoid deep copy for large datasets; we'll overwrite columns as needed.
+        tiles = coords_used.loc[:, ['x', 'y']].copy(deep=False)
+
+        # Decide rescaling policy up front so we can skip expensive kNN work.
+        rescale_flag = coords_rescale_to_nn
+        if rescale_flag is None:
+            rescale_flag = (coords_compaction != 'tight')
 
         # Compute original median 1-NN distance (for optional rescaling)
         med_nn_orig = None
-        try:
-            kdt_orig = cKDTree(tiles[['x','y']].values.astype(float))
-            dists_orig, _ = kdt_orig.query(tiles[['x','y']].values.astype(float), k=2)
-            med_nn_orig = np.median(dists_orig[:, 1]) if dists_orig.shape[1] > 1 else None
-        except Exception:
-            med_nn_orig = None
+        if rescale_flag:
+            try:
+                t_nn0 = time.perf_counter()
+                # Keep float64 for strict backward-compatible distances/scales.
+                xy_orig = tiles[['x', 'y']].to_numpy(dtype=np.float64, copy=False)
+                kdt_orig = cKDTree(xy_orig)
+                workers = -1 if (n_jobs in (None, -1)) else int(n_jobs)
+                try:
+                    dists_orig, _ = kdt_orig.query(xy_orig, k=2, workers=workers)
+                except TypeError:
+                    dists_orig, _ = kdt_orig.query(xy_orig, k=2)
+                med_nn_orig = np.median(dists_orig[:, 1]) if dists_orig.shape[1] > 1 else None
+                if verbose:
+                    logging.info(f"Computed original median 1-NN distance in {time.perf_counter() - t_nn0:.2f}s")
+            except Exception:
+                med_nn_orig = None
 
         if coords_compaction == 'tight':
             try:
@@ -315,6 +333,7 @@ def generate_tiles(
                 logging.warning(f"Tight packing failed; skipping: {e}")
         elif coords_max_gap_factor is not None and coords_max_gap_factor > 0:
             try:
+                t_compact = time.perf_counter()
                 x_new = _limit_axis_gaps(tiles['x'].to_numpy(dtype=float), float(coords_max_gap_factor))
                 y_new = _limit_axis_gaps(tiles['y'].to_numpy(dtype=float), float(coords_max_gap_factor))
                 tiles['x'] = x_new
@@ -323,23 +342,31 @@ def generate_tiles(
                     logging.info(
                         f"Coords-as-tiles compaction applied (gap cap factor={coords_max_gap_factor})."
                     )
+                    logging.info(f"Coords-as-tiles compaction took {time.perf_counter() - t_compact:.2f}s")
             except Exception as e:
                 logging.warning(f"Coordinate compaction skipped due to error: {e}")
 
         # Optionally rescale to match original median 1-NN distance
-        rescale_flag = coords_rescale_to_nn
-        if rescale_flag is None:
-            rescale_flag = (coords_compaction != 'tight')
         if rescale_flag and med_nn_orig is not None and med_nn_orig > 0:
             try:
-                kdt_new = cKDTree(tiles[['x','y']].values.astype(float))
-                dists_new, _ = kdt_new.query(tiles[['x','y']].values.astype(float), k=2)
+                t_nn1 = time.perf_counter()
+                # Keep float64 for strict backward-compatible distances/scales.
+                xy_new = tiles[['x', 'y']].to_numpy(dtype=np.float64, copy=False)
+                kdt_new = cKDTree(xy_new)
+                workers = -1 if (n_jobs in (None, -1)) else int(n_jobs)
+                try:
+                    dists_new, _ = kdt_new.query(xy_new, k=2, workers=workers)
+                except TypeError:
+                    dists_new, _ = kdt_new.query(xy_new, k=2)
                 med_nn_new = np.median(dists_new[:, 1]) if dists_new.shape[1] > 1 else None
                 if med_nn_new is not None and med_nn_new > 0:
                     scale = med_nn_orig / med_nn_new
-                    tiles[['x','y']] = tiles[['x','y']] * scale
+                    # Faster than 2-col DataFrame multiplication for large n.
+                    tiles['x'] = tiles['x'].to_numpy(dtype=np.float64, copy=False) * float(scale)
+                    tiles['y'] = tiles['y'].to_numpy(dtype=np.float64, copy=False) * float(scale)
                     if verbose:
                         logging.info("Post-compaction rescale applied to match median 1-NN distance.")
+                        logging.info(f"Computed new median 1-NN + rescaled in {time.perf_counter() - t_nn1:.2f}s")
             except Exception as e:
                 logging.warning(f"Rescale after compaction skipped: {e}")
 

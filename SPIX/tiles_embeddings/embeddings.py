@@ -344,15 +344,29 @@ def process_counts(
 
     # Select counts based on 'use_counts' parameter
     if use_counts == 'raw':
-        counts = adata.raw.X if adata.raw is not None else adata.X.copy()
-        adata_proc = adata.copy()
+        # Avoid copying the full AnnData (obsm/uns/etc). We only need X/obs/var for
+        # normalization + HVG/PCA. This is a major memory win on large objects.
+        if adata.raw is not None:
+            counts = adata.raw.X
+            var_df = adata.raw.var.copy()
+            var_names = adata.raw.var_names.copy()
+        else:
+            counts = adata.X
+            var_df = adata.var.copy()
+            var_names = adata.var_names.copy()
+
+        X = counts.copy() if hasattr(counts, "copy") else counts
+        adata_proc = AnnData(X=X, obs=adata.obs.copy(), var=var_df)
+        adata_proc.obs_names = adata.obs_names.copy()
+        adata_proc.var_names = var_names
     else:
         if use_counts not in adata.layers:
             raise ValueError(f"Layer '{use_counts}' not found in adata.layers.")
         counts = adata.layers[use_counts]
-        adata_proc = AnnData(X=counts)
-        adata_proc.var_names = adata.var_names.copy()
+        X = counts.copy() if hasattr(counts, "copy") else counts
+        adata_proc = AnnData(X=X, obs=adata.obs.copy(), var=adata.var.copy())
         adata_proc.obs_names = adata.obs_names.copy()
+        adata_proc.var_names = adata.var_names.copy()
 
     # Apply normalization and feature selection
     if method == 'log_norm':

@@ -30,7 +30,8 @@ def equalize_image(
     up: float = 100.0,
     down: float = 10.0,
     verbose: bool = True,
-    n_jobs: int = 1  
+    n_jobs: int = 1,
+    implementation: str = "auto",  # 'auto'|'vectorized'|'legacy'
 ) -> AnnData:
     """
     Equalize histogram of embeddings.
@@ -78,7 +79,50 @@ def equalize_image(
     if verbose:
         print("Starting equalization...")
     
+    impl = (implementation or "auto").lower()
+    if impl not in {"auto", "vectorized", "legacy"}:
+        raise ValueError("implementation must be one of {'auto','vectorized','legacy'}.")
+
     embeddings = adata.obsm[embedding][:, dimensions].copy()
+
+    # Fast path: fully vectorized BalanceSimplest across dimensions
+    if method == "BalanceSimplest" and impl in {"auto", "vectorized"}:
+        if verbose:
+            print(f"Equalizing {len(dimensions)} dims using vectorized '{method}'")
+
+        # Match legacy numeric behavior: percentiles in float64, clip to original dtype,
+        # then min-max normalize with float64 denom before casting back to embeddings dtype.
+        data = np.asarray(embeddings)
+        lower = np.percentile(data, sleft, axis=0)
+        upper = np.percentile(data, 100.0 - sright, axis=0)
+        balanced = np.clip(data, lower, upper)
+        vmin = balanced.min(axis=0)
+        vmax = balanced.max(axis=0)
+        denom = (vmax - vmin) + 1e-10
+        out = (balanced - vmin) / denom
+        embeddings[:] = out.astype(embeddings.dtype, copy=False)
+
+        adata.obsm[output] = embeddings
+        if verbose:
+            print("Logging changes to AnnData.uns['equalize_image_log']")
+        adata.uns['equalize_image_log'] = {
+            'method': method,
+            'parameters': {
+                'N': N,
+                'smax': smax,
+                'sleft': sleft,
+                'sright': sright,
+                'lambda_': lambda_,
+                'up': up,
+                'down': down
+            },
+            'dimensions': dimensions,
+            'embedding': embedding,
+            'implementation': 'vectorized',
+        }
+        if verbose:
+            print("Histogram equalization completed.")
+        return adata
     
     def process_dimension(i, dim):
         if verbose:
@@ -104,6 +148,8 @@ def equalize_image(
         else:
             raise ValueError(f"Unknown equalization method '{method}'")
 
+    if impl == "legacy":
+        n_jobs = int(n_jobs)
     if n_jobs > 1:
         with ThreadPoolExecutor(max_workers=n_jobs) as executor:
             results = list(executor.map(process_dimension, range(len(dimensions)), dimensions))

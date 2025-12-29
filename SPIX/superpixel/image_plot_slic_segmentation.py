@@ -114,7 +114,7 @@ def image_plot_slic_segmentation(
 
     logger.info("Running SLIC on CPU...")
     label_img = slic(
-        img.astype(np.float64),
+        img,
         n_segments=n_segments,
         compactness=compactness,
         sigma=0,
@@ -187,7 +187,7 @@ def slic_segmentation_from_cached_image(
         raise ValueError("Cached image must have shape (H, W, C).")
 
     label_img = slic(
-        img.astype(np.float64),
+        img,
         n_segments=int(n_segments),
         compactness=float(compactness),
         sigma=0,

@@ -35,3 +35,4 @@ SPIX/utils/__init__.py
 SPIX/utils/utils.py
 SPIX/visualization/__init__.py
 SPIX/visualization/plotting.py
+benchmarks/visiumhd_crc_benchmark.py
