@@ -8,3 +8,8 @@ __pycache__/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Runtime caches/artifacts
+.spix_cache/
+.numba_cache/
+.mplconfig/

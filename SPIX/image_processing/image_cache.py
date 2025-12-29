@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import os
 from sklearn.preprocessing import MinMaxScaler
 from scipy.spatial import KDTree
 from typing import Optional, Dict, Any, List, Sequence, Tuple
@@ -30,6 +31,9 @@ def cache_embedding_image(
     store: str = "auto",  # 'auto'|'memory'|'memmap'
     memmap_dir: Optional[str] = None,
     memmap_threshold_mb: float = 512.0,
+    # Cache metadata size control
+    store_barcodes: str = "auto",  # 'auto'|'always'|'never'
+    barcodes_max_n: int = 1_000_000,
     verbose: bool = False,
     show: bool = False,
     show_channels: Optional[Sequence[int]] = None,
@@ -128,6 +132,9 @@ def cache_embedding_image(
     store = (store or "auto").lower()
     if store not in {"auto", "memory", "memmap"}:
         raise ValueError("store must be one of {'auto','memory','memmap'}.")
+    store_barcodes = (store_barcodes or "auto").lower()
+    if store_barcodes not in {"auto", "always", "never"}:
+        raise ValueError("store_barcodes must be one of {'auto','always','never'}.")
 
     # Align tiles (coords) to obs order without a full pandas merge
     tiles_df = adata.uns["tiles"]
@@ -309,14 +316,28 @@ def cache_embedding_image(
 
     # Chunked rasterization in chosen order
     num_tiles = spatial_coords.shape[0]
-    for i in range(0, num_tiles, max(1, chunk_size)):
-        idx = order_idx[i : min(i + chunk_size, num_tiles)]
-        xi = ((spatial_coords[idx, 0] - x_min) * scale).astype(int)
-        yi = ((spatial_coords[idx, 1] - y_min) * scale).astype(int)
-        all_x = np.clip((xi[:, None] + dx).ravel(), 0, w - 1)
-        all_y = np.clip((yi[:, None] + dy).ravel(), 0, h - 1)
-        tile_idx_map = np.repeat(idx, len(dx))
-        img[all_y, all_x] = cols[tile_idx_map]
+    pixels_per_tile = int(len(dx))
+    # Keep intermediate index arrays bounded.
+    target_pixels = int(os.environ.get("SPIX_CACHE_RASTER_TARGET_PIXELS", "25000000"))
+    chunk_n = int(max(1, min(int(chunk_size), int(max(1, target_pixels // max(1, pixels_per_tile))))))
+    if pixels_per_tile == 1 and pixel_shape != "circle":
+        # Fast path for s==1 square tiles: assign one pixel per tile.
+        for i in range(0, num_tiles, chunk_n):
+            idx = order_idx[i : min(i + chunk_n, num_tiles)]
+            xi = ((spatial_coords[idx, 0] - x_min) * scale).astype(np.int32)
+            yi = ((spatial_coords[idx, 1] - y_min) * scale).astype(np.int32)
+            xi = np.clip(xi, 0, w - 1)
+            yi = np.clip(yi, 0, h - 1)
+            img[yi, xi] = cols[idx]
+    else:
+        for i in range(0, num_tiles, chunk_n):
+            idx = order_idx[i : min(i + chunk_n, num_tiles)]
+            xi = ((spatial_coords[idx, 0] - x_min) * scale).astype(np.int32)
+            yi = ((spatial_coords[idx, 1] - y_min) * scale).astype(np.int32)
+            all_x = np.clip((xi[:, None] + dx).ravel(), 0, w - 1)
+            all_y = np.clip((yi[:, None] + dy).ravel(), 0, h - 1)
+            tile_idx_map = np.repeat(idx, pixels_per_tile)
+            img[all_y, all_x] = cols[tile_idx_map]
 
     # Optional: build label image for boundary overlay (preview only)
     label_img = None
@@ -394,8 +415,21 @@ def cache_embedding_image(
         "cx": cx.astype(np.int32),
         "cy": cy.astype(np.int32),
         "tile_obs_indices": tile_obs_indices.astype(np.int64),
-        "barcodes": [str(bc) for bc in barcodes.tolist()],
-        "origin_flags": np.asarray(origin_flags, dtype=int),
+        # Store barcodes only when explicitly requested or when the dataset is small.
+        # For huge VisiumHD datasets, storing a Python list of millions of strings
+        # can dominate RAM usage; downstream code can use `tile_obs_indices` instead.
+        "barcodes": (
+            [str(bc) for bc in barcodes.tolist()]
+            if (
+                store_barcodes == "always"
+                or (store_barcodes == "auto" and int(len(barcodes)) <= int(barcodes_max_n))
+            )
+            else None
+        ),
+        "barcodes_stored": bool(
+            store_barcodes == "always" or (store_barcodes == "auto" and int(len(barcodes)) <= int(barcodes_max_n))
+        ),
+        "origin_flags": np.asarray(origin_flags, dtype=np.uint8),
         "segment_key": seg_col,
         "segment_key_requested": segment_key,
         "store": store,
@@ -850,17 +884,26 @@ def rebuild_cached_image_from_obsm(
     w = int(cache["w"])
     s = int(cache["tile_px"])
     pixel_shape = str(cache.get("pixel_shape", "square"))
-    barcodes = list(cache.get("barcodes", []))
-    if not barcodes:
-        raise ValueError("Cached image missing 'barcodes' order.")
     cx = np.asarray(cache.get("cx"), dtype=int)
     cy = np.asarray(cache.get("cy"), dtype=int)
-    if cx.size != len(barcodes) or cy.size != len(barcodes):
-        raise ValueError("Cached centers length mismatch with barcodes.")
+    tile_obs_indices = cache.get("tile_obs_indices", None)
+    barcodes = list(cache.get("barcodes", []) or [])
+    if tile_obs_indices is None and not barcodes:
+        raise ValueError("Cached image missing both 'tile_obs_indices' and 'barcodes' order.")
+    if tile_obs_indices is not None:
+        idx = np.asarray(tile_obs_indices, dtype=int)
+        if cx.size != idx.size or cy.size != idx.size:
+            raise ValueError("Cached centers length mismatch with tile_obs_indices.")
+    else:
+        if cx.size != len(barcodes) or cy.size != len(barcodes):
+            raise ValueError("Cached centers length mismatch with barcodes.")
 
     # collect embeddings aligned to cached barcodes order
-    obs_idx_map = {str(bc): i for i, bc in enumerate(adata.obs.index.astype(str))}
-    rows = np.fromiter((obs_idx_map[str(bc)] for bc in barcodes), dtype=int)
+    if tile_obs_indices is not None:
+        rows = np.asarray(tile_obs_indices, dtype=int)
+    else:
+        obs_idx_map = {str(bc): i for i, bc in enumerate(adata.obs.index.astype(str))}
+        rows = np.fromiter((obs_idx_map[str(bc)] for bc in barcodes), dtype=int)
     E = np.asarray(adata.obsm[emb_key])
     # If the embedding only contains the selected dims (e.g., smoothed/equalized output),
     # treat dims as relative indices [0..len(dims)-1]. Otherwise, use absolute dim indices.
@@ -890,11 +933,18 @@ def rebuild_cached_image_from_obsm(
         gx, gy = np.meshgrid(rng, rng)
         dx, dy = gx.flatten(), gy.flatten()
 
-    n = len(barcodes)
-    for i in range(n):
-        all_x = np.clip(xi[i] + dx, 0, w - 1)
-        all_y = np.clip(yi[i] + dy, 0, h - 1)
-        img[all_y, all_x] = emb[i]
+    n = int(cx.size)
+    pixels_per_tile = int(len(dx))
+    if pixels_per_tile == 1 and pixel_shape != "circle":
+        img[np.clip(cy, 0, h - 1), np.clip(cx, 0, w - 1)] = emb
+    else:
+        chunk_n = int(os.environ.get("SPIX_CACHE_REBUILD_CHUNK", "50000"))
+        for start in range(0, n, max(1, chunk_n)):
+            end = min(start + max(1, chunk_n), n)
+            all_x = np.clip((xi[start:end, None] + dx).ravel(), 0, w - 1)
+            all_y = np.clip((yi[start:end, None] + dy).ravel(), 0, h - 1)
+            tile_idx_map = np.repeat(np.arange(start, end), pixels_per_tile)
+            img[all_y, all_x] = emb[tile_idx_map]
 
     out_cache = cache if in_place else dict(cache)
     out_cache["img"] = img

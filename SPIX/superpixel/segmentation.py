@@ -523,27 +523,59 @@ def segment_image(
             )
             t1 = time.perf_counter()
 
-            cache_barcodes = pd.Series(cache.get("barcodes", []), dtype=str)
-            if cache_barcodes.empty:
-                raise ValueError(f"Cached image '{image_cache_key}' missing barcodes.")
-
-            if cache_barcodes.duplicated().any():
-                clusters_df = _aggregate_labels_majority(
-                    cache_barcodes,
-                    labels_tile,
-                    origin_flags=cache.get("origin_flags", None),
-                )
-                tile_barcodes = clusters_df["barcode"].astype(str).to_numpy()
-                tile_labels = clusters_df["Segment"].to_numpy()
-            else:
-                tile_barcodes = cache_barcodes.to_numpy()
-                tile_labels = np.asarray(labels_tile)
-
-            obs_barcodes = pd.Index(adata.obs.index.astype(str))
-            obs_pos = obs_barcodes.get_indexer(pd.Index(tile_barcodes))
-            ok = obs_pos >= 0
             seg_vals = np.full(adata.n_obs, np.nan, dtype=object)
-            seg_vals[obs_pos[ok]] = tile_labels[ok]
+            tile_obs_indices = cache.get("tile_obs_indices", None)
+            if tile_obs_indices is not None:
+                idx = np.asarray(tile_obs_indices, dtype=np.int64)
+                tile_labels = np.asarray(labels_tile)
+                if idx.ndim != 1 or idx.size != tile_labels.size:
+                    raise ValueError(
+                        f"Cached image '{image_cache_key}' has tile_obs_indices of length {idx.size}, "
+                        f"but got {tile_labels.size} tile labels."
+                    )
+                # Fast path: one tile per obs (unique indices)
+                if np.unique(idx).size == idx.size:
+                    seg_vals[idx] = tile_labels
+                else:
+                    # Fallback: if duplicates exist, use barcode aggregation if available.
+                    cache_barcodes = pd.Series(cache.get("barcodes") or [], dtype=str)
+                    if cache_barcodes.empty:
+                        raise ValueError(
+                            f"Cached image '{image_cache_key}' has duplicate tile_obs_indices but no barcodes to aggregate."
+                        )
+                    clusters_df = _aggregate_labels_majority(
+                        cache_barcodes,
+                        tile_labels,
+                        origin_flags=cache.get("origin_flags", None),
+                    )
+                    tile_barcodes = clusters_df["barcode"].astype(str).to_numpy()
+                    tile_labels2 = clusters_df["Segment"].to_numpy()
+                    obs_barcodes = pd.Index(adata.obs.index.astype(str))
+                    obs_pos = obs_barcodes.get_indexer(pd.Index(tile_barcodes))
+                    ok = obs_pos >= 0
+                    seg_vals[obs_pos[ok]] = tile_labels2[ok]
+            else:
+                # Backward-compatible mapping by barcode list
+                cache_barcodes = pd.Series(cache.get("barcodes") or [], dtype=str)
+                if cache_barcodes.empty:
+                    raise ValueError(f"Cached image '{image_cache_key}' missing barcodes.")
+
+                if cache_barcodes.duplicated().any():
+                    clusters_df = _aggregate_labels_majority(
+                        cache_barcodes,
+                        labels_tile,
+                        origin_flags=cache.get("origin_flags", None),
+                    )
+                    tile_barcodes = clusters_df["barcode"].astype(str).to_numpy()
+                    tile_labels = clusters_df["Segment"].to_numpy()
+                else:
+                    tile_barcodes = cache_barcodes.to_numpy()
+                    tile_labels = np.asarray(labels_tile)
+
+                obs_barcodes = pd.Index(adata.obs.index.astype(str))
+                obs_pos = obs_barcodes.get_indexer(pd.Index(tile_barcodes))
+                ok = obs_pos >= 0
+                seg_vals[obs_pos[ok]] = tile_labels[ok]
             adata.obs[Segment] = pd.Categorical(seg_vals)
 
             # Compute pseudo-centroids in obs order
