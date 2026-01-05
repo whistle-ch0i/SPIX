@@ -50,6 +50,8 @@ def cache_embedding_image(
     segment_color_by_major: bool = False,
     title: Optional[str] = None,
     use_imshow: bool = True,
+    brighten_continuous: bool = False,
+    continuous_gamma: float = 0.8,
     # Boundary-related options for preview overlay
     plot_boundaries: bool = False,
     boundary_method: str = "pixel",
@@ -110,6 +112,8 @@ def cache_embedding_image(
             segment_color_by_major=segment_color_by_major,
             title=title,
             use_imshow=use_imshow,
+            brighten_continuous=brighten_continuous,
+            continuous_gamma=continuous_gamma,
             plot_boundaries=plot_boundaries,
             boundary_method=boundary_method,
             boundary_color=boundary_color,
@@ -246,6 +250,9 @@ def cache_embedding_image(
     dims = embeddings.shape[1]
     scaler = MinMaxScaler()
     cols = scaler.fit_transform(embeddings.astype(np.float32))
+    brighten_applied = bool(brighten_continuous and dims == 3)
+    if brighten_applied:
+        cols = _apply_brighten_continuous_rgb(cols, continuous_gamma)
 
     if verbose:
         print(f"Rasterizing → image size (h, w, C)=({h}, {w}, {dims}) | tile_px={s}")
@@ -451,6 +458,9 @@ def cache_embedding_image(
             "segment_color_by_major": bool(segment_color_by_major),
             "title": title,
             "use_imshow": bool(use_imshow),
+            "brighten_continuous": bool(brighten_continuous),
+            "continuous_gamma": float(continuous_gamma),
+            "brighten_applied": bool(brighten_applied),
             # boundary params
             "plot_boundaries": bool(plot_boundaries),
             "boundary_method": boundary_method,
@@ -553,6 +563,8 @@ def _cache_embedding_image_legacy(
     segment_color_by_major: bool,
     title: Optional[str],
     use_imshow: bool,
+    brighten_continuous: bool,
+    continuous_gamma: float,
     plot_boundaries: bool,
     boundary_method: str,
     boundary_color: str,
@@ -665,6 +677,9 @@ def _cache_embedding_image_legacy(
     dims = embeddings.shape[1]
     scaler = MinMaxScaler()
     cols = scaler.fit_transform(embeddings.astype(np.float32))
+    brighten_applied = bool(brighten_continuous and dims == 3)
+    if brighten_applied:
+        cols = _apply_brighten_continuous_rgb(cols, continuous_gamma)
 
     if verbose:
         print(f"Rasterizing → image size (h, w, C)=({h}, {w}, {dims}) | tile_px={s}")
@@ -817,6 +832,9 @@ def _cache_embedding_image_legacy(
             "segment_color_by_major": bool(segment_color_by_major),
             "title": title,
             "use_imshow": bool(use_imshow),
+            "brighten_continuous": bool(brighten_continuous),
+            "continuous_gamma": float(continuous_gamma),
+            "brighten_applied": bool(brighten_applied),
             "plot_boundaries": bool(plot_boundaries),
             "boundary_method": boundary_method,
             "boundary_color": boundary_color,
@@ -917,6 +935,11 @@ def rebuild_cached_image_from_obsm(
     if normalize_channels:
         scaler = MinMaxScaler()
         emb = scaler.fit_transform(emb)
+    plot_params = cache.get("image_plot_params", {})
+    brighten_applied = False
+    if plot_params.get("brighten_continuous", False) and emb.shape[1] == 3:
+        emb = _apply_brighten_continuous_rgb(emb, plot_params.get("continuous_gamma", 0.8))
+        brighten_applied = True
 
     img = np.ones((h, w, emb.shape[1]), dtype=np.float32)
 
@@ -956,6 +979,9 @@ def rebuild_cached_image_from_obsm(
         "embedding": emb_key,
         "dims": list(dims),
     })
+    out_plot_params = dict(out_cache.get("image_plot_params", {}) or {})
+    out_plot_params["brighten_applied"] = bool(brighten_applied)
+    out_cache["image_plot_params"] = out_plot_params
 
     if not in_place and out_key:
         adata.uns[out_key] = out_cache
@@ -999,6 +1025,23 @@ def _prepare_display_image(img: np.ndarray, channels: Optional[Sequence[int]] = 
     return rgb
 
 
+def _apply_brighten_continuous_rgb(rgb: np.ndarray, continuous_gamma: float) -> np.ndarray:
+    """Apply image_plot-style brightening/gamma to RGB arrays."""
+    arr = np.asarray(rgb, dtype=np.float32)
+    if arr.shape[-1] != 3:
+        return arr
+    max_per_pixel = arr.max(axis=-1, keepdims=True)
+    scale = np.where(max_per_pixel > 0, 1.0 / max_per_pixel, 0.0)
+    arr = np.clip(arr * scale, 0.0, 1.0)
+    try:
+        gamma = float(continuous_gamma)
+        if gamma > 0 and gamma != 1.0:
+            arr = np.clip(np.power(arr, gamma), 0.0, 1.0)
+    except Exception:
+        pass
+    return arr
+
+
 def _auto_title_fontsize_from_figsize(figsize: Tuple[float, float]) -> int:
     """Choose a title fontsize that scales with figure size.
 
@@ -1038,12 +1081,16 @@ def show_cached_image(
     figsize: Optional[tuple] = None,
     fig_dpi: Optional[int] = None,
     prefer_preview: bool = True,
+    brighten_continuous: Optional[bool] = None,
+    continuous_gamma: Optional[float] = None,
 ):
     """Display a single cached image stored in ``adata.uns[key]``.
 
     - For multi-channel images, defaults to RGB display. You can select
       specific channels via ``channels=[i,j,k]``.
     - For 1-channel images, uses ``cmap`` if provided; otherwise converts to RGB.
+    - ``brighten_continuous``/``continuous_gamma`` can brighten RGB display;
+      defaults to cached ``image_plot_params`` when present.
     """
     if key not in adata.uns:
         raise KeyError(f"No cached image under adata.uns['{key}']")
@@ -1059,11 +1106,27 @@ def show_cached_image(
     if figsize is None:
         figsize = cache.get("figsize", (8, 8))
 
+    plot_params = cache.get("image_plot_params", {}) or {}
+    apply_brighten = (
+        bool(brighten_continuous)
+        if brighten_continuous is not None
+        else bool(plot_params.get("brighten_continuous", False))
+    )
+    gamma = (
+        float(continuous_gamma)
+        if continuous_gamma is not None
+        else float(plot_params.get("continuous_gamma", 0.8))
+    )
+    cache_channels = int(cache.get("channels", img.shape[2]))
+    already_applied = bool(plot_params.get("brighten_applied", False)) and cache_channels == 3
+
     plt.figure(figsize=figsize, dpi=fig_dpi)
     if img.shape[2] == 1 and cmap is not None and channels is None:
         plt.imshow(img[:, :, 0], origin="lower", cmap=cmap)
     else:
         rgb = _prepare_display_image(img, channels=channels)
+        if apply_brighten and not already_applied:
+            rgb = _apply_brighten_continuous_rgb(rgb, gamma)
         plt.imshow(rgb, origin="lower")
 
     if title is None:
@@ -1103,6 +1166,8 @@ def show_all_cached_images(
     cmap: Optional[str] = None,
     tight_layout: bool = True,
     prefer_preview: bool = True,
+    brighten_continuous: Optional[bool] = None,
+    continuous_gamma: Optional[float] = None,
 ):
     """Display all cached images (or a provided subset of keys) as a grid."""
     if keys is None:
@@ -1132,10 +1197,25 @@ def show_all_cached_images(
         if img.ndim != 3:
             ax.set_visible(False)
             continue
+        plot_params = cache.get("image_plot_params", {}) or {}
+        apply_brighten = (
+            bool(brighten_continuous)
+            if brighten_continuous is not None
+            else bool(plot_params.get("brighten_continuous", False))
+        )
+        gamma = (
+            float(continuous_gamma)
+            if continuous_gamma is not None
+            else float(plot_params.get("continuous_gamma", 0.8))
+        )
+        cache_channels = int(cache.get("channels", img.shape[2]))
+        already_applied = bool(plot_params.get("brighten_applied", False)) and cache_channels == 3
         if img.shape[2] == 1 and cmap is not None and channels is None:
             ax.imshow(img[:, :, 0], origin="lower", cmap=cmap)
         else:
             rgb = _prepare_display_image(img, channels=channels)
+            if apply_brighten and not already_applied:
+                rgb = _apply_brighten_continuous_rgb(rgb, gamma)
             ax.imshow(rgb, origin="lower")
         emb = cache.get("embedding_key", "?")
         dims = cache.get("dimensions", [])

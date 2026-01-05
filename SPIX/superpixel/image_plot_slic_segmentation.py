@@ -9,6 +9,23 @@ from skimage.segmentation import slic
 from skimage.transform import resize
 
 
+def _apply_brighten_continuous_rgb(rgb: np.ndarray, continuous_gamma: float) -> np.ndarray:
+    """Apply image_plot-style brightening/gamma to RGB arrays."""
+    arr = np.asarray(rgb, dtype=np.float32)
+    if arr.shape[-1] != 3:
+        return arr
+    max_per_pixel = arr.max(axis=-1, keepdims=True)
+    scale = np.where(max_per_pixel > 0, 1.0 / max_per_pixel, 0.0)
+    arr = np.clip(arr * scale, 0.0, 1.0)
+    try:
+        gamma = float(continuous_gamma)
+        if gamma > 0 and gamma != 1.0:
+            arr = np.clip(np.power(arr, gamma), 0.0, 1.0)
+    except Exception:
+        pass
+    return arr
+
+
 def image_plot_slic_segmentation(
     embeddings: np.ndarray,
     spatial_coords: np.ndarray,
@@ -216,6 +233,13 @@ def slic_segmentation_from_cached_image(
         # Prefer provided figsize/fig_dpi; else fall back to cached
         _figsize = figsize if figsize is not None else cache.get("figsize", (8, 8))
         _dpi = fig_dpi if fig_dpi is not None else cache.get("fig_dpi", None)
+        plot_params = cache.get("image_plot_params", {}) or {}
+        apply_brighten = bool(plot_params.get("brighten_continuous", False))
+        gamma = float(plot_params.get("continuous_gamma", 0.8))
+        cache_channels = int(cache.get("channels", img.shape[2]))
+        already_applied = bool(plot_params.get("brighten_applied", False)) and cache_channels == 3
+        if apply_brighten and not already_applied:
+            display_img = _apply_brighten_continuous_rgb(display_img, gamma)
         plt.figure(figsize=_figsize, dpi=_dpi)
         plt.imshow(display_img, origin="lower")
         plt.title("Cached Embeddings Image")

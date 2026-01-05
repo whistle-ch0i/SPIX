@@ -389,6 +389,7 @@ def segment_image(
     use_cached_image: bool = False,
     image_cache_key: str = "image_plot_slic",
     cache_fast_path: bool = True,
+    compute_pseudo_centroids: bool = True,
 ):
     """
     Segment embeddings to find initial territories.
@@ -523,7 +524,10 @@ def segment_image(
             )
             t1 = time.perf_counter()
 
-            seg_vals = np.full(adata.n_obs, np.nan, dtype=object)
+            # Build per-observation segment codes without allocating an object array.
+            # Use -1 for missing values; `pd.Categorical.from_codes` treats -1 as NaN.
+            n_obs = int(adata.n_obs)
+            seg_codes = np.full(n_obs, -1, dtype=np.int32)
             tile_obs_indices = cache.get("tile_obs_indices", None)
             if tile_obs_indices is not None:
                 idx = np.asarray(tile_obs_indices, dtype=np.int64)
@@ -535,7 +539,7 @@ def segment_image(
                     )
                 # Fast path: one tile per obs (unique indices)
                 if np.unique(idx).size == idx.size:
-                    seg_vals[idx] = tile_labels
+                    seg_codes[idx] = tile_labels.astype(np.int32, copy=False)
                 else:
                     # Fallback: if duplicates exist, use barcode aggregation if available.
                     cache_barcodes = pd.Series(cache.get("barcodes") or [], dtype=str)
@@ -553,7 +557,7 @@ def segment_image(
                     obs_barcodes = pd.Index(adata.obs.index.astype(str))
                     obs_pos = obs_barcodes.get_indexer(pd.Index(tile_barcodes))
                     ok = obs_pos >= 0
-                    seg_vals[obs_pos[ok]] = tile_labels2[ok]
+                    seg_codes[obs_pos[ok]] = np.asarray(tile_labels2[ok], dtype=np.int32)
             else:
                 # Backward-compatible mapping by barcode list
                 cache_barcodes = pd.Series(cache.get("barcodes") or [], dtype=str)
@@ -575,8 +579,20 @@ def segment_image(
                 obs_barcodes = pd.Index(adata.obs.index.astype(str))
                 obs_pos = obs_barcodes.get_indexer(pd.Index(tile_barcodes))
                 ok = obs_pos >= 0
-                seg_vals[obs_pos[ok]] = tile_labels[ok]
-            adata.obs[Segment] = pd.Categorical(seg_vals)
+                seg_codes[obs_pos[ok]] = np.asarray(tile_labels[ok], dtype=np.int32)
+
+            # Categories are integer labels. Some SLIC implementations can return
+            # labels that are not exactly 0..n_segments-1, so derive the upper
+            # bound from observed labels to keep codes valid.
+            max_code = int(seg_codes.max(initial=-1))
+            n_segments = int(max_code + 1) if max_code >= 0 else 0
+            categories = np.arange(n_segments, dtype=np.int32)
+            adata.obs[Segment] = pd.Categorical.from_codes(seg_codes, categories=categories)
+
+            if not compute_pseudo_centroids:
+                if verbose:
+                    print(f"[perf] cached SLIC (fast path): {t1 - t0:.3f}s")
+                return
 
             # Compute pseudo-centroids in obs order
             E_full = np.asarray(adata.obsm[embedding])
@@ -584,7 +600,22 @@ def segment_image(
                 E_use = E_full
             else:
                 E_use = E_full[:, dimensions]
-            pseudo_centroids = _pseudo_centroids_from_segment_labels(E_use, seg_vals)
+            # Convert codes -> per-observation pseudo-centroid vectors.
+            mask = seg_codes >= 0
+            if not mask.any():
+                pseudo_centroids = np.full((n_obs, E_use.shape[1]), np.nan, dtype=np.float32)
+            else:
+                E = np.asarray(E_use[mask], dtype=np.float64)
+                codes = seg_codes[mask].astype(np.int64, copy=False)
+                sums = np.zeros((n_segments, E.shape[1]), dtype=np.float64)
+                counts = np.bincount(codes, minlength=n_segments).astype(np.float64)
+                for j in range(E.shape[1]):
+                    np.add.at(sums[:, j], codes, E[:, j])
+                denom = counts.copy()
+                denom[denom < 1.0] = np.nan
+                means = (sums / denom[:, None]).astype(np.float32)
+                pseudo_centroids = np.full((n_obs, E_use.shape[1]), np.nan, dtype=np.float32)
+                pseudo_centroids[mask] = means[codes]
             segment_suffix = _sanitize_segment_name(Segment)
             adata.obsm["X_embedding_segment"] = pseudo_centroids
             adata.obsm[f"X_embedding_{segment_suffix}"] = pseudo_centroids
