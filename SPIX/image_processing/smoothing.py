@@ -30,6 +30,12 @@ def smooth_image(
     # Graph-diffusion smoothing parameters
     graph_k           = 30,                   # Number of neighbors for graph construction
     graph_t           = 2,                    # Number of diffusion steps
+    graph_tol         = None,                # Early-stop tolerance for graph diffusion (max abs change); None disables
+    graph_check_every = 1,                   # Check graph convergence every N steps when graph_tol is set
+    approx_mode       = None,                # None or 'grid' to approximate all methods on a coarse grid
+    approx_target_n   = 200_000,             # Target number of bins for approx_mode='grid'
+    approx_bin        = None,                # Bin size (coord units) for approx_mode='grid'
+    approx_max_bins   = None,                # Hard cap on bin count for approx_mode='grid'
     graph_explicit    = 'explicit',                # 'explicit'|'implicit'|'auto' or bool to control graph operator
     graph_explicit_max_mb = None,            # Max MB allowed for explicit graph operator in 'auto' mode
     use_float32       = True,                # Override SPIX_SMOOTH_FLOAT32; bool or None
@@ -65,7 +71,7 @@ def smooth_image(
     # Parallelization backend
     backend = 'processes',                    # 'processes' (default) or 'threads'
     mp_start_method = None,                   # None=auto; else one of {'fork','spawn','forkserver'}
-    implementation: str = "vectorized",             # 'auto'|'vectorized'|'legacy'
+    implementation: str = "auto",             # 'auto'|'vectorized'|'legacy'
 ):
     """
     Sequentially apply one or more smoothing methods to an embedding and store
@@ -94,6 +100,14 @@ def smooth_image(
         knn_chunk (int): Process KNN/gaussian in chunks to cap memory.
         graph_k (int): Neighbor count for graph construction.
         graph_t (int): Number of graph diffusion steps.
+        graph_tol (float|None): If set, stop early when max abs change <= graph_tol.
+            This can speed up large t at a small accuracy cost.
+        graph_check_every (int): Check convergence every N steps when graph_tol is set.
+        approx_mode (str|None): If 'grid', run all requested methods on a coarse
+            grid and map results back to cells (approximate).
+        approx_target_n (int): Target number of grid bins for approx_mode='grid'.
+        approx_bin (float|None): Grid bin size in coordinate units; overrides target.
+        approx_max_bins (int|None): Hard cap on bin count for approx_mode='grid'.
         graph_explicit (str|bool|None): 'explicit' uses symmetric operator (1 matmul/step),
             'implicit' uses W + Wᵀ (2 matmul/step), 'auto' chooses by memory; bool maps
             to explicit/implicit. None uses env or default.
@@ -135,7 +149,11 @@ def smooth_image(
     Returns:
         anndata.AnnData: With smoothed embedding at adata.obsm[output].
     """
+    global _SMOOTH_PRECOMPUTED
     logging.info("Starting embedding smoothing process.")
+    if isinstance(methods, (str, bytes)):
+        methods = [methods]
+    methods = [str(m).strip().lower() for m in methods]
     logging.info(f"Input embedding key: '{embedding}'")
     logging.info(f"Output embedding key: '{output}'")
     logging.info(f"Smoothing methods to apply (in order): {methods}")
@@ -149,6 +167,34 @@ def smooth_image(
         logging.info("Smoothing precision: float32")
     if fast_float32:
         logging.info("Fast float32 math enabled for neighbor weights.")
+    if graph_tol is not None:
+        graph_tol = float(graph_tol)
+        if graph_tol <= 0:
+            graph_tol = None
+    graph_check_every = int(max(1, graph_check_every))
+    if graph_tol is not None:
+        logging.info("Graph early-stop enabled: tol=%g, check_every=%d", graph_tol, graph_check_every)
+    approx_mode_val = None
+    if approx_mode is not None:
+        if isinstance(approx_mode, bool):
+            approx_mode_val = "grid" if approx_mode else None
+        else:
+            approx_mode_val = str(approx_mode).strip().lower()
+            if approx_mode_val in {"none", "off", "false", "0"}:
+                approx_mode_val = None
+    if approx_mode_val is not None and approx_mode_val not in {"grid"}:
+        raise ValueError("approx_mode must be one of {None,'grid','none'}.")
+    if approx_max_bins is None:
+        try:
+            approx_max_bins = int(
+                os.environ.get("SPIX_SMOOTH_APPROX_MAX_BINS", "500000")
+            )
+        except Exception:
+            approx_max_bins = 500000
+    else:
+        approx_max_bins = int(approx_max_bins)
+    if approx_max_bins is not None and approx_max_bins <= 0:
+        approx_max_bins = None
     # 1) load embedding first (to get n)
     try:
         raw_embedding = np.asarray(adata.obsm[embedding])
@@ -202,13 +248,13 @@ def smooth_image(
 
     # 3) Precompute neighbors/graphs once in the parent (memory + speed)
     precomputed = {}
-    tree_spatial = cKDTree(coords, balanced_tree=True, compact_nodes=True)
 
     need_graph = 'graph' in methods
     need_knn = 'knn' in methods
     need_gaussian = 'gaussian' in methods
     need_guided = 'guided' in methods
     need_heat = 'heat' in methods
+    need_tree = need_graph or need_knn or need_gaussian or need_guided or need_heat or ('bilateral' in methods)
 
     if need_gaussian:
         gaussian_t = int(gaussian_t)
@@ -308,6 +354,328 @@ def smooth_image(
         ).strip().lower() in {"1", "true", "yes"}
     else:
         gaussian_sparse_sort = bool(gaussian_sparse_sort)
+
+    if approx_mode_val is not None:
+        logging.info("Approximate smoothing enabled: mode=%s", approx_mode_val)
+        approx_info = _precompute_approx_grid(
+            coords,
+            graph_k=graph_k,
+            graph_t=graph_t,
+            graph_explicit=graph_explicit,
+            graph_explicit_max_mb=graph_explicit_max_mb,
+            use_float32=use_float32,
+            target_n=approx_target_n,
+            bin_size=approx_bin,
+            max_bins=approx_max_bins,
+            build_graph=('graph' in methods),
+            neighbor_workers=neighbor_workers,
+        )
+        precomputed_approx = {}
+        if 'graph' in methods:
+            g = approx_info.get("graph")
+            if g is None:
+                raise RuntimeError("Approximate graph operator missing.")
+            precomputed_approx["graph"] = g
+        centers = approx_info.get("centers")
+        if centers is None:
+            raise RuntimeError("Approximate bin centers missing.")
+        n_bins = int(approx_info.get("n_bins", centers.shape[0]))
+
+        need_knn = 'knn' in methods
+        need_gaussian = 'gaussian' in methods
+        need_guided = 'guided' in methods
+        need_heat = 'heat' in methods
+        need_bilateral = 'bilateral' in methods
+
+        k_knn = int(max(1, min(int(knn_k), n_bins))) if need_knn else 0
+        if need_gaussian:
+            gaussian_k_eff = knn_k if gaussian_k is None else gaussian_k
+            k_gauss = int(max(1, min(int(gaussian_k_eff), n_bins)))
+        else:
+            k_gauss = 0
+        if need_guided:
+            guided_k_eff = knn_k if guided_k is None else guided_k
+            k_guided = int(max(1, min(int(guided_k_eff), n_bins)))
+        else:
+            k_guided = 0
+        if need_heat:
+            if heat_k is None:
+                heat_k_eff = gaussian_k if gaussian_k is not None else knn_k
+            else:
+                heat_k_eff = heat_k
+            k_heat = int(max(1, min(int(heat_k_eff), n_bins)))
+        else:
+            k_heat = 0
+        if need_bilateral:
+            k_bi = int(max(1, min(int(bilateral_k) + 1, n_bins)))
+        else:
+            k_bi = 0
+
+        if need_knn or need_gaussian or need_guided or need_heat or need_bilateral:
+            tree_bins = cKDTree(centers, balanced_tree=True, compact_nodes=True)
+            k_all = int(max(k_knn, k_gauss, k_guided, k_heat, k_bi))
+            d_all, idx_all = tree_bins.query(centers, k=k_all, workers=neighbor_workers)
+            if k_all == 1:
+                d_all = d_all[:, None]
+                idx_all = idx_all[:, None]
+            if need_knn:
+                precomputed_approx['knn'] = {
+                    'dists': d_all[:, :k_knn].astype('float32'),
+                    'idx': idx_all[:, :k_knn].astype('int32'),
+                }
+            if need_gaussian:
+                if need_knn and k_gauss == k_knn:
+                    precomputed_approx['gaussian'] = precomputed_approx['knn']
+                else:
+                    precomputed_approx['gaussian'] = {
+                        'dists': d_all[:, :k_gauss].astype('float32'),
+                        'idx': idx_all[:, :k_gauss].astype('int32'),
+                    }
+            if need_guided:
+                guided_entry = {
+                    'idx': idx_all[:, :k_guided].astype('int32'),
+                }
+                if guided_sigma is not None:
+                    guided_entry['dists'] = d_all[:, :k_guided].astype('float32')
+                precomputed_approx['guided'] = guided_entry
+            if need_heat:
+                precomputed_approx['heat'] = {
+                    'dists': d_all[:, :k_heat].astype('float32'),
+                    'idx': idx_all[:, :k_heat].astype('int32'),
+                }
+            if need_bilateral:
+                d_bi = d_all[:, :k_bi].astype('float32')
+                idx_bi = idx_all[:, :k_bi].astype('int32')
+                if k_bi > 1:
+                    sigma_s = (np.median(d_bi[:, 1:], axis=1).astype('float32') + 1e-9).astype('float32')
+                else:
+                    sigma_s = np.full(d_bi.shape[0], 1.0, dtype='float32')
+                precomputed_approx['bilateral'] = {
+                    'dists': d_bi,
+                    'idx': idx_bi,
+                    'sigma_s': sigma_s,
+                }
+            try:
+                del d_all, idx_all
+            except Exception:
+                pass
+            gc.collect()
+
+        if need_gaussian and gaussian_mode not in {"chunked", "0", "false", "no"}:
+            use_sparse = False
+            est_mb = None
+            if gaussian_mode in {"sparse", "1", "true", "yes"}:
+                use_sparse = True
+            else:
+                if gaussian_t > 1:
+                    nnz = int(n_bins) * int(k_gauss)
+                    data_bytes = np.dtype(np.float32 if fast_float32 else np.float64).itemsize
+                    use_int32 = nnz <= np.iinfo(np.int32).max and n_bins <= np.iinfo(np.int32).max
+                    index_bytes = np.dtype(np.int32 if use_int32 else np.int64).itemsize
+                    est_bytes = nnz * (data_bytes + index_bytes) + (int(n_bins) + 1) * index_bytes
+                    est_mb = est_bytes / (1024.0 ** 2)
+                    use_sparse = est_mb <= float(gaussian_operator_max_mb)
+            if use_sparse:
+                gauss_data = precomputed_approx.get("gaussian")
+                if gauss_data is None:
+                    raise RuntimeError("Gaussian neighbors not precomputed but 'gaussian' requested.")
+                Wg = _build_row_stochastic_csr(
+                    gauss_data["dists"],
+                    gauss_data["idx"],
+                    sigma=float(gaussian_sigma),
+                    fast_float32=fast_float32,
+                    sort_indices=gaussian_sparse_sort,
+                )
+                gauss_data["W"] = Wg
+                if gauss_data is not precomputed_approx.get("knn"):
+                    gauss_data.pop("dists", None)
+                    gauss_data.pop("idx", None)
+                if est_mb is None:
+                    nnz = int(Wg.nnz)
+                    data_bytes = np.dtype(Wg.dtype).itemsize
+                    index_bytes = np.dtype(Wg.indices.dtype).itemsize
+                    est_bytes = nnz * (data_bytes + index_bytes) + (int(n_bins) + 1) * index_bytes
+                    est_mb = est_bytes / (1024.0 ** 2)
+                logging.info(
+                    "Gaussian operator (approx): sparse (1 matmul/step), est %.1f MB.",
+                    est_mb,
+                )
+
+        if need_heat and heat_time > 0:
+            heat_data = precomputed_approx.get("heat")
+            if heat_data is None:
+                raise RuntimeError("Heat neighbors not precomputed but 'heat' requested.")
+            W_heat = None
+            if need_gaussian and k_heat == k_gauss and float(heat_sigma_eff) == float(gaussian_sigma):
+                gauss_data = precomputed_approx.get("gaussian")
+                if gauss_data is not None:
+                    W_heat = gauss_data.get("W")
+            if W_heat is None:
+                W_heat = _build_row_stochastic_csr(
+                    heat_data["dists"],
+                    heat_data["idx"],
+                    sigma=float(heat_sigma_eff),
+                    fast_float32=fast_float32,
+                    sort_indices=heat_sparse_sort,
+                )
+            heat_data["W"] = W_heat
+            heat_data.pop("dists", None)
+            heat_data.pop("idx", None)
+            logging.info("Heat operator ready (approx).")
+
+        sum_dtype = np.float32 if fast_float32 else np.float64
+        E_bins = _aggregate_by_bins(
+            raw_embedding[:, dims_to_use],
+            approx_info["bin_id"],
+            approx_info["counts"],
+            sum_dtype,
+        )
+
+        impl = (implementation or "auto").lower()
+        if impl not in {"auto", "vectorized", "legacy"}:
+            raise ValueError("implementation must be one of {'auto','vectorized','legacy'}.")
+        can_vectorize = (
+            rescale_mode in {"final", "none"}
+            and ("bilateral" not in methods)
+            and all(m in {"graph", "gaussian", "knn", "guided", "heat"} for m in methods)
+        )
+        if impl == "vectorized" and not can_vectorize:
+            logging.warning(
+                "Vectorized engine not compatible with methods=%s; falling back to legacy.",
+                methods,
+            )
+            impl = "legacy"
+        if impl == "vectorized" or (impl == "auto" and can_vectorize):
+            logging.info("Using vectorized smoothing engine (approx).")
+            E_bins_smoothed = _smooth_matrix_vectorized(
+                E_bins,
+                methods=methods,
+                precomputed=precomputed_approx,
+                knn_sigma=knn_sigma,
+                knn_chunk=knn_chunk,
+                graph_t=graph_t,
+                graph_tol=graph_tol,
+                graph_check_every=graph_check_every,
+                gaussian_sigma=gaussian_sigma,
+                gaussian_t=gaussian_t,
+                guided_eps=guided_eps,
+                guided_sigma=guided_sigma,
+                guided_t=guided_t,
+                heat_time=heat_time,
+                heat_method=heat_method,
+                heat_tol=heat_tol,
+                heat_min_k=heat_min_k,
+                heat_max_k=heat_max_k,
+                rescale_mode=rescale_mode,
+                n_workers=max(1, min(n_jobs, len(dims_to_use))),
+                fast_float32=fast_float32,
+            )
+        else:
+            logging.info("Using legacy smoothing engine (approx).")
+            max_workers = max(1, min(n_jobs, len(dims_to_use)))
+            results = [None] * len(dims_to_use)
+            if backend == 'threads':
+                func = partial(
+                    _process_dimension,
+                    methods=methods,
+                    precomputed=precomputed_approx,
+                    knn_sigma=knn_sigma,
+                    knn_chunk=knn_chunk,
+                    bilateral_sigma_r=bilateral_sigma_r,
+                    bilateral_t=bilateral_t,
+                    graph_t=graph_t,
+                    graph_tol=graph_tol,
+                    graph_check_every=graph_check_every,
+                    gaussian_t=gaussian_t,
+                    gaussian_sigma=gaussian_sigma,
+                    guided_eps=guided_eps,
+                    guided_sigma=guided_sigma,
+                    guided_t=guided_t,
+                    heat_time=heat_time,
+                    heat_method=heat_method,
+                    heat_tol=heat_tol,
+                    heat_min_k=heat_min_k,
+                    heat_max_k=heat_max_k,
+                    rescale_mode=rescale_mode,
+                    fast_float32=fast_float32,
+                )
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_idx = {
+                        executor.submit(func, E_bins[:, idx].astype('float32')): idx
+                        for idx in range(len(dims_to_use))
+                    }
+                    for future in tqdm(as_completed(future_to_idx),
+                                       total=len(future_to_idx),
+                                       desc="Smoothing dimensions (approx)"):
+                        idx = future_to_idx[future]
+                        results[idx] = future.result()
+            else:
+                if mp_start_method is None:
+                    if platform.system() == 'Linux':
+                        start = 'fork'
+                    else:
+                        start = 'spawn'
+                else:
+                    start = mp_start_method
+                logging.info(f"Process start method (approx): {start}")
+                mp_context = multiprocessing.get_context(start)
+                _SMOOTH_PRECOMPUTED = precomputed_approx
+                init_arg = None if start == 'fork' else precomputed_approx
+                with ProcessPoolExecutor(
+                    max_workers=max_workers,
+                    mp_context=mp_context,
+                    initializer=_init_smoothing_worker,
+                    initargs=(init_arg,)
+                ) as executor:
+                    future_to_idx = {
+                        executor.submit(
+                            _process_dimension,
+                            E_bins[:, idx].astype('float32'),
+                            methods,
+                            None,
+                            knn_sigma,
+                            knn_chunk,
+                            bilateral_sigma_r,
+                            bilateral_t,
+                            graph_t,
+                            graph_tol,
+                            graph_check_every,
+                            gaussian_t,
+                            gaussian_sigma,
+                            guided_eps,
+                            guided_sigma,
+                            guided_t,
+                            heat_time,
+                            heat_method,
+                            heat_tol,
+                            heat_min_k,
+                            heat_max_k,
+                            rescale_mode,
+                            fast_float32,
+                        ): idx
+                        for idx in range(len(dims_to_use))
+                    }
+                    for future in tqdm(as_completed(future_to_idx),
+                                       total=len(future_to_idx),
+                                       desc="Smoothing dimensions (approx)"):
+                        idx = future_to_idx[future]
+                        results[idx] = future.result()
+            E_bins_smoothed = np.stack(results, axis=1).astype('float32')
+            if rescale_mode == 'final':
+                mn = E_bins_smoothed.min(axis=0, keepdims=True)
+                mx = E_bins_smoothed.max(axis=0, keepdims=True)
+                denom = (mx - mn)
+                denom[denom < 1e-12] = 1e-12
+                E_bins_smoothed = (E_bins_smoothed - mn) / denom
+
+        E_smoothed = E_bins_smoothed[approx_info["bin_id"]]
+        adata.obsm[output] = E_smoothed.astype('float32', copy=False)
+        logging.info(f"Finished. Stored smoothed embedding → adata.obsm['{output}']")
+        return adata
+
+    tree_spatial = None
+    if need_tree:
+        tree_spatial = cKDTree(coords, balanced_tree=True, compact_nodes=True)
 
     # If both graph + (knn/gaussian) are requested, a single KDTree query can
     # be shared. However, for huge VisiumHD datasets the float64/int64 arrays
@@ -576,6 +944,12 @@ def smooth_image(
         and ("bilateral" not in methods)   # bilateral would require huge (n,k,d) intermediates
         and all(m in {"graph", "gaussian", "knn", "guided", "heat"} for m in methods)
     )
+    if impl == "vectorized" and not can_vectorize:
+        logging.warning(
+            "Vectorized engine not compatible with methods=%s; falling back to legacy.",
+            methods,
+        )
+        impl = "legacy"
     if impl == "vectorized" or (impl == "auto" and can_vectorize):
         logging.info("Using vectorized smoothing engine.")
         E_smoothed = _smooth_matrix_vectorized(
@@ -585,6 +959,8 @@ def smooth_image(
             knn_sigma=knn_sigma,
             knn_chunk=knn_chunk,
             graph_t=graph_t,
+            graph_tol=graph_tol,
+            graph_check_every=graph_check_every,
             gaussian_sigma=gaussian_sigma,
             gaussian_t=gaussian_t,
             guided_eps=guided_eps,
@@ -602,6 +978,8 @@ def smooth_image(
         adata.obsm[output] = E_smoothed
         logging.info(f"Finished. Stored smoothed embedding → adata.obsm['{output}']")
         return adata
+    if impl == "legacy" or (impl == "auto" and not can_vectorize):
+        logging.info("Using legacy smoothing engine.")
 
 
     # Prepare the dimension-processing function (pass only the column vector, not the full matrix)
@@ -622,6 +1000,8 @@ def smooth_image(
             bilateral_sigma_r=bilateral_sigma_r,
             bilateral_t=bilateral_t,
             graph_t=graph_t,
+            graph_tol=graph_tol,
+            graph_check_every=graph_check_every,
             gaussian_sigma=gaussian_sigma,
             gaussian_t=gaussian_t,
             guided_eps=guided_eps,
@@ -662,7 +1042,6 @@ def smooth_image(
         mp_context = multiprocessing.get_context(start)
 
         # Set module-level global for forked children; for spawn, pass via initializer
-        global _SMOOTH_PRECOMPUTED
         _SMOOTH_PRECOMPUTED = precomputed
 
         init_arg = None if start == 'fork' else precomputed
@@ -686,6 +1065,8 @@ def smooth_image(
                     bilateral_sigma_r,
                     bilateral_t,
                     graph_t,
+                    graph_tol,
+                    graph_check_every,
                     gaussian_t,
                     gaussian_sigma,
                     guided_eps,
@@ -729,6 +1110,8 @@ def _smooth_matrix_vectorized(
     knn_sigma: float,
     knn_chunk: int,
     graph_t: int,
+    graph_tol,
+    graph_check_every: int,
     gaussian_sigma: float,
     gaussian_t: int,
     guided_eps: float,
@@ -761,6 +1144,10 @@ def _smooth_matrix_vectorized(
     n_obs, n_dim = E_src.shape
     n_workers = int(max(1, n_workers))
     graph_t_int = int(graph_t)
+    graph_tol_val = None if graph_tol is None else float(graph_tol)
+    if graph_tol_val is not None and graph_tol_val <= 0:
+        graph_tol_val = None
+    graph_check_every_int = int(max(1, graph_check_every))
     gaussian_t_int = int(gaussian_t)
     guided_t_int = int(guided_t)
     heat_time_val = float(heat_time)
@@ -768,6 +1155,7 @@ def _smooth_matrix_vectorized(
     heat_tol_val = float(heat_tol)
     heat_min_k_int = int(max(0, heat_min_k))
     heat_max_k_val = None if heat_max_k is None else int(max(0, heat_max_k))
+    diff_chunk_rows = int(max(1, knn_chunk)) if knn_chunk is not None else 10000
 
     # Control peak memory by limiting float64 block size. Users can tune via env vars.
     try:
@@ -837,32 +1225,14 @@ def _smooth_matrix_vectorized(
             if method == "graph":
                 g = precomputed.get("graph")
                 if g is not None:
-                    S = g.get("S")
-                    W = g.get("W")
-                    invdeg = g.get("invdeg")
-                    if invdeg is None:
-                        raise RuntimeError("Graph operator missing fields in precomputed['graph'].")
-                    t = graph_t_int
-                    if t > 0:
-                        tmp = E_work
-                        if S is not None:
-                            for _ in range(t):
-                                y = S.dot(tmp)
-                                y *= invdeg[:, None]
-                                tmp = y
-                        else:
-                            if W is None:
-                                raise RuntimeError("Graph operator missing matrix in precomputed['graph'].")
-                            Wt = g.get("Wt")
-                            if Wt is None:
-                                Wt = W.transpose(copy=False)
-                            for _ in range(t):
-                                y = W.dot(tmp)
-                                y += Wt.dot(tmp)
-                                y *= 0.5
-                                y *= invdeg[:, None]
-                                tmp = y
-                        E_work = tmp
+                    E_work = _apply_graph_operator(
+                        g,
+                        E_work,
+                        graph_t=graph_t_int,
+                        graph_tol=graph_tol_val,
+                        graph_check_every=graph_check_every_int,
+                        diff_chunk_rows=diff_chunk_rows,
+                    )
                 else:
                     Pg = precomputed.get("Pg")
                     if Pg is None:
@@ -979,6 +1349,322 @@ def _smooth_matrix_vectorized(
         for fut in futures:
             fut.result()
     return out
+
+
+def _max_abs_diff_chunked(a: np.ndarray, b: np.ndarray, chunk_rows: int) -> float:
+    """Return max(abs(a - b)) using row chunks to cap temporary memory."""
+    if a.shape != b.shape:
+        raise ValueError("a and b must have the same shape.")
+    n = a.shape[0]
+    chunk_rows = int(max(1, chunk_rows))
+    max_val = 0.0
+    for start in range(0, n, chunk_rows):
+        end = min(start + chunk_rows, n)
+        diff = np.abs(a[start:end] - b[start:end])
+        local_max = float(diff.max())
+        if local_max > max_val:
+            max_val = local_max
+    return max_val
+
+
+def _aggregate_by_bins(
+    E: np.ndarray,
+    bin_id: np.ndarray,
+    counts: np.ndarray,
+    sum_dtype,
+) -> np.ndarray:
+    """Aggregate per-cell values into bins using bincount (sum / counts)."""
+    n_bins = int(counts.shape[0])
+    out = np.empty((n_bins, E.shape[1]), dtype=sum_dtype)
+    for j in range(E.shape[1]):
+        out[:, j] = np.bincount(bin_id, weights=E[:, j], minlength=n_bins)
+    denom = counts.astype(sum_dtype, copy=True)
+    denom[denom < 1e-12] = 1e-12
+    out /= denom[:, None]
+    return out
+
+
+def _apply_graph_operator(
+    g: dict,
+    X: np.ndarray,
+    *,
+    graph_t: int,
+    graph_tol,
+    graph_check_every: int,
+    diff_chunk_rows: int,
+) -> np.ndarray:
+    """Apply graph diffusion operator for graph_t steps with optional early stop."""
+    t = int(graph_t)
+    if t <= 0:
+        return X
+    invdeg = g.get("invdeg")
+    if invdeg is None:
+        raise RuntimeError("Graph operator missing fields in precomputed['graph'].")
+    graph_tol_val = None if graph_tol is None else float(graph_tol)
+    if graph_tol_val is not None and graph_tol_val <= 0:
+        graph_tol_val = None
+    graph_check_every_int = int(max(1, graph_check_every))
+    diff_chunk_rows = int(max(1, diff_chunk_rows))
+
+    S = g.get("S")
+    W = g.get("W")
+    tmp = X
+    if S is not None:
+        for step in range(t):
+            y = S.dot(tmp)
+            y *= invdeg[:, None]
+            if graph_tol_val is not None and (step + 1) % graph_check_every_int == 0:
+                if _max_abs_diff_chunked(y, tmp, diff_chunk_rows) <= graph_tol_val:
+                    tmp = y
+                    break
+            tmp = y
+    else:
+        if W is None:
+            raise RuntimeError("Graph operator missing matrix in precomputed['graph'].")
+        Wt = g.get("Wt")
+        if Wt is None:
+            Wt = W.transpose(copy=False)
+            g["Wt"] = Wt
+        for step in range(t):
+            y = W.dot(tmp)
+            y += Wt.dot(tmp)
+            y *= 0.5
+            y *= invdeg[:, None]
+            if graph_tol_val is not None and (step + 1) % graph_check_every_int == 0:
+                if _max_abs_diff_chunked(y, tmp, diff_chunk_rows) <= graph_tol_val:
+                    tmp = y
+                    break
+            tmp = y
+    return tmp
+
+
+def _precompute_approx_grid(
+    coords: np.ndarray,
+    *,
+    graph_k: int,
+    graph_t: int,
+    graph_explicit,
+    graph_explicit_max_mb,
+    use_float32: bool,
+    target_n,
+    bin_size,
+    max_bins,
+    build_graph: bool = True,
+    neighbor_workers: int,
+) -> dict:
+    """Build a coarse grid graph and mapping for approximate diffusion."""
+    coords = np.asarray(coords, dtype=np.float32)
+    n = int(coords.shape[0])
+    if n == 0:
+        raise ValueError("coords must be non-empty for approximation.")
+
+    mins = coords.min(axis=0)
+    maxs = coords.max(axis=0)
+    span = np.maximum(maxs - mins, 1e-6)
+    area = float(span[0] * span[1])
+
+    if bin_size is None:
+        try:
+            target_n = int(target_n) if target_n is not None else 0
+        except Exception:
+            target_n = 0
+        if target_n <= 0:
+            target_n = int(min(200_000, max(10_000, n // 50)))
+        bin_size = float(np.sqrt(area / max(1.0, float(target_n))))
+    else:
+        bin_size = float(bin_size)
+    if bin_size <= 0:
+        raise ValueError("approx_bin must be > 0.")
+    if max_bins is not None:
+        est_bins = area / max(1e-12, (bin_size * bin_size))
+        if est_bins > float(max_bins):
+            new_bin = float(np.sqrt(area / max(1.0, float(max_bins))))
+            logging.warning(
+                "Approx bin_size %.3g would create ~%.1f bins; capping to %.3g.",
+                float(bin_size),
+                float(est_bins),
+                float(new_bin),
+            )
+            bin_size = new_bin
+
+    bx = np.floor((coords[:, 0] - mins[0]) / bin_size).astype(np.int64)
+    by = np.floor((coords[:, 1] - mins[1]) / bin_size).astype(np.int64)
+    if bx.size == 0 or by.size == 0:
+        raise ValueError("Empty bin arrays computed for approximation.")
+    if bx.min() < 0:
+        bx = np.maximum(bx, 0)
+    if by.min() < 0:
+        by = np.maximum(by, 0)
+    max_bx = int(bx.max())
+    max_by = int(by.max())
+    use_key = max_bx <= np.iinfo(np.int32).max and max_by <= np.iinfo(np.int32).max
+    if use_key:
+        bx32 = bx.astype(np.uint64, copy=False)
+        by32 = by.astype(np.uint64, copy=False)
+        key = (bx32 << np.uint64(32)) | by32
+        uniq, inv = np.unique(key, return_inverse=True)
+        bx_u = (uniq >> np.uint64(32)).astype(np.int64, copy=False)
+        by_u = (uniq & np.uint64(0xFFFFFFFF)).astype(np.int64, copy=False)
+        n_bins = int(uniq.shape[0])
+        del key, bx32, by32, uniq
+    else:
+        pairs = np.stack([bx, by], axis=1)
+        uniq_pairs, inv = np.unique(pairs, axis=0, return_inverse=True)
+        bx_u = uniq_pairs[:, 0]
+        by_u = uniq_pairs[:, 1]
+        n_bins = int(uniq_pairs.shape[0])
+        del pairs, uniq_pairs
+    del bx, by
+    gc.collect()
+
+    if n_bins <= 0:
+        raise ValueError("No bins created for approximation.")
+    if n_bins <= np.iinfo(np.int32).max:
+        inv = inv.astype(np.int32, copy=False)
+    counts = np.bincount(inv, minlength=n_bins).astype(np.float32)
+    centers = np.column_stack(
+        (
+            mins[0] + (bx_u.astype(np.float32) + 0.5) * bin_size,
+            mins[1] + (by_u.astype(np.float32) + 0.5) * bin_size,
+        )
+    ).astype(np.float32)
+    if n_bins == 1:
+        graph = None
+        if build_graph:
+            invdeg = np.ones(1, dtype=np.float32 if use_float32 else np.float64)
+            graph = {"W": csr_matrix((1, 1)), "Wt": None, "invdeg": invdeg}
+        logging.info(
+            "Approx grid: bins=%d (%.1fx reduction), bin_size=%.3g.",
+            n_bins,
+            float(n) / float(n_bins),
+            float(bin_size),
+        )
+        return {
+            "mode": "grid",
+            "bin_id": inv,
+            "counts": counts,
+            "graph": graph,
+            "centers": centers,
+            "bin_size": bin_size,
+            "n_bins": n_bins,
+        }
+
+    if not build_graph:
+        logging.info(
+            "Approx grid: bins=%d (%.1fx reduction), bin_size=%.3g.",
+            n_bins,
+            float(n) / float(n_bins),
+            float(bin_size),
+        )
+        return {
+            "mode": "grid",
+            "bin_id": inv,
+            "counts": counts,
+            "graph": None,
+            "centers": centers,
+            "bin_size": bin_size,
+            "n_bins": n_bins,
+        }
+
+    tree = cKDTree(centers, balanced_tree=True, compact_nodes=True)
+    k_graph = int(max(1, min(int(graph_k) + 1, n_bins)))
+    dists_g, neigh_g = tree.query(centers, k=k_graph, workers=int(neighbor_workers))
+    if k_graph > 1:
+        dists_g = dists_g[:, 1:]
+        neigh_g = neigh_g[:, 1:]
+        gk = dists_g.shape[1]
+        sigma_loc = np.median(dists_g, axis=1) + 1e-9
+
+        nnz = int(n_bins) * int(gk)
+        use_int32 = nnz <= np.iinfo(np.int32).max and n_bins <= np.iinfo(np.int32).max
+        index_dtype = np.int32 if use_int32 else np.int64
+        indptr = (np.arange(n_bins + 1, dtype=index_dtype) * gk)
+        indices = neigh_g.reshape(-1).astype(index_dtype, copy=False)
+        if use_float32:
+            d32 = dists_g.astype(np.float32, copy=False)
+            s32 = sigma_loc.astype(np.float32, copy=False)
+            data = np.exp(-(d32 ** 2) / (2.0 * (s32[:, None] ** 2))).reshape(-1).astype(np.float32, copy=False)
+        else:
+            data = np.exp(-(dists_g ** 2) / (2.0 * (sigma_loc[:, None] ** 2))).reshape(-1)
+        Wg = csr_matrix((data, indices, indptr), shape=(n_bins, n_bins))
+    else:
+        Wg = csr_matrix((n_bins, n_bins))
+
+    row_sum = Wg.sum(1).A1
+    col_sum = Wg.sum(0).A1
+    deg = 0.5 * (row_sum + col_sum) + 1e-12
+    invdeg = 1.0 / deg
+    if use_float32 and invdeg.dtype != np.float32:
+        invdeg = invdeg.astype(np.float32, copy=False)
+    Wt = None
+    if int(graph_t) > 0:
+        Wt = Wg.transpose(copy=False)
+    graph = {"W": Wg, "Wt": Wt, "invdeg": invdeg}
+
+    if graph_explicit is None:
+        graph_mode = str(os.environ.get("SPIX_SMOOTH_GRAPH_EXPLICIT", "implicit")).strip().lower()
+    elif isinstance(graph_explicit, bool):
+        graph_mode = "explicit" if graph_explicit else "implicit"
+    else:
+        graph_mode = str(graph_explicit).strip().lower()
+    if graph_explicit_max_mb is None:
+        try:
+            graph_explicit_max_mb = float(
+                os.environ.get("SPIX_SMOOTH_GRAPH_EXPLICIT_MAX_MB", "1024")
+            )
+        except Exception:
+            graph_explicit_max_mb = 1024.0
+    else:
+        graph_explicit_max_mb = float(graph_explicit_max_mb)
+
+    use_explicit = False
+    est_mb = None
+    if int(graph_t) > 0:
+        if graph_mode in {"1", "true", "yes", "explicit"}:
+            use_explicit = True
+        elif graph_mode in {"0", "false", "no", "implicit"}:
+            use_explicit = False
+        else:
+            nnz = int(Wg.nnz)
+            data_bytes = int(np.dtype(Wg.dtype).itemsize)
+            index_bytes = int(np.dtype(Wg.indices.dtype).itemsize)
+            est_bytes = (2 * nnz) * (data_bytes + index_bytes) + (int(n_bins) + 1) * index_bytes
+            est_mb = est_bytes / (1024.0 ** 2)
+            use_explicit = est_mb <= float(graph_explicit_max_mb)
+    if use_explicit:
+        if Wt is None:
+            Wt = Wg.transpose(copy=False)
+        S = (Wg + Wt).tocsr()
+        S.data *= 0.5
+        graph["S"] = S
+        graph["W"] = None
+        graph["Wt"] = None
+        if est_mb is None:
+            nnz = int(S.nnz)
+            data_bytes = int(np.dtype(S.dtype).itemsize)
+            index_bytes = int(np.dtype(S.indices.dtype).itemsize)
+            est_bytes = nnz * (data_bytes + index_bytes) + (int(n_bins) + 1) * index_bytes
+            est_mb = est_bytes / (1024.0 ** 2)
+        logging.info(
+            "Approx grid graph operator: explicit symmetric (1 matmul/step), est %.1f MB.",
+            est_mb,
+        )
+
+    logging.info(
+        "Approx grid: bins=%d (%.1fx reduction), bin_size=%.3g.",
+        n_bins,
+        float(n) / float(n_bins),
+        float(bin_size),
+    )
+    return {
+        "mode": "grid",
+        "bin_id": inv,
+        "counts": counts,
+        "graph": graph,
+        "centers": centers,
+        "bin_size": bin_size,
+        "n_bins": n_bins,
+    }
 
 
 def _apply_weighted_neighbors_chunked(
@@ -1253,6 +1939,8 @@ def _process_dimension(
     bilateral_sigma_r,
     bilateral_t,
     graph_t,
+    graph_tol,
+    graph_check_every,
     gaussian_t,
     gaussian_sigma,
     guided_eps,
@@ -1279,6 +1967,10 @@ def _process_dimension(
         raise RuntimeError("Precomputed data not initialized in worker.")
 
     graph_t_int = int(graph_t)
+    graph_tol_val = None if graph_tol is None else float(graph_tol)
+    if graph_tol_val is not None and graph_tol_val <= 0:
+        graph_tol_val = None
+    graph_check_every_int = int(max(1, graph_check_every))
     gaussian_t_int = int(gaussian_t)
     guided_t_int = int(guided_t)
     heat_time_val = float(heat_time)
@@ -1326,32 +2018,14 @@ def _process_dimension(
         elif method == 'graph':
             g = precomputed.get("graph")
             if g is not None:
-                S = g.get("S")
-                W = g.get("W")
-                invdeg = g.get("invdeg")
-                if invdeg is None:
-                    raise RuntimeError("Graph operator missing fields in precomputed['graph'].")
-                if graph_t_int > 0:
-                    tmp = E
-                    if S is not None:
-                        for _ in range(graph_t_int):
-                            y = S.dot(tmp)
-                            y *= invdeg[:, None]
-                            tmp = y
-                    else:
-                        if W is None:
-                            raise RuntimeError("Graph operator missing matrix in precomputed['graph'].")
-                        Wt = g.get("Wt")
-                        if Wt is None:
-                            Wt = W.transpose(copy=False)
-                            g["Wt"] = Wt
-                        for _ in range(graph_t_int):
-                            y = W.dot(tmp)
-                            y += Wt.dot(tmp)
-                            y *= 0.5
-                            y *= invdeg[:, None]
-                            tmp = y
-                    E = tmp
+                E = _apply_graph_operator(
+                    g,
+                    E,
+                    graph_t=graph_t_int,
+                    graph_tol=graph_tol_val,
+                    graph_check_every=graph_check_every_int,
+                    diff_chunk_rows=knn_chunk_int,
+                )
             else:
                 Pg = precomputed['Pg']
                 tmp = E
