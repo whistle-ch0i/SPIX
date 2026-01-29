@@ -1,6 +1,9 @@
 import numpy as np
 import pandas as pd
 import os
+import atexit
+import glob
+from pathlib import Path
 from sklearn.preprocessing import MinMaxScaler
 from scipy.spatial import KDTree
 from typing import Optional, Dict, Any, List, Sequence, Tuple
@@ -10,6 +13,110 @@ from skimage.segmentation import find_boundaries
 from scipy.ndimage import gaussian_filter, binary_dilation
 
 # no additional utils needed here after function removals
+from SPIX.visualization import raster as _raster
+
+
+_MEMMAP_CLEANUP_PATHS: set[str] = set()
+
+
+def _cleanup_registered_memmaps() -> None:  # pragma: no cover
+    # Best-effort cleanup; ignore failures (e.g., file already removed).
+    for p in list(_MEMMAP_CLEANUP_PATHS):
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+
+
+atexit.register(_cleanup_registered_memmaps)
+
+
+def _default_memmap_dir() -> str:
+    # Prefer a user cache dir over writing inside the current project.
+    # Users can override with `memmap_dir=` or env var `SPIX_CACHE_DIR`.
+    env = os.environ.get("SPIX_CACHE_DIR")
+    if env:
+        return env
+    return os.path.join(os.getcwd(), ".spix_cache")
+
+
+def clear_memmap_cache(
+    memmap_dir: Optional[str] = None,
+    *,
+    key: Optional[str] = None,
+    embedding: Optional[str] = None,
+    verbose: bool = False,
+    strict: bool = False,
+) -> int:
+    """Delete on-disk memmap files created by `cache_embedding_image`.
+
+    Parameters
+    ----------
+    memmap_dir
+        Directory to clear. Defaults to the same resolution as cache generation
+        (env `SPIX_CACHE_DIR` → `~/.cache/spix` → `./.spix_cache`).
+    key, embedding
+        If provided, only delete files matching this key/embedding prefix.
+
+    Returns
+    -------
+    int
+        Number of deleted files.
+    """
+    cache_dir_in = memmap_dir or _default_memmap_dir()
+    try:
+        cache_dir = str(Path(cache_dir_in).expanduser().resolve(strict=False))
+    except Exception:
+        cache_dir = str(cache_dir_in)
+    if verbose:
+        print(f"[clear_memmap_cache] cache_dir={cache_dir!r}")
+    if key is None and embedding is None:
+        pattern = os.path.join(cache_dir, "*.dat")
+    else:
+        safe_key = "*" if key is None else "".join(c if (c.isalnum() or c in ("-", "_")) else "_" for c in str(key))
+        safe_emb = "*" if embedding is None else "".join(
+            c if (c.isalnum() or c in ("-", "_")) else "_" for c in str(embedding)
+        )
+        pattern = os.path.join(cache_dir, f"{safe_key}__{safe_emb}__*.dat")
+    paths = list(glob.glob(pattern))
+    if verbose:
+        print(f"[clear_memmap_cache] matched_files={len(paths)} pattern={pattern!r}")
+    deleted = 0
+    for p in paths:
+        try:
+            os.remove(p)
+            deleted += 1
+        except Exception:
+            if strict:
+                raise
+    return deleted
+
+
+class _QuietCacheDict(dict):
+    """dict subclass with a compact repr to avoid dumping huge arrays/lists in notebooks."""
+
+    @staticmethod
+    def _summarize(v: Any) -> str:
+        try:
+            if isinstance(v, np.ndarray):
+                return f"<ndarray shape={v.shape} dtype={v.dtype}>"
+            if isinstance(v, list):
+                n = len(v)
+                if n == 0:
+                    return "<list len=0>"
+                # Barcodes can be millions; avoid showing first elements.
+                return f"<list len={n}>"
+            if isinstance(v, dict):
+                return f"<dict keys={len(v)}>"
+        except Exception:
+            pass
+        return repr(v)
+
+    def __repr__(self) -> str:  # pragma: no cover
+        items = ", ".join(f"{k!r}: {self._summarize(v)}" for k, v in self.items())
+        return "{" + items + "}"
+
+    __str__ = __repr__
 
 
 def cache_embedding_image(
@@ -19,10 +126,18 @@ def cache_embedding_image(
     dimensions: List[int] = [0, 1, 2],
     origin: bool = True,
     key: str = "image_plot_slic",
-    figsize: tuple = (10, 10),
+    coordinate_mode: str = "spatial",  # 'spatial'|'array'|'visium'|'visiumhd'|'auto'
+    array_row_key: str = "array_row",
+    array_col_key: str = "array_col",
+    figsize: tuple | None = None,
     fig_dpi: Optional[int] = None,
     imshow_tile_size: Optional[float] = None,
     imshow_scale_factor: float = 1.0,
+    imshow_tile_size_mode: str = "auto",
+    imshow_tile_size_quantile: Optional[float] = None,
+    imshow_tile_size_rounding: str = "floor",
+    imshow_tile_size_shrink: float = 0.98,
+    pixel_perfect: bool = True,
     pixel_shape: str = "square",
     chunk_size: int = 50000,
     downsample_factor: float = 1.0,
@@ -31,6 +146,8 @@ def cache_embedding_image(
     store: str = "auto",  # 'auto'|'memory'|'memmap'
     memmap_dir: Optional[str] = None,
     memmap_threshold_mb: float = 512.0,
+    memmap_prune: str = "none",  # 'none'|'key' (remove older shapes for same key+embedding)
+    memmap_cleanup: str = "none",  # 'none'|'on_exit' (delete created file when Python exits)
     # Cache metadata size control
     store_barcodes: str = "auto",  # 'auto'|'always'|'never'
     barcodes_max_n: int = 1_000_000,
@@ -90,10 +207,18 @@ def cache_embedding_image(
             dimensions=dimensions,
             origin=origin,
             key=key,
+            coordinate_mode=coordinate_mode,
+            array_row_key=array_row_key,
+            array_col_key=array_col_key,
             figsize=figsize,
             fig_dpi=fig_dpi,
             imshow_tile_size=imshow_tile_size,
             imshow_scale_factor=imshow_scale_factor,
+            imshow_tile_size_mode=imshow_tile_size_mode,
+            imshow_tile_size_quantile=imshow_tile_size_quantile,
+            imshow_tile_size_rounding=imshow_tile_size_rounding,
+            imshow_tile_size_shrink=imshow_tile_size_shrink,
+            pixel_perfect=pixel_perfect,
             pixel_shape=pixel_shape,
             chunk_size=chunk_size,
             downsample_factor=downsample_factor,
@@ -131,11 +256,17 @@ def cache_embedding_image(
             **plot_kwargs,
         )
         adata.uns[key] = cache
-        return cache
+        return _QuietCacheDict(cache)
 
     store = (store or "auto").lower()
     if store not in {"auto", "memory", "memmap"}:
         raise ValueError("store must be one of {'auto','memory','memmap'}.")
+    memmap_prune = (memmap_prune or "none").lower()
+    if memmap_prune not in {"none", "key"}:
+        raise ValueError("memmap_prune must be one of {'none','key'}.")
+    memmap_cleanup = (memmap_cleanup or "none").lower()
+    if memmap_cleanup not in {"none", "on_exit"}:
+        raise ValueError("memmap_cleanup must be one of {'none','on_exit'}.")
     store_barcodes = (store_barcodes or "auto").lower()
     if store_barcodes not in {"auto", "always", "never"}:
         raise ValueError("store_barcodes must be one of {'auto','always','never'}.")
@@ -164,7 +295,32 @@ def cache_embedding_image(
         if missing:
             print(f"[cache_embedding_image] Dropping {missing} observations with missing coordinates.")
 
-    spatial_coords = xy.to_numpy(dtype=float)[valid_mask]
+    coord_mode = str(coordinate_mode or "spatial").lower()
+    if coord_mode not in {"spatial", "array", "visium", "visiumhd", "auto"}:
+        coord_mode = "spatial"
+    if coord_mode == "auto":
+        if (array_row_key in adata.obs.columns) and (array_col_key in adata.obs.columns) and int(adata.n_obs) >= 200_000:
+            coord_mode = "visiumhd"
+        else:
+            coord_mode = "spatial"
+    if coord_mode in {"array", "visium", "visiumhd"}:
+        if (array_row_key not in adata.obs.columns) or (array_col_key not in adata.obs.columns):
+            raise ValueError(
+                f"coordinate_mode='array' requires adata.obs['{array_row_key}'] and adata.obs['{array_col_key}']."
+            )
+        col = pd.to_numeric(adata.obs[array_col_key], errors="coerce").to_numpy(dtype=float)
+        row = pd.to_numeric(adata.obs[array_row_key], errors="coerce").to_numpy(dtype=float)
+        coord_mask = valid_mask & (~np.isnan(col)) & (~np.isnan(row))
+        if coord_mode == "visium":
+            parity = (row.astype(np.int64, copy=False) % 2).astype(np.float64)
+            x = col.astype(np.float64, copy=False) + 0.5 * parity
+            y = row.astype(np.float64, copy=False) * (np.sqrt(3.0) / 2.0)
+            spatial_coords = np.column_stack([x, y])[coord_mask]
+        else:
+            spatial_coords = np.column_stack([col, row])[coord_mask]
+        valid_mask = coord_mask
+    else:
+        spatial_coords = xy.to_numpy(dtype=float)[valid_mask]
     origin_flags = tiles_aligned.get("origin", pd.Series(index=tiles_aligned.index, data=1)).to_numpy()[valid_mask]
 
     # Select embedding channels (support embeddings that already contain only these dims)
@@ -222,29 +378,79 @@ def cache_embedding_image(
     x_min, x_max = spatial_coords[:, 0].min(), spatial_coords[:, 0].max()
     y_min, y_max = spatial_coords[:, 1].min(), spatial_coords[:, 1].max()
 
-    if imshow_tile_size is None:
-        s_data_units = 1.0
-        if len(spatial_coords) > 1:
-            sample_size = min(len(spatial_coords), 100000)
-            sample_idx = np.random.choice(len(spatial_coords), sample_size, replace=False)
-            tree = KDTree(spatial_coords[sample_idx])
-            d, _ = tree.query(spatial_coords[sample_idx], k=2)
-            nn = d[:, 1][d[:, 1] > 0]
-            if len(nn) > 0:
-                s_data_units = float(np.median(nn))
-    else:
-        s_data_units = float(imshow_tile_size)
-    s_data_units = max(0.1, s_data_units * float(imshow_scale_factor))
+    user_figsize_given = figsize is not None
+    user_dpi_given = fig_dpi is not None
+    auto_sized = (not user_figsize_given) or (not user_dpi_given)
 
+    shrink_eff = 1.0 if pixel_perfect else float(imshow_tile_size_shrink)
+    imshow_tile_size_eff = imshow_tile_size
+    if coord_mode == "visiumhd" and imshow_tile_size_eff is None:
+        imshow_tile_size_eff = 1.0
+    s_data_units = _raster.estimate_tile_size_units(
+        spatial_coords,
+        imshow_tile_size_eff,
+        imshow_scale_factor,
+        imshow_tile_size_mode,
+        imshow_tile_size_quantile,
+        shrink_eff,
+        logger=None,
+    )
+    s_data_units = _raster.cap_tile_size_by_density(
+        s_data_units=float(s_data_units),
+        x_range=float(max(1.0, x_max - x_min)),
+        y_range=float(max(1.0, y_max - y_min)),
+        n_points=int(spatial_coords.shape[0]),
+        logger=None,
+        context="cache_embedding_image",
+    )
+
+    # Match image_plot auto-size behavior: if figsize or dpi is None, auto-pick to fit n_tiles.
+    x_min_eff, x_max_eff, y_min_eff, y_max_eff = _raster.effective_extent(
+        x_min=float(x_min),
+        x_max=float(x_max),
+        y_min=float(y_min),
+        y_max=float(y_max),
+        s_data_units=float(s_data_units),
+        pixel_perfect=bool(pixel_perfect),
+    )
+    x_range_eff = (x_max_eff - x_min_eff) or 1.0
+    y_range_eff = (y_max_eff - y_min_eff) or 1.0
+    figsize, fig_dpi = _raster.resolve_figsize_dpi_for_tiles(
+        figsize=figsize,
+        fig_dpi=fig_dpi,
+        x_range=float(x_range_eff),
+        y_range=float(y_range_eff),
+        s_data_units=float(s_data_units),
+        pixel_perfect=bool(pixel_perfect),
+        n_points=int(spatial_coords.shape[0]),
+        logger=None,
+    )
+    if figsize is None:
+        figsize = (10, 10)
     dpi_in = int(fig_dpi) if fig_dpi is not None else 100
-    w_pixels = int(np.ceil(figsize[0] * dpi_in))
-    h_pixels = int(np.ceil(figsize[1] * dpi_in))
-    x_range = (x_max - x_min) or 1.0
-    y_range = (y_max - y_min) or 1.0
-    scale = min(w_pixels / x_range, h_pixels / y_range)
+    w_pixels = int(np.ceil(float(figsize[0]) * float(dpi_in)))
+    h_pixels = int(np.ceil(float(figsize[1]) * float(dpi_in)))
+
+    x_range = (x_max_eff - x_min_eff) or 1.0
+    y_range = (y_max_eff - y_min_eff) or 1.0
+    scale_raw = _raster.scale_raw_from_canvas(
+        w_pixels=int(w_pixels),
+        h_pixels=int(h_pixels),
+        x_range=float(x_range),
+        y_range=float(y_range),
+        pixel_perfect=bool(pixel_perfect),
+        auto_sized=bool(auto_sized),
+    )
+    if pixel_perfect and s_data_units > 0:
+        pitch_px = max(1, int(np.round(float(s_data_units) * float(scale_raw))))
+        scale = float(pitch_px) / float(s_data_units)
+        s = int(pitch_px)
+    else:
+        scale = float(scale_raw)
+        s = _raster.round_tile_size_px(float(s_data_units), float(scale), imshow_tile_size_rounding)
+
     w = max(1, int(np.ceil(x_range * scale)))
     h = max(1, int(np.ceil(y_range * scale)))
-    s = max(1, int(np.ceil(s_data_units * scale)))
 
     # Normalize embedding channels 0..1 per channel
     dims = embeddings.shape[1]
@@ -260,31 +466,44 @@ def cache_embedding_image(
     est_mb = (float(h) * float(w) * float(dims) * 4.0) / (1024.0 * 1024.0)
     use_memmap = store == "memmap" or (store == "auto" and est_mb >= float(memmap_threshold_mb))
     img_path: Optional[str] = None
+    cache_dir_resolved: Optional[str] = None
     if use_memmap:
-        import os
-
-        cache_dir = memmap_dir or os.environ.get("SPIX_CACHE_DIR") or os.path.join(os.getcwd(), ".spix_cache")
-        os.makedirs(cache_dir, exist_ok=True)
+        cache_dir = memmap_dir or _default_memmap_dir()
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        cache_dir_resolved = cache_dir
         safe_key = "".join(c if (c.isalnum() or c in ("-", "_")) else "_" for c in str(key))
         safe_emb = "".join(c if (c.isalnum() or c in ("-", "_")) else "_" for c in str(embedding))
+        if memmap_prune == "key":
+            prefix = os.path.join(cache_dir, f"{safe_key}__{safe_emb}__")
+            for old in glob.glob(prefix + "*.dat"):
+                try:
+                    os.remove(old)
+                except Exception:
+                    pass
         img_path = os.path.join(cache_dir, f"{safe_key}__{safe_emb}__{h}x{w}x{dims}.dat")
         img = np.memmap(img_path, dtype=np.float32, mode="w+", shape=(h, w, dims))
         img.fill(1.0)
         if verbose:
             print(f"[cache_embedding_image] Using memmap image at: {img_path} (~{est_mb:.1f} MB)")
+        if memmap_cleanup == "on_exit" and img_path is not None:
+            _MEMMAP_CLEANUP_PATHS.add(img_path)
     else:
         img = np.ones((h, w, dims), dtype=np.float32)
 
-    # Precompute pixel offsets for square/circle tiles
+    # Precompute pixel offsets for square/circle tiles (relative to center)
+    center_off = int(s // 2)
     if pixel_shape == "circle":
         yy, xx = np.ogrid[:s, :s]
         center = (s - 1) / 2
         mask = (xx - center) ** 2 + (yy - center) ** 2 <= (s / 2) ** 2
         dy, dx = np.nonzero(mask)
+        dx = dx.astype(np.int32) - center_off
+        dy = dy.astype(np.int32) - center_off
     else:
-        rng = np.arange(s)
+        rng = np.arange(s, dtype=np.int32)
         gx, gy = np.meshgrid(rng, rng)
-        dx, dy = gx.flatten(), gy.flatten()
+        dx = (gx - center_off).ravel()
+        dy = (gy - center_off).ravel()
 
     # Optional depth ordering similar to image_plot (alpha-driven)
     def _compute_alpha_from_values(values, arange=(0.1, 1.0), clip=None, invert=False):
@@ -328,21 +547,29 @@ def cache_embedding_image(
     target_pixels = int(os.environ.get("SPIX_CACHE_RASTER_TARGET_PIXELS", "25000000"))
     chunk_n = int(max(1, min(int(chunk_size), int(max(1, target_pixels // max(1, pixels_per_tile))))))
     if pixels_per_tile == 1 and pixel_shape != "circle":
-        # Fast path for s==1 square tiles: assign one pixel per tile.
+        # Fast path for s==1 square tiles: assign one pixel per tile (center pixel).
         for i in range(0, num_tiles, chunk_n):
             idx = order_idx[i : min(i + chunk_n, num_tiles)]
-            xi = ((spatial_coords[idx, 0] - x_min) * scale).astype(np.int32)
-            yi = ((spatial_coords[idx, 1] - y_min) * scale).astype(np.int32)
-            xi = np.clip(xi, 0, w - 1)
-            yi = np.clip(yi, 0, h - 1)
-            img[yi, xi] = cols[idx]
+            if pixel_perfect:
+                cx0 = np.floor((spatial_coords[idx, 0] - x_min_eff) * scale + 0.5).astype(np.int32)
+                cy0 = np.floor((spatial_coords[idx, 1] - y_min_eff) * scale + 0.5).astype(np.int32)
+            else:
+                cx0 = np.rint((spatial_coords[idx, 0] - x_min_eff) * scale).astype(np.int32)
+                cy0 = np.rint((spatial_coords[idx, 1] - y_min_eff) * scale).astype(np.int32)
+            cx0 = np.clip(cx0, 0, w - 1)
+            cy0 = np.clip(cy0, 0, h - 1)
+            img[cy0, cx0] = cols[idx]
     else:
         for i in range(0, num_tiles, chunk_n):
             idx = order_idx[i : min(i + chunk_n, num_tiles)]
-            xi = ((spatial_coords[idx, 0] - x_min) * scale).astype(np.int32)
-            yi = ((spatial_coords[idx, 1] - y_min) * scale).astype(np.int32)
-            all_x = np.clip((xi[:, None] + dx).ravel(), 0, w - 1)
-            all_y = np.clip((yi[:, None] + dy).ravel(), 0, h - 1)
+            if pixel_perfect:
+                cx0 = np.floor((spatial_coords[idx, 0] - x_min_eff) * scale + 0.5).astype(np.int32)
+                cy0 = np.floor((spatial_coords[idx, 1] - y_min_eff) * scale + 0.5).astype(np.int32)
+            else:
+                cx0 = np.rint((spatial_coords[idx, 0] - x_min_eff) * scale).astype(np.int32)
+                cy0 = np.rint((spatial_coords[idx, 1] - y_min_eff) * scale).astype(np.int32)
+            all_x = np.clip((cx0[:, None] + dx[None, :]).ravel(), 0, w - 1)
+            all_y = np.clip((cy0[:, None] + dy[None, :]).ravel(), 0, h - 1)
             tile_idx_map = np.repeat(idx, pixels_per_tile)
             img[all_y, all_x] = cols[tile_idx_map]
 
@@ -354,17 +581,21 @@ def cache_embedding_image(
         label_img = np.full((h, w), -1, dtype=int)
         for i in range(0, num_tiles, max(1, chunk_size)):
             idx = order_idx[i : min(i + chunk_size, num_tiles)]
-            xi = ((spatial_coords[idx, 0] - x_min) * scale).astype(int)
-            yi = ((spatial_coords[idx, 1] - y_min) * scale).astype(int)
+            if pixel_perfect:
+                cx0 = np.floor((spatial_coords[idx, 0] - x_min_eff) * scale + 0.5).astype(np.int32)
+                cy0 = np.floor((spatial_coords[idx, 1] - y_min_eff) * scale + 0.5).astype(np.int32)
+            else:
+                cx0 = np.rint((spatial_coords[idx, 0] - x_min_eff) * scale).astype(np.int32)
+                cy0 = np.rint((spatial_coords[idx, 1] - y_min_eff) * scale).astype(np.int32)
             if pixel_shape == "circle":
                 # Paint circle
                 for j, t in enumerate(idx):
-                    lx = np.clip(xi[j] + dx, 0, w - 1)
-                    ly = np.clip(yi[j] + dy, 0, h - 1)
+                    lx = np.clip(cx0[j] + dx, 0, w - 1)
+                    ly = np.clip(cy0[j] + dy, 0, h - 1)
                     label_img[ly, lx] = seg_codes[t]
             else:
-                all_x = np.clip((xi[:, None] + dx).ravel(), 0, w - 1)
-                all_y = np.clip((yi[:, None] + dy).ravel(), 0, h - 1)
+                all_x = np.clip((cx0[:, None] + dx[None, :]).ravel(), 0, w - 1)
+                all_y = np.clip((cy0[:, None] + dy[None, :]).ravel(), 0, h - 1)
                 label_img[all_y, all_x] = np.repeat(seg_codes[idx], len(dx))
 
     if downsample_factor and downsample_factor > 1.0:
@@ -392,10 +623,12 @@ def cache_embedding_image(
         label_img = label_img.reshape(new_h, factor, new_w, factor).max(axis=(1, 3))
 
     # Compute sampling centers per tile (pixel indices)
-    xi_final = ((spatial_coords[:, 0] - x_min) * scale).astype(int)
-    yi_final = ((spatial_coords[:, 1] - y_min) * scale).astype(int)
-    cx = np.clip(xi_final + s // 2, 0, w - 1)
-    cy = np.clip(yi_final + s // 2, 0, h - 1)
+    if pixel_perfect:
+        cx = np.clip(np.floor((spatial_coords[:, 0] - x_min_eff) * scale + 0.5).astype(np.int32), 0, w - 1)
+        cy = np.clip(np.floor((spatial_coords[:, 1] - y_min_eff) * scale + 0.5).astype(np.int32), 0, h - 1)
+    else:
+        cx = np.clip(np.rint((spatial_coords[:, 0] - x_min_eff) * scale).astype(np.int32), 0, w - 1)
+        cy = np.clip(np.rint((spatial_coords[:, 1] - y_min_eff) * scale).astype(np.int32), 0, h - 1)
 
     cache = {
         "img": img,
@@ -403,13 +636,19 @@ def cache_embedding_image(
         "w": int(w),
         "total_pixels": int(h * w),
         "channels": int(dims),
+        "coordinate_mode": str(coord_mode),
         "x_min": float(x_min),
         "x_max": float(x_max),
         "y_min": float(y_min),
         "y_max": float(y_max),
+        "x_min_eff": float(x_min_eff),
+        "x_max_eff": float(x_max_eff),
+        "y_min_eff": float(y_min_eff),
+        "y_max_eff": float(y_max_eff),
         "scale": float(scale),
         "s_data_units": float(s_data_units),
         "tile_px": int(s),
+        "pixel_perfect": bool(pixel_perfect),
         "pixel_shape": str(pixel_shape),
         "embedding_key": str(embedding),
         "dimensions": list(dimensions),
@@ -441,6 +680,7 @@ def cache_embedding_image(
         "segment_key_requested": segment_key,
         "store": store,
         "memmap": bool(use_memmap),
+        "memmap_dir": cache_dir_resolved,
         "img_path": img_path,
         # provenance
         "created_by": "cache_embedding_image",
@@ -531,7 +771,8 @@ def cache_embedding_image(
             show_cached_image(adata, key=key, channels=show_channels, cmap=show_cmap)
         except Exception:
             pass
-    return cache
+    # Return a compact-repr dict to avoid printing huge tensors/barcode lists in notebooks.
+    return _QuietCacheDict(cache)
 
 
 def _cache_embedding_image_legacy(
@@ -541,10 +782,18 @@ def _cache_embedding_image_legacy(
     dimensions: List[int],
     origin: bool,
     key: str,
-    figsize: tuple,
+    coordinate_mode: str,
+    array_row_key: str,
+    array_col_key: str,
+    figsize: tuple | None,
     fig_dpi: Optional[int],
     imshow_tile_size: Optional[float],
     imshow_scale_factor: float,
+    imshow_tile_size_mode: str,
+    imshow_tile_size_quantile: Optional[float],
+    imshow_tile_size_rounding: str,
+    imshow_tile_size_shrink: float,
+    pixel_perfect: bool,
     pixel_shape: str,
     chunk_size: int,
     downsample_factor: float,
@@ -605,6 +854,32 @@ def _cache_embedding_image_legacy(
     if len(coordinates_df) == 0:
         raise ValueError("No coordinates found after merging tiles with embeddings.")
 
+    coord_mode = str(coordinate_mode or "spatial").lower()
+    if coord_mode not in {"spatial", "array", "visium", "visiumhd", "auto"}:
+        coord_mode = "spatial"
+    if coord_mode == "auto":
+        if (array_row_key in adata.obs.columns) and (array_col_key in adata.obs.columns) and int(adata.n_obs) >= 200_000:
+            coord_mode = "visiumhd"
+        else:
+            coord_mode = "spatial"
+    if coord_mode in {"array", "visium", "visiumhd"}:
+        if (array_row_key not in adata.obs.columns) or (array_col_key not in adata.obs.columns):
+            raise ValueError(
+                f"coordinate_mode='array' requires adata.obs['{array_row_key}'] and adata.obs['{array_col_key}']."
+            )
+        coordinates_df[array_col_key] = coordinates_df["barcode"].map(adata.obs[array_col_key])
+        coordinates_df[array_row_key] = coordinates_df["barcode"].map(adata.obs[array_row_key])
+        col = pd.to_numeric(coordinates_df[array_col_key], errors="coerce")
+        row = pd.to_numeric(coordinates_df[array_row_key], errors="coerce")
+        if coord_mode == "visium":
+            row_i = row.astype("Int64")
+            parity = (row_i % 2).astype(float)
+            coordinates_df["x"] = col.astype(float) + 0.5 * parity
+            coordinates_df["y"] = row.astype(float) * (np.sqrt(3.0) / 2.0)
+        else:
+            coordinates_df["x"] = col.astype(float)
+            coordinates_df["y"] = row.astype(float)
+
     segment_series = None
     seg_col: Optional[str] = None
     segment_available = False
@@ -650,29 +925,76 @@ def _cache_embedding_image_legacy(
     x_min, x_max = spatial_coords[:, 0].min(), spatial_coords[:, 0].max()
     y_min, y_max = spatial_coords[:, 1].min(), spatial_coords[:, 1].max()
 
-    if imshow_tile_size is None:
-        s_data_units = 1.0
-        if len(spatial_coords) > 1:
-            sample_size = min(len(spatial_coords), 100000)
-            sample_idx = np.random.choice(len(spatial_coords), sample_size, replace=False)
-            tree = KDTree(spatial_coords[sample_idx])
-            d, _ = tree.query(spatial_coords[sample_idx], k=2)
-            nn = d[:, 1][d[:, 1] > 0]
-            if len(nn) > 0:
-                s_data_units = float(np.median(nn))
-    else:
-        s_data_units = float(imshow_tile_size)
-    s_data_units = max(0.1, s_data_units * float(imshow_scale_factor))
+    user_figsize_given = figsize is not None
+    user_dpi_given = fig_dpi is not None
+    auto_sized = (not user_figsize_given) or (not user_dpi_given)
 
+    shrink_eff = 1.0 if pixel_perfect else float(imshow_tile_size_shrink)
+    imshow_tile_size_eff = imshow_tile_size
+    if coord_mode == "visiumhd" and imshow_tile_size_eff is None:
+        imshow_tile_size_eff = 1.0
+    s_data_units = _raster.estimate_tile_size_units(
+        spatial_coords,
+        imshow_tile_size_eff,
+        imshow_scale_factor,
+        imshow_tile_size_mode,
+        imshow_tile_size_quantile,
+        shrink_eff,
+        logger=None,
+    )
+    s_data_units = _raster.cap_tile_size_by_density(
+        s_data_units=float(s_data_units),
+        x_range=float(max(1.0, x_max - x_min)),
+        y_range=float(max(1.0, y_max - y_min)),
+        n_points=int(spatial_coords.shape[0]),
+        logger=None,
+        context="cache_embedding_image(legacy)",
+    )
+
+    x_min_eff, x_max_eff, y_min_eff, y_max_eff = _raster.effective_extent(
+        x_min=float(x_min),
+        x_max=float(x_max),
+        y_min=float(y_min),
+        y_max=float(y_max),
+        s_data_units=float(s_data_units),
+        pixel_perfect=bool(pixel_perfect),
+    )
+    x_range = (x_max_eff - x_min_eff) or 1.0
+    y_range = (y_max_eff - y_min_eff) or 1.0
+    figsize, fig_dpi = _raster.resolve_figsize_dpi_for_tiles(
+        figsize=figsize,
+        fig_dpi=fig_dpi,
+        x_range=float(x_range),
+        y_range=float(y_range),
+        s_data_units=float(s_data_units),
+        pixel_perfect=bool(pixel_perfect),
+        n_points=int(spatial_coords.shape[0]),
+        logger=None,
+    )
+    if figsize is None:
+        figsize = (10, 10)
     dpi_in = int(fig_dpi) if fig_dpi is not None else 100
-    w_pixels = int(np.ceil(figsize[0] * dpi_in))
-    h_pixels = int(np.ceil(figsize[1] * dpi_in))
-    x_range = (x_max - x_min) or 1.0
-    y_range = (y_max - y_min) or 1.0
-    scale = min(w_pixels / x_range, h_pixels / y_range)
+    w_pixels = int(np.ceil(float(figsize[0]) * float(dpi_in)))
+    h_pixels = int(np.ceil(float(figsize[1]) * float(dpi_in)))
+
+    scale_raw = _raster.scale_raw_from_canvas(
+        w_pixels=int(w_pixels),
+        h_pixels=int(h_pixels),
+        x_range=float(x_range),
+        y_range=float(y_range),
+        pixel_perfect=bool(pixel_perfect),
+        auto_sized=bool(auto_sized),
+    )
+    if pixel_perfect and s_data_units > 0:
+        pitch_px = max(1, int(np.round(float(s_data_units) * float(scale_raw))))
+        scale = float(pitch_px) / float(s_data_units)
+        s = int(pitch_px)
+    else:
+        scale = float(scale_raw)
+        s = max(1, int(np.ceil(s_data_units * scale)))
+
     w = max(1, int(np.ceil(x_range * scale)))
     h = max(1, int(np.ceil(y_range * scale)))
-    s = max(1, int(np.ceil(s_data_units * scale)))
 
     dims = embeddings.shape[1]
     scaler = MinMaxScaler()
@@ -686,16 +1008,20 @@ def _cache_embedding_image_legacy(
 
     img = np.ones((h, w, dims), dtype=np.float32)
 
-    # Precompute pixel offsets for square/circle tiles
+    # Precompute pixel offsets for square/circle tiles (relative to center)
+    center_off = int(s // 2)
     if pixel_shape == "circle":
         yy, xx = np.ogrid[:s, :s]
         center = (s - 1) / 2
         mask = (xx - center) ** 2 + (yy - center) ** 2 <= (s / 2) ** 2
         dy, dx = np.nonzero(mask)
+        dx = dx.astype(np.int32) - center_off
+        dy = dy.astype(np.int32) - center_off
     else:
-        rng = np.arange(s)
+        rng = np.arange(s, dtype=np.int32)
         gx, gy = np.meshgrid(rng, rng)
-        dx, dy = gx.flatten(), gy.flatten()
+        dx = (gx - center_off).ravel()
+        dy = (gy - center_off).ravel()
 
     def _compute_alpha_from_values(values, arange=(0.1, 1.0), clip=None, invert=False):
         v = np.asarray(values, dtype=float)
@@ -734,10 +1060,14 @@ def _cache_embedding_image_legacy(
     num_tiles = spatial_coords.shape[0]
     for i in range(0, num_tiles, max(1, chunk_size)):
         idx = order_idx[i : min(i + chunk_size, num_tiles)]
-        xi = ((spatial_coords[idx, 0] - x_min) * scale).astype(int)
-        yi = ((spatial_coords[idx, 1] - y_min) * scale).astype(int)
-        all_x = np.clip((xi[:, None] + dx).ravel(), 0, w - 1)
-        all_y = np.clip((yi[:, None] + dy).ravel(), 0, h - 1)
+        if pixel_perfect:
+            cx0 = np.floor((spatial_coords[idx, 0] - x_min_eff) * scale + 0.5).astype(np.int32)
+            cy0 = np.floor((spatial_coords[idx, 1] - y_min_eff) * scale + 0.5).astype(np.int32)
+        else:
+            cx0 = np.rint((spatial_coords[idx, 0] - x_min_eff) * scale).astype(np.int32)
+            cy0 = np.rint((spatial_coords[idx, 1] - y_min_eff) * scale).astype(np.int32)
+        all_x = np.clip((cx0[:, None] + dx[None, :]).ravel(), 0, w - 1)
+        all_y = np.clip((cy0[:, None] + dy[None, :]).ravel(), 0, h - 1)
         tile_idx_map = np.repeat(idx, len(dx))
         img[all_y, all_x] = cols[tile_idx_map]
 
@@ -747,16 +1077,20 @@ def _cache_embedding_image_legacy(
         label_img = np.full((h, w), -1, dtype=int)
         for i in range(0, num_tiles, max(1, chunk_size)):
             idx = order_idx[i : min(i + chunk_size, num_tiles)]
-            xi = ((spatial_coords[idx, 0] - x_min) * scale).astype(int)
-            yi = ((spatial_coords[idx, 1] - y_min) * scale).astype(int)
+            if pixel_perfect:
+                cx0 = np.floor((spatial_coords[idx, 0] - x_min_eff) * scale + 0.5).astype(np.int32)
+                cy0 = np.floor((spatial_coords[idx, 1] - y_min_eff) * scale + 0.5).astype(np.int32)
+            else:
+                cx0 = np.rint((spatial_coords[idx, 0] - x_min_eff) * scale).astype(np.int32)
+                cy0 = np.rint((spatial_coords[idx, 1] - y_min_eff) * scale).astype(np.int32)
             if pixel_shape == "circle":
                 for j, t in enumerate(idx):
-                    lx = np.clip(xi[j] + dx, 0, w - 1)
-                    ly = np.clip(yi[j] + dy, 0, h - 1)
+                    lx = np.clip(cx0[j] + dx, 0, w - 1)
+                    ly = np.clip(cy0[j] + dy, 0, h - 1)
                     label_img[ly, lx] = seg_codes[t]
             else:
-                all_x = np.clip((xi[:, None] + dx).ravel(), 0, w - 1)
-                all_y = np.clip((yi[:, None] + dy).ravel(), 0, h - 1)
+                all_x = np.clip((cx0[:, None] + dx[None, :]).ravel(), 0, w - 1)
+                all_y = np.clip((cy0[:, None] + dy[None, :]).ravel(), 0, h - 1)
                 label_img[all_y, all_x] = np.repeat(seg_codes[idx], len(dx))
 
     if downsample_factor and downsample_factor > 1.0:
@@ -780,10 +1114,12 @@ def _cache_embedding_image_legacy(
         label_img = label_img[: new_h * factor, : new_w * factor]
         label_img = label_img.reshape(new_h, factor, new_w, factor).max(axis=(1, 3))
 
-    xi_final = ((spatial_coords[:, 0] - x_min) * scale).astype(int)
-    yi_final = ((spatial_coords[:, 1] - y_min) * scale).astype(int)
-    cx = np.clip(xi_final + s // 2, 0, w - 1)
-    cy = np.clip(yi_final + s // 2, 0, h - 1)
+    if pixel_perfect:
+        cx = np.clip(np.floor((spatial_coords[:, 0] - x_min_eff) * scale + 0.5).astype(np.int32), 0, w - 1)
+        cy = np.clip(np.floor((spatial_coords[:, 1] - y_min_eff) * scale + 0.5).astype(np.int32), 0, h - 1)
+    else:
+        cx = np.clip(np.rint((spatial_coords[:, 0] - x_min_eff) * scale).astype(np.int32), 0, w - 1)
+        cy = np.clip(np.rint((spatial_coords[:, 1] - y_min_eff) * scale).astype(np.int32), 0, h - 1)
 
     cache = {
         "img": img,
@@ -791,13 +1127,19 @@ def _cache_embedding_image_legacy(
         "w": int(w),
         "total_pixels": int(h * w),
         "channels": int(dims),
+        "coordinate_mode": str(coord_mode),
         "x_min": float(x_min),
         "x_max": float(x_max),
         "y_min": float(y_min),
         "y_max": float(y_max),
+        "x_min_eff": float(x_min_eff),
+        "x_max_eff": float(x_max_eff),
+        "y_min_eff": float(y_min_eff),
+        "y_max_eff": float(y_max_eff),
         "scale": float(scale),
         "s_data_units": float(s_data_units),
         "tile_px": int(s),
+        "pixel_perfect": bool(pixel_perfect),
         "pixel_shape": str(pixel_shape),
         "embedding_key": str(embedding),
         "dimensions": list(dimensions),
@@ -1122,12 +1464,12 @@ def show_cached_image(
 
     plt.figure(figsize=figsize, dpi=fig_dpi)
     if img.shape[2] == 1 and cmap is not None and channels is None:
-        plt.imshow(img[:, :, 0], origin="lower", cmap=cmap)
+        plt.imshow(img[:, :, 0], origin="lower", cmap=cmap, interpolation="nearest")
     else:
         rgb = _prepare_display_image(img, channels=channels)
         if apply_brighten and not already_applied:
             rgb = _apply_brighten_continuous_rgb(rgb, gamma)
-        plt.imshow(rgb, origin="lower")
+        plt.imshow(rgb, origin="lower", interpolation="nearest")
 
     if title is None:
         emb = cache.get("embedding_key", "?")
@@ -1211,12 +1553,12 @@ def show_all_cached_images(
         cache_channels = int(cache.get("channels", img.shape[2]))
         already_applied = bool(plot_params.get("brighten_applied", False)) and cache_channels == 3
         if img.shape[2] == 1 and cmap is not None and channels is None:
-            ax.imshow(img[:, :, 0], origin="lower", cmap=cmap)
+            ax.imshow(img[:, :, 0], origin="lower", cmap=cmap, interpolation="nearest")
         else:
             rgb = _prepare_display_image(img, channels=channels)
             if apply_brighten and not already_applied:
                 rgb = _apply_brighten_continuous_rgb(rgb, gamma)
-            ax.imshow(rgb, origin="lower")
+            ax.imshow(rgb, origin="lower", interpolation="nearest")
         emb = cache.get("embedding_key", "?")
         dims = cache.get("dimensions", [])
         raster_dpi = cache.get("raster_dpi", cache.get("effective_dpi", None))

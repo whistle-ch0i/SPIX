@@ -140,6 +140,66 @@ def _pseudo_centroids_from_segment_labels(
     return out
 
 
+def _pseudo_centroids_from_clusters_df(
+    adata: AnnData,
+    clusters_df: pd.DataFrame,
+    *,
+    embedding: str,
+    dimensions: list[int],
+    chunk_size: int = 1_000_000,
+) -> np.ndarray:
+    """Fast pseudo-centroids in adata.obs order from (barcode -> Segment) mapping.
+
+    This replaces the slow pandas merge/groupby/transform path in `create_pseudo_centroids`
+    for very large datasets.
+    """
+    if "barcode" not in clusters_df.columns or "Segment" not in clusters_df.columns:
+        raise ValueError("clusters_df must have columns: 'barcode', 'Segment'")
+
+    obs_barcodes = pd.Index(adata.obs.index.astype(str))
+    tile_barcodes = pd.Index(clusters_df["barcode"].astype(str))
+    obs_pos = obs_barcodes.get_indexer(tile_barcodes)
+    ok = obs_pos >= 0
+
+    E_full = np.asarray(adata.obsm[embedding])
+    if E_full.ndim != 2 or E_full.shape[0] != adata.n_obs:
+        raise ValueError(f"Embedding '{embedding}' must be a 2D array with n_obs rows.")
+    E_use = E_full if E_full.shape[1] == len(dimensions) else E_full[:, dimensions]
+    E_use = np.asarray(E_use, dtype=np.float32)
+    d = int(E_use.shape[1])
+
+    if not np.any(ok):
+        return np.full((adata.n_obs, d), np.nan, dtype=np.float32)
+
+    pos = obs_pos[ok].astype(np.int64, copy=False)
+    labels = clusters_df.loc[ok, "Segment"].to_numpy()
+    codes, _uniques = pd.factorize(labels, sort=False)
+    codes = codes.astype(np.int64, copy=False)
+    k = int(codes.max(initial=-1)) + 1
+    if k <= 0:
+        return np.full((adata.n_obs, d), np.nan, dtype=np.float32)
+
+    counts = np.bincount(codes, minlength=k).astype(np.int64, copy=False)
+    sums = np.zeros((k, d), dtype=np.float32)
+
+    if chunk_size < 1:
+        chunk_size = 1_000_000
+    n = int(pos.size)
+    for i in range(0, n, int(chunk_size)):
+        j = min(i + int(chunk_size), n)
+        p = pos[i:j]
+        c = codes[i:j]
+        np.add.at(sums, c, E_use[p])
+
+    denom = counts.astype(np.float32)
+    denom[denom < 1] = np.nan
+    means = (sums / denom[:, None]).astype(np.float32, copy=False)
+
+    out = np.full((adata.n_obs, d), np.nan, dtype=np.float32)
+    out[pos] = means[codes]
+    return out
+
+
 def n_segments_from_size(
     tiles_df: pd.DataFrame, target_um: float = 100.0, pitch_um: float = 2.0
 ) -> int:
@@ -376,10 +436,11 @@ def segment_image(
     origin: bool = True,
     verbose: bool = True,
     library_id: str = None,  # Specify library_id column name in adata.obs
-    figsize: tuple = (10, 10),
+    figsize: tuple | None = None,
     fig_dpi: int | None = None,
     imshow_tile_size: float | None = None,
     imshow_scale_factor: float = 1.0,
+    pixel_perfect: bool = True,
     enforce_connectivity: bool = False,
     pixel_shape: str = "square",
     show_image: bool = False,
@@ -390,6 +451,9 @@ def segment_image(
     image_cache_key: str = "image_plot_slic",
     cache_fast_path: bool = True,
     compute_pseudo_centroids: bool = True,
+    coordinate_mode: str = "spatial",  # 'spatial'|'array'|'visium'|'visiumhd'|'auto'
+    array_row_key: str = "array_row",
+    array_col_key: str = "array_col",
 ):
     """
     Segment embeddings to find initial territories.
@@ -427,7 +491,7 @@ def segment_image(
         Whether to display progress messages.
     library_id : str, optional (default=None)
         Column name in adata.obs to group by. If specified, segmentation is performed separately for each group.
-    figsize : tuple, optional (default=(10, 10))
+    figsize : tuple or None, optional (default=None)
         Figure size used when creating the intermediate image for ``image_plot_slic``.
     fig_dpi : int or None, optional (default=None)
         DPI used when constructing the internal image for ``image_plot_slic``.
@@ -435,6 +499,11 @@ def segment_image(
         Tile size used for estimating pixel scaling in ``image_plot_slic``.
     imshow_scale_factor : float, optional (default=1.0)
         Additional scaling factor for ``image_plot_slic``.
+    pixel_perfect : bool, optional (default ``True``)
+        Pixel-perfect rasterization (integer pitch + center-based tiles) used when
+        generating the temporary image. When ``use_cached_image=True`` and a cached
+        image is available, this flag does not affect segmentation (the cache is used
+        as-is).
     enforce_connectivity : bool, optional (default=False)
         Whether to enforce connectivity in ``image_plot_slic``.
     pixel_shape : str, optional (default ``"square"``)
@@ -456,6 +525,12 @@ def segment_image(
     pitch_um : float, optional (default=2.0)
         Distance between neighbouring spots in micrometers used when
         ``target_segment_um`` is specified.
+    coordinate_mode : str, optional (default='spatial')
+        Coordinate system used for the internal rasterization in ``image_plot_slic``.
+        Use ``'array'`` for Visium/VisiumHD to rasterize on the exact grid
+        (uses ``adata.obs[array_row_key/array_col_key]``).
+    array_row_key / array_col_key : str
+        Column names in ``adata.obs`` used when ``coordinate_mode='array'``.
 
     Returns
     -------
@@ -471,6 +546,10 @@ def segment_image(
         tiles = tiles_all[tiles_all.get("origin", 1) == 1]
     else:
         tiles = tiles_all
+    if "barcode" in tiles.columns and tiles["barcode"].duplicated().any():
+        if verbose:
+            print("[warning] adata.uns['tiles'] has duplicated barcodes; keeping first occurrence for segmentation.")
+        tiles = tiles.drop_duplicates("barcode", keep="first")
 
     # For target-based segment estimation, always base on origin==1 spots
     tiles_for_n = tiles_all
@@ -507,9 +586,11 @@ def segment_image(
             if show_image:
                 cache_figsize = cache.get("figsize", None)
                 cache_figdpi = cache.get("fig_dpi", None)
-                print(
-                    f"[info] use_cached_image=True: showing with cached figsize={cache_figsize}, fig_dpi={cache_figdpi}"
-                )
+                cache_pp = cache.get("pixel_perfect", None)
+                if verbose:
+                    print(
+                        f"[info] use_cached_image=True: showing with cached figsize={cache_figsize}, fig_dpi={cache_figdpi}, pixel_perfect={cache_pp}"
+                    )
 
             t0 = time.perf_counter()
             labels_tile, _ = slic_segmentation_from_cached_image(
@@ -653,6 +734,31 @@ def segment_image(
         lib_info["barcode"] = lib_info.index
         coordinates_df = pd.merge(coordinates_df, lib_info, on="barcode", how="left")
 
+    coord_mode = str(coordinate_mode or "spatial").lower()
+    if coord_mode not in {"spatial", "array", "visium", "visiumhd", "auto"}:
+        coord_mode = "spatial"
+    if coord_mode == "auto":
+        if (array_row_key in adata.obs.columns) and (array_col_key in adata.obs.columns) and int(adata.n_obs) >= 200_000:
+            coord_mode = "visiumhd"
+        else:
+            coord_mode = "spatial"
+    if coord_mode in {"array", "visium", "visiumhd"}:
+        if (array_row_key not in adata.obs.columns) or (array_col_key not in adata.obs.columns):
+            raise ValueError(
+                f"coordinate_mode='array' requires adata.obs['{array_row_key}'] and adata.obs['{array_col_key}']."
+            )
+        col = pd.to_numeric(coordinates_df["barcode"].map(adata.obs[array_col_key]), errors="coerce")
+        row = pd.to_numeric(coordinates_df["barcode"].map(adata.obs[array_row_key]), errors="coerce")
+        if coord_mode == "visium":
+            row_i = row.astype("Int64")
+            parity = (row_i % 2).astype(float)
+            coordinates_df["x"] = col.astype(float) + 0.5 * parity
+            coordinates_df["y"] = row.astype(float) * (np.sqrt(3.0) / 2.0)
+        else:
+            coordinates_df["x"] = col.astype(float)
+            coordinates_df["y"] = row.astype(float)
+        coordinates_df = coordinates_df.dropna(subset=["x", "y"])
+
     # If library_id is specified, perform segmentation per library group
     if library_id is not None:
         clusters_list = []
@@ -674,8 +780,10 @@ def segment_image(
             barcode_group = group["barcode"]
 
             if method == "image_plot_slic":
-                if use_cached_image:
-                    print("[warning] use_cached_image=True ignored when library_id is set; regenerating per-library image.")
+                if use_cached_image and verbose:
+                    print(
+                        "[warning] use_cached_image=True ignored when library_id is set; regenerating per-library image."
+                    )
                 labels, _, _ = image_plot_slic_segmentation(
                     embeddings_group,
                     spatial_coords_group,
@@ -685,6 +793,7 @@ def segment_image(
                     fig_dpi=fig_dpi,
                     imshow_tile_size=imshow_tile_size,
                     imshow_scale_factor=imshow_scale_factor,
+                    pixel_perfect=pixel_perfect,
                     enforce_connectivity=enforce_connectivity,
                     pixel_shape=pixel_shape,
                     show_image=show_image,
@@ -698,10 +807,7 @@ def segment_image(
                     origin_flags=group.get("origin", pd.Series(index=group.index, data=0)).values,
                 )
                 # Use per-barcode embeddings to compute pseudo-centroids
-                emb_base_group = (
-                    base_embeddings_df.loc[clusters_df_group["barcode"].astype(str)]
-                    .copy()
-                )
+                emb_base_group = base_embeddings_df.loc[clusters_df_group["barcode"].astype(str)].copy()
                 pseudo_centroids_group = create_pseudo_centroids(
                     emb_base_group,
                     clusters_df_group,
@@ -709,31 +815,30 @@ def segment_image(
                 )
                 combined_data_group = None
             else:
-                clusters_df_group, pseudo_centroids_group, combined_data_group = (
-                    segment_image_inner(
-                        embeddings_group,
-                        embeddings_df_group,
-                        barcode_group,
-                        spatial_coords_group,
-                        dimensions,
-                        method,
-                        resolution,
-                        compactness,
-                        scaling,
-                        n_neighbors,
-                        random_state,
-                        Segment,
-                        index_selection,
-                        max_iter,
-                        verbose,
-                        figsize,
-                        imshow_tile_size,
-                        imshow_scale_factor,
-                        enforce_connectivity,
-                        pixel_shape,
-                        show_image,
-                        fig_dpi=fig_dpi,
-                    )
+                clusters_df_group, pseudo_centroids_group, combined_data_group = segment_image_inner(
+                    embeddings_group,
+                    embeddings_df_group,
+                    barcode_group,
+                    spatial_coords_group,
+                    dimensions,
+                    method,
+                    resolution,
+                    compactness,
+                    scaling,
+                    n_neighbors,
+                    random_state,
+                    Segment,
+                    index_selection,
+                    max_iter,
+                    verbose,
+                    figsize,
+                    imshow_tile_size,
+                    imshow_scale_factor,
+                    pixel_perfect,
+                    enforce_connectivity,
+                    pixel_shape,
+                    show_image,
+                    fig_dpi=fig_dpi,
                 )
                 # If duplicates (origin=False), aggregate to one label per barcode and recompute centroids
                 if clusters_df_group["barcode"].duplicated().any():
@@ -742,10 +847,7 @@ def segment_image(
                         clusters_df_group["Segment"].values,
                         origin_flags=group.get("origin", pd.Series(index=group.index, data=0)).values,
                     )
-                    emb_base_group = (
-                        base_embeddings_df.loc[clusters_df_group["barcode"].astype(str)]
-                        .copy()
-                    )
+                    emb_base_group = base_embeddings_df.loc[clusters_df_group["barcode"].astype(str)].copy()
                     pseudo_centroids_group = create_pseudo_centroids(
                         emb_base_group,
                         clusters_df_group,
@@ -813,7 +915,8 @@ def segment_image(
                     if (cached_emb is not None and cached_emb != embedding) or (
                         cached_dims is not None and list(cached_dims) != list(dimensions)
                     ):
-                        print("[warning] Cached image embedding/dimensions differ; regenerating image.")
+                        if verbose:
+                            print("[warning] Cached image embedding/dimensions differ; regenerating image.")
                         raise KeyError
 
                     # When using cached image, always display with cached figsize/dpi
@@ -821,14 +924,17 @@ def segment_image(
                     if show_image:
                         cache_figsize = cache.get("figsize", None)
                         cache_figdpi = cache.get("fig_dpi", None)
+                        cache_pp = cache.get("pixel_perfect", None)
                         if figsize is not None or fig_dpi is not None:
-                            print(
-                                f"[info] use_cached_image=True: showing with cached figsize={cache_figsize}, fig_dpi={cache_figdpi} (ignoring provided figsize/fig_dpi)"
-                            )
+                            if verbose:
+                                print(
+                                    f"[info] use_cached_image=True: showing with cached figsize={cache_figsize}, fig_dpi={cache_figdpi}, pixel_perfect={cache_pp} (ignoring provided figsize/fig_dpi)"
+                                )
                         else:
-                            print(
-                                f"[info] use_cached_image=True: showing with cached figsize={cache_figsize}, fig_dpi={cache_figdpi}"
-                            )
+                            if verbose:
+                                print(
+                                    f"[info] use_cached_image=True: showing with cached figsize={cache_figsize}, fig_dpi={cache_figdpi}, pixel_perfect={cache_pp}"
+                                )
 
                     t0 = time.perf_counter()
                     labels_tile, _ = slic_segmentation_from_cached_image(
@@ -855,11 +961,11 @@ def segment_image(
                             origin_flags=cache.get("origin_flags", None),
                         )
                     t2 = time.perf_counter()
-                    emb_base = base_embeddings_df.loc[clusters_df["barcode"].astype(str)].copy()
-                    pseudo_centroids = create_pseudo_centroids(
-                        emb_base,
+                    pseudo_centroids = _pseudo_centroids_from_clusters_df(
+                        adata,
                         clusters_df,
-                        emb_base.columns,
+                        embedding=embedding,
+                        dimensions=list(dimensions),
                     )
                     t3 = time.perf_counter()
                     if verbose:
@@ -877,6 +983,7 @@ def segment_image(
                         fig_dpi=fig_dpi,
                         imshow_tile_size=imshow_tile_size,
                         imshow_scale_factor=imshow_scale_factor,
+                        pixel_perfect=pixel_perfect,
                         enforce_connectivity=enforce_connectivity,
                         pixel_shape=pixel_shape,
                         show_image=show_image,
@@ -890,11 +997,11 @@ def segment_image(
                         origin_flags=coordinates_df.get("origin", pd.Series(index=coordinates_df.index, data=0)).values,
                     )
                     t2 = time.perf_counter()
-                    emb_base = base_embeddings_df.loc[clusters_df["barcode"].astype(str)].copy()
-                    pseudo_centroids = create_pseudo_centroids(
-                        emb_base,
+                    pseudo_centroids = _pseudo_centroids_from_clusters_df(
+                        adata,
                         clusters_df,
-                        emb_base.columns,
+                        embedding=embedding,
+                        dimensions=list(dimensions),
                     )
                     t3 = time.perf_counter()
                     if verbose:
@@ -911,6 +1018,7 @@ def segment_image(
                     fig_dpi=fig_dpi,
                     imshow_tile_size=imshow_tile_size,
                     imshow_scale_factor=imshow_scale_factor,
+                    pixel_perfect=pixel_perfect,
                     enforce_connectivity=enforce_connectivity,
                     pixel_shape=pixel_shape,
                     show_image=show_image,
@@ -930,11 +1038,11 @@ def segment_image(
                         origin_flags=coordinates_df.get("origin", pd.Series(index=coordinates_df.index, data=0)).values,
                     )
                 t2 = time.perf_counter()
-                emb_base = base_embeddings_df.loc[clusters_df["barcode"].astype(str)].copy()
-                pseudo_centroids = create_pseudo_centroids(
-                    emb_base,
+                pseudo_centroids = _pseudo_centroids_from_clusters_df(
+                    adata,
                     clusters_df,
-                    emb_base.columns,
+                    embedding=embedding,
+                    dimensions=list(dimensions),
                 )
                 t3 = time.perf_counter()
                 if verbose:
@@ -960,6 +1068,7 @@ def segment_image(
                 figsize,
                 imshow_tile_size,
                 imshow_scale_factor,
+                pixel_perfect,
                 enforce_connectivity,
                 pixel_shape,
                 show_image,
@@ -972,11 +1081,11 @@ def segment_image(
                     clusters_df["Segment"].values,
                     origin_flags=coordinates_df.get("origin", pd.Series(index=coordinates_df.index, data=0)).values,
                 )
-                emb_base = base_embeddings_df.loc[clusters_df["barcode"].astype(str)].copy()
-                pseudo_centroids = create_pseudo_centroids(
-                    emb_base,
+                pseudo_centroids = _pseudo_centroids_from_clusters_df(
+                    adata,
                     clusters_df,
-                    emb_base.columns,
+                    embedding=embedding,
+                    dimensions=list(dimensions),
                 )
                 # Aggregate combined_data to per-barcode mean if available
                 if combined_data is not None:
@@ -1032,9 +1141,10 @@ def segment_image_inner(
     index_selection="random",
     max_iter=1000,
     verbose=True,
-    figsize=(10, 10),
+    figsize=None,
     imshow_tile_size: float | None = None,
     imshow_scale_factor: float = 1.0,
+    pixel_perfect: bool = True,
     enforce_connectivity: bool = False,
     pixel_shape: str = "square",
     show_image: bool = False,
@@ -1077,12 +1187,15 @@ def segment_image_inner(
         Maximum number of iterations for convergence.
     verbose : bool, optional
         Whether to display progress messages.
-    figsize : tuple, optional
+    figsize : tuple or None, optional
         Figure size used when creating the intermediate image for ``image_plot_slic``.
     imshow_tile_size : float or None, optional
         Tile size used for estimating pixel scaling in ``image_plot_slic``.
     imshow_scale_factor : float, optional
         Additional scaling factor for ``image_plot_slic``.
+    pixel_perfect : bool, optional (default ``True``)
+        If True, use pixel-perfect rasterization when constructing the internal
+        image for ``image_plot_slic``.
     enforce_connectivity : bool, optional
         Whether to enforce connectivity in ``image_plot_slic``.
     pixel_shape : str, optional
@@ -1146,6 +1259,7 @@ def segment_image_inner(
             fig_dpi=fig_dpi,
             imshow_tile_size=imshow_tile_size,
             imshow_scale_factor=imshow_scale_factor,
+            pixel_perfect=pixel_perfect,
             enforce_connectivity=enforce_connectivity,
             pixel_shape=pixel_shape,
             show_image=show_image,
@@ -1193,6 +1307,7 @@ def segment_image_inner(
         pseudo_centroids = create_pseudo_centroids(embeddings_df, clusters_df, dimensions)
 
     if verbose:
-        print("Image segmentation completed.")
+        if verbose:
+            print("Image segmentation completed.")
 
     return clusters_df, pseudo_centroids, combined_data

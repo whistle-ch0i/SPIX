@@ -28,6 +28,7 @@ except ImportError:
 def perform_pseudo_bulk_analysis(
     adata: sc.AnnData,
     segment_key: str = 'Segment',
+    segment_codes: Optional[np.ndarray] = None,
     expr_agg: str = "sum",         # "sum" or "mean"
     batch_key: Optional[str] = None,
     min_genes_in_segment: int = 1,
@@ -35,6 +36,7 @@ def perform_pseudo_bulk_analysis(
     log_transform: bool = True,
     moranI_threshold: float = 0.1,
     mode: str = "moran",
+    compute_spatial_autocorr: bool = True,
     sq_neighbors_kwargs: Optional[Dict[str, Any]] = None,
     sq_autocorr_kwargs: Optional[Dict[str, Any]] = None,
     add_bulked_layer_to_original_adata: bool = False,
@@ -96,6 +98,8 @@ def perform_pseudo_bulk_analysis(
         in the pseudo-bulk analysis will be returned.
     mode : str, optional (default="moran")
         Mode for `squidpy.gr.spatial_autocorr` ('moran', 'geary').
+    compute_spatial_autocorr : bool, optional (default=True)
+        Whether to compute spatial autocorrelation on the pseudo-bulk data.
     sq_neighbors_kwargs : dict, optional
         Additional arguments to pass to `squidpy.gr.spatial_neighbors`
         when computing the spatial graph on the pseudo-bulk data (`new_adata`).
@@ -189,7 +193,7 @@ def perform_pseudo_bulk_analysis(
     Raises
     -------
     ValueError
-        If `segment_key` is not found in `adata.obs`.
+        If `segment_key` is not found in `adata.obs` (and `segment_codes` is None).
         If `adata.obsm` does not contain `'spatial'`.
         If `batch_key` is provided but not found in `adata.obs`.
     RuntimeError
@@ -229,9 +233,18 @@ def perform_pseudo_bulk_analysis(
     if expr_agg not in ("sum", "mean"):
         _logger.error(f"Invalid expr_agg '{expr_agg}'. Must be 'sum' or 'mean'.")
         raise ValueError(f"Invalid expr_agg '{expr_agg}'. Must be 'sum' or 'mean'.")
-    if segment_key not in adata.obs:
-        _logger.error(f"'{segment_key}' key is not present in adata.obs.")
-        raise ValueError(f"'{segment_key}' key is not present in adata.obs.")
+    if segment_codes is None:
+        if segment_key not in adata.obs:
+            _logger.error(f"'{segment_key}' key is not present in adata.obs.")
+            raise ValueError(f"'{segment_key}' key is not present in adata.obs.")
+    else:
+        segment_codes = np.asarray(segment_codes)
+        if segment_codes.ndim != 1:
+            raise ValueError("segment_codes must be a 1D array of length adata.n_obs")
+        if segment_codes.shape[0] != adata.n_obs:
+            raise ValueError(
+                f"segment_codes length ({segment_codes.shape[0]}) != adata.n_obs ({adata.n_obs})"
+            )
     if 'spatial' not in adata.obsm:
         _logger.error("'spatial' coordinates not found in adata.obsm.")
         raise ValueError("'spatial' coordinates not found in adata.obsm.")
@@ -250,8 +263,22 @@ def perform_pseudo_bulk_analysis(
     # Prepare data for aggregation
     adata_X = adata.X
     adata_obsm_coords = adata.obsm['spatial']
-    # Convert segment key to string category for robustness
-    segments = adata.obs[segment_key].astype("category").cat.rename_categories(lambda x: str(x))
+    # Prepare segments as a categorical Series.
+    # Important: downstream (graph collapse, squidpy) is most reliable when segment labels are strings,
+    # so we normalize categories to string labels even if codes are numeric.
+    if segment_codes is None:
+        segments = adata.obs[segment_key].astype("category")
+        segments = segments.cat.rename_categories(lambda x: str(x))
+    else:
+        max_code = int(segment_codes.max()) if segment_codes.size else -1
+        if max_code < 0:
+            raise ValueError("segment_codes has no valid (>=0) segment ids")
+        categories = np.arange(max_code + 1, dtype=np.int64).astype(str)
+        segments = pd.Series(
+            pd.Categorical.from_codes(segment_codes.astype(np.int32, copy=False), categories=categories),
+            index=adata.obs_names,
+            name=segment_key,
+        )
     # Handle potential NaN segments (groupby might drop them, ensure consistency)
     # It's safer to drop rows with NaN segments *before* aggregation if they exist
     # For now, assume segment_key has no NaNs or groupby handles them reasonably.
@@ -392,7 +419,7 @@ def perform_pseudo_bulk_analysis(
 
         if available_cols:
             obs_subset = adata.obs[available_cols].copy()
-            obs_subset["_segment_tmp"] = segments.astype(str).values
+            obs_subset["_segment_tmp"] = segments.values
             grouped = obs_subset.groupby("_segment_tmp", observed=True)
 
             numeric_cols = [col for col in available_cols if is_numeric_dtype(obs_subset[col])]
@@ -976,44 +1003,42 @@ def perform_pseudo_bulk_analysis(
             _logger.info("Spatial neighbors computation complete (centroid-based).")
         except Exception as e:
             _logger.error(f"Error computing centroid-based spatial neighbors: {e}")
-            _logger.warning("Skipping spatial autocorrelation calculation.")
+            if compute_spatial_autocorr:
+                _logger.warning("Skipping spatial autocorrelation calculation.")
+                return new_adata, pd.DataFrame()
+            _logger.warning("Continuing without spatial autocorrelation.")
+
+
+    superpixel_moranI = pd.DataFrame()
+    if compute_spatial_autocorr:
+        _logger.info(f"Calculating spatial autocorrelation ({mode})...")
+        if ('spatial_connectivities' not in new_adata.obsp) and ('spatial_neighbors' not in new_adata.uns):
+            _logger.error(
+                "No spatial graph found in new_adata (obsp['spatial_connectivities'] or uns['spatial_neighbors'])."
+            )
             return new_adata, pd.DataFrame()
 
+        try:
+            sq.gr.spatial_autocorr(new_adata, mode=mode, genes=new_adata.var_names, **sq_autocorr_kwargs)
+            _logger.info("Spatial autocorrelation calculation complete.")
+        except Exception as e:
+            _logger.error(f"Error calculating spatial autocorrelation: {e}")
 
-    # Calculate spatial autocorrelation
-    _logger.info(f"Calculating spatial autocorrelation ({mode})...")
-    # Ensure a spatial graph is available in new_adata
-    if ('spatial_connectivities' not in new_adata.obsp) and ('spatial_neighbors' not in new_adata.uns):
-         _logger.error("No spatial graph found in new_adata (obsp['spatial_connectivities'] or uns['spatial_neighbors']).")
-         return new_adata, pd.DataFrame()
-
-    try:
-        # Use genes=new_adata.var_names to compute for all current genes
-        sq.gr.spatial_autocorr(new_adata, mode=mode, genes=new_adata.var_names, **sq_autocorr_kwargs)
-        _logger.info("Spatial autocorrelation calculation complete.")
-    except Exception as e:
-         _logger.error(f"Error calculating spatial autocorrelation: {e}")
-         # The result 'moranI' might not be in new_adata.uns
-         pass # Continue, but check for results later
-
-
-    # Filter spatial autocorrelation results
-    superpixel_moranI = pd.DataFrame() # Initialize as empty
-    # The key depends on the mode, e.g., 'moranI' or 'gearyC'
-    results_key = f"{mode}C" if mode == "geary" else f"{mode}I"
-
-    if results_key in new_adata.uns and not new_adata.uns[results_key].empty:
-        results_df = new_adata.uns[results_key]
-        # Filter based on the index name relevant for the mode ('I' for Moran, 'C' for Geary)
-        index_col = 'I' if mode == 'moran' else 'C'
-        if index_col in results_df.columns:
-             superpixel_moranI = results_df[results_df[index_col] > moranI_threshold].copy()
-             _logger.info(f"Number of genes with {mode}'s {index_col} > {moranI_threshold}: {superpixel_moranI.shape[0]}")
+        results_key = f"{mode}C" if mode == "geary" else f"{mode}I"
+        if results_key in new_adata.uns and not new_adata.uns[results_key].empty:
+            results_df = new_adata.uns[results_key]
+            index_col = 'I' if mode == 'moran' else 'C'
+            if index_col in results_df.columns:
+                superpixel_moranI = results_df[results_df[index_col] > moranI_threshold].copy()
+                _logger.info(
+                    f"Number of genes with {mode}'s {index_col} > {moranI_threshold}: {superpixel_moranI.shape[0]}"
+                )
+            else:
+                _logger.warning(f"Expected index column '{index_col}' not found in '{results_key}' results.")
         else:
-             _logger.warning(f"Expected index column '{index_col}' not found in '{results_key}' results.")
-
+            _logger.warning(f"Spatial autocorrelation results ('{results_key}') not found in new_adata.uns or are empty.")
     else:
-        _logger.warning(f"Spatial autocorrelation results ('{results_key}') not found in new_adata.uns or are empty.")
+        _logger.info("Skipping spatial autocorrelation.")
 
 
     # --- Additional Pseudo-Bulk Preprocessing (HVG, PCA, Neighbors) ---

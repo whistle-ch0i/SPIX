@@ -11,6 +11,7 @@ import os
 import gc
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from functools import partial
+from itertools import product
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -23,6 +24,7 @@ def smooth_image(
     embedding         = 'X_embedding',        # key for raw embeddings in adata.obsm
     embedding_dims    = None,                 # list of embedding dimensions to use (None for all)
     output            = 'X_embedding_smooth', # key for smoothed embeddings in adata.obsm
+    obs_mask          = None,                 # optional mask (bool array) or adata.obs key (str) to smooth only a subset (e.g. in_tissue)
     # K-NN smoothing parameters
     knn_k             = 35,                   # Number of neighbors for KNN/gaussian
     knn_sigma         = 2.0,                  # Kernel width for KNN spatial distance
@@ -95,6 +97,9 @@ def smooth_image(
         embedding_dims (list[int] | None): Indices of embedding dimensions to process
             (None = all dimensions).
         output (str): Key in adata.obsm where the smoothed embedding is stored.
+        obs_mask (str|array-like|None): If provided, smooth only the selected
+            observations (e.g. `obs_mask="in_tissue"`). Unselected rows are
+            copied through from the input embedding.
         knn_k (int): Neighbor count for KNN/gaussian smoothing.
         knn_sigma (float): Spatial kernel width for KNN smoothing.
         knn_chunk (int): Process KNN/gaussian in chunks to cap memory.
@@ -233,6 +238,31 @@ def smooth_image(
             logging.error(f"Spatial coordinates not found in adata.obsm['spatial'] or adata.uns['tiles']: {e}")
             raise
     logging.info(f"Loaded coordinates for {coords.shape[0]} observations.")
+    # Optional: smooth only a subset of observations (e.g. in_tissue) to avoid
+    # bleeding signal into background regions (common in VisiumHD).
+    full_mask = None
+    raw_embedding_full = None
+    coords_full = None
+    if obs_mask is not None:
+        if isinstance(obs_mask, (str, bytes)):
+            key = str(obs_mask)
+            if key not in adata.obs:
+                raise KeyError(f"obs_mask key '{key}' not found in adata.obs.")
+            full_mask = np.asarray(adata.obs[key]).astype(bool, copy=False)
+        else:
+            full_mask = np.asarray(obs_mask).astype(bool, copy=False)
+        if full_mask.shape[0] != n:
+            raise ValueError("obs_mask must have length n_obs.")
+        if not bool(full_mask.any()):
+            raise ValueError("obs_mask selects 0 observations.")
+        if bool(full_mask.all()):
+            full_mask = None
+        else:
+            raw_embedding_full = raw_embedding
+            coords_full = coords
+            raw_embedding = raw_embedding[full_mask]
+            coords = coords[full_mask]
+            n, total_dim = raw_embedding.shape
     if embedding_dims is None:
         dims_to_use = list(range(total_dim))
     else:
@@ -669,7 +699,12 @@ def smooth_image(
                 E_bins_smoothed = (E_bins_smoothed - mn) / denom
 
         E_smoothed = E_bins_smoothed[approx_info["bin_id"]]
-        adata.obsm[output] = E_smoothed.astype('float32', copy=False)
+        if full_mask is not None:
+            out_full = raw_embedding_full[:, dims_to_use].astype("float32", copy=True)
+            out_full[full_mask] = E_smoothed.astype("float32", copy=False)
+            adata.obsm[output] = out_full
+        else:
+            adata.obsm[output] = E_smoothed.astype('float32', copy=False)
         logging.info(f"Finished. Stored smoothed embedding → adata.obsm['{output}']")
         return adata
 
@@ -975,7 +1010,12 @@ def smooth_image(
             n_workers=max_workers,
             fast_float32=fast_float32,
         )
-        adata.obsm[output] = E_smoothed
+        if full_mask is not None:
+            out_full = raw_embedding_full[:, dims_to_use].astype("float32", copy=True)
+            out_full[full_mask] = E_smoothed.astype("float32", copy=False)
+            adata.obsm[output] = out_full
+        else:
+            adata.obsm[output] = E_smoothed
         logging.info(f"Finished. Stored smoothed embedding → adata.obsm['{output}']")
         return adata
     if impl == "legacy" or (impl == "auto" and not can_vectorize):
@@ -1097,7 +1137,12 @@ def smooth_image(
         denom = (mx - mn)
         denom[denom < 1e-12] = 1e-12
         E_smoothed = (E_smoothed - mn) / denom
-    adata.obsm[output] = E_smoothed
+    if full_mask is not None:
+        out_full = raw_embedding_full[:, dims_to_use].astype("float32", copy=True)
+        out_full[full_mask] = E_smoothed.astype("float32", copy=False)
+        adata.obsm[output] = out_full
+    else:
+        adata.obsm[output] = E_smoothed
     logging.info(f"Finished. Stored smoothed embedding → adata.obsm['{output}']")
     return adata
 
@@ -2165,3 +2210,518 @@ def _process_dimension(
             E = (E - mn) / denom
 
     return E.ravel()
+
+
+def tune_smooth_image_params(
+    adata,
+    *,
+    embedding: str = "X_embedding",
+    methods=("bilateral",),
+    embedding_dims=None,
+    obs_mask=None,
+    coords=None,
+    # Approximation (grid) controls for fast tuning on large datasets
+    approx_target_n: int = 20_000,
+    approx_bin=None,
+    approx_max_bins=None,
+    # Neighbor + diffusion defaults (match smooth_image defaults)
+    graph_k: int = 30,
+    graph_t: int = 2,
+    graph_tol=None,
+    graph_check_every: int = 1,
+    graph_explicit="implicit",
+    graph_explicit_max_mb=None,
+    knn_sigma: float = 2.0,
+    knn_chunk: int = 10_000,
+    # Bilateral grid search
+    bilateral_k: int = 30,
+    bilateral_k_grid=None,
+    bilateral_sigma_r_grid=None,
+    bilateral_t_grid=None,
+    # Scoring controls
+    n_dims_eval: int = 3,
+    random_state: int = 0,
+    score_sample_edges: int = 200_000,
+    score_q_low: float = 0.2,
+    score_q_high: float = 0.8,
+    # Selection controls (no manual 'strength' needed)
+    selection: str = "gain_then_edge",
+    select_gain_fraction=None,
+    select_min_edge_preserve=None,
+    # Legacy scoring weights (kept for diagnostics only)
+    score_w_edge: float = 1.0,
+    score_w_all: float = 0.2,
+    # Optional preference knob (only applied if explicitly provided)
+    strength=None,
+    # Numeric behavior
+    rescale_mode: str = "final",
+    use_float32=None,
+    fast_float32: bool = True,
+    n_jobs=None,
+    verbose: bool = True,
+):
+    """
+    Automatically suggest dataset-specific `smooth_image(...)` parameters.
+
+    This tuner is designed for very large datasets (e.g. VisiumHD) and evaluates
+    candidates on an approximate coarse grid (bins) to keep runtime reasonable.
+
+    Currently focuses on tuning the bilateral filter parameters:
+      - `bilateral_sigma_r`
+      - `bilateral_t`
+      - optionally `bilateral_k`
+
+    Returns:
+        dict with:
+          - 'best' (dict): recommended keyword args for `smooth_image(...)`
+          - 'candidates' (pd.DataFrame): per-candidate scores/diagnostics
+          - 'dims_eval' (list[int]): embedding dimensions used for tuning
+          - 'approx' (dict): coarse-grid info (bin_size, n_bins)
+    """
+    log = logging.getLogger(__name__)
+    if not verbose:
+        prev_level = log.level
+        log.setLevel(logging.WARNING)
+    try:
+        strength_val = None
+        if strength is not None:
+            strength_val = float(strength)
+            if not np.isfinite(strength_val) or strength_val <= 0:
+                raise ValueError("strength must be a finite positive float.")
+
+        if isinstance(methods, (str, bytes)):
+            methods = [methods]
+        methods = [str(m).strip().lower() for m in methods]
+        if "bilateral" not in methods:
+            raise ValueError("tune_smooth_image_params currently requires methods to include 'bilateral'.")
+        if score_q_low <= 0 or score_q_high >= 1 or score_q_low >= score_q_high:
+            raise ValueError("score_q_low/high must satisfy 0 < low < high < 1.")
+
+        selection_mode = str(selection).strip().lower()
+        if selection_mode not in {"gain_then_edge", "product", "score", "max_gain"}:
+            raise ValueError("selection must be one of {'gain_then_edge','product','score','max_gain'}.")
+        select_gain_fraction_val = None
+        if select_gain_fraction is not None:
+            select_gain_fraction_val = float(select_gain_fraction)
+            if not np.isfinite(select_gain_fraction_val) or not (0 < select_gain_fraction_val <= 1.0):
+                raise ValueError("select_gain_fraction must be in (0,1].")
+        min_edge_val = None if select_min_edge_preserve is None else float(select_min_edge_preserve)
+        if min_edge_val is not None and (not np.isfinite(min_edge_val) or not (0 < min_edge_val <= 1.0)):
+            raise ValueError("select_min_edge_preserve must be in (0,1].")
+
+        # Load embedding (minimal copy).
+        raw_embedding = np.asarray(adata.obsm[embedding])
+        if raw_embedding.dtype != np.float32:
+            raw_embedding = raw_embedding.astype(np.float32, copy=False)
+        n_obs, n_dim_total = raw_embedding.shape
+
+        # Resolve coords aligned to obs.
+        if coords is None:
+            coords_local = None
+            try:
+                if "spatial" in adata.obsm:
+                    coords_candidate = np.asarray(adata.obsm["spatial"], dtype=np.float32)
+                    if coords_candidate.shape[0] == n_obs:
+                        coords_local = coords_candidate[:, :2]
+            except Exception:
+                coords_local = None
+            if coords_local is None:
+                try:
+                    tiles_df = adata.uns["tiles"]
+                    tiles_origin = tiles_df[tiles_df["origin"] == 1].copy()
+                    tiles_origin["barcode"] = tiles_origin["barcode"].astype(str)
+                    obs_idx = pd.Index(adata.obs_names.astype(str))
+                    tiles_aligned = tiles_origin.set_index("barcode").reindex(obs_idx)
+                    if tiles_aligned[["x", "y"]].isna().any().any():
+                        missing = int(tiles_aligned[["x", "y"]].isna().any(axis=1).sum())
+                        raise ValueError(
+                            f"Missing coordinates for {missing} observations when aligning tiles to obs."
+                        )
+                    coords_local = tiles_aligned[["x", "y"]].to_numpy(dtype=np.float32)
+                except Exception as e:
+                    raise ValueError(
+                        "Could not resolve coordinates from adata.obsm['spatial'] or adata.uns['tiles']."
+                    ) from e
+            coords = coords_local
+        else:
+            coords = np.asarray(coords, dtype=np.float32)
+            if coords.ndim != 2 or coords.shape[0] != n_obs or coords.shape[1] < 2:
+                raise ValueError("coords must be shaped (n_obs, 2+).")
+            coords = coords[:, :2]
+
+        # Optional: tune on a subset (e.g. in_tissue only). This often improves
+        # results on VisiumHD where background tiles dominate neighborhood stats.
+        if obs_mask is not None:
+            if isinstance(obs_mask, (str, bytes)):
+                key = str(obs_mask)
+                if key not in adata.obs:
+                    raise KeyError(f"obs_mask key '{key}' not found in adata.obs.")
+                mask = np.asarray(adata.obs[key]).astype(bool, copy=False)
+            else:
+                mask = np.asarray(obs_mask).astype(bool, copy=False)
+            if mask.shape[0] != n_obs:
+                raise ValueError("obs_mask must have length n_obs.")
+            if not bool(mask.any()):
+                raise ValueError("obs_mask selects 0 observations.")
+            if not bool(mask.all()):
+                raw_embedding = raw_embedding[mask]
+                coords = coords[mask]
+                n_obs = int(raw_embedding.shape[0])
+
+        if embedding_dims is None:
+            dims_pool = np.arange(n_dim_total, dtype=np.int32)
+        else:
+            dims_pool = np.asarray(list(embedding_dims), dtype=np.int32)
+            if dims_pool.size == 0:
+                raise ValueError("embedding_dims must be non-empty when provided.")
+            if dims_pool.min() < 0 or dims_pool.max() >= n_dim_total:
+                raise ValueError("embedding_dims contains out-of-range indices.")
+
+        n_dims_eval = int(max(1, n_dims_eval))
+        rng = np.random.default_rng(int(random_state))
+        if dims_pool.size <= n_dims_eval:
+            dims_eval = [int(x) for x in dims_pool.tolist()]
+        else:
+            dims_eval = sorted(int(x) for x in rng.choice(dims_pool, size=n_dims_eval, replace=False))
+
+        if n_jobs is None or int(n_jobs) == -1:
+            n_jobs = multiprocessing.cpu_count()
+        n_jobs = int(n_jobs)
+        neighbor_workers = max(1, n_jobs)
+
+        if use_float32 is None:
+            use_float32 = str(os.environ.get("SPIX_SMOOTH_FLOAT32", "0")).strip().lower() in {"1", "true", "yes"}
+        else:
+            use_float32 = bool(use_float32)
+        if fast_float32:
+            use_float32 = True
+
+        if approx_max_bins is None:
+            try:
+                approx_max_bins = int(os.environ.get("SPIX_SMOOTH_APPROX_MAX_BINS", "500000"))
+            except Exception:
+                approx_max_bins = 500000
+
+        # Precompute approximate grid (bins + centers).
+        approx_info = _precompute_approx_grid(
+            coords,
+            graph_k=int(graph_k),
+            graph_t=int(graph_t),
+            graph_explicit=graph_explicit,
+            graph_explicit_max_mb=graph_explicit_max_mb,
+            use_float32=use_float32,
+            target_n=int(approx_target_n),
+            bin_size=approx_bin,
+            max_bins=approx_max_bins,
+            build_graph=("graph" in methods),
+            neighbor_workers=neighbor_workers,
+        )
+        bin_id = approx_info["bin_id"]
+        counts = approx_info["counts"]
+        centers = approx_info["centers"]
+        n_bins = int(approx_info["n_bins"])
+
+        # Aggregate into bins for evaluation dims only.
+        E_eval = raw_embedding[:, dims_eval]
+        sum_dtype = np.float32 if fast_float32 else np.float64
+        E_bins = _aggregate_by_bins(E_eval, bin_id, counts, sum_dtype=sum_dtype).astype(np.float32, copy=False)
+        # For tuning, compare candidates in the same scale as the final output.
+        # `smooth_image(rescale_mode='final')` min-max rescales *after* all methods,
+        # so we normalize the baseline as well to make ratios meaningful.
+        if str(rescale_mode).strip().lower() in {"final", "per_step"}:
+            mn0 = E_bins.min(axis=0, keepdims=True)
+            mx0 = E_bins.max(axis=0, keepdims=True)
+            denom0 = mx0 - mn0
+            denom0[denom0 < 1e-12] = 1e-12
+            E_bins = (E_bins - mn0) / denom0
+
+        # Build neighbor queries on bin centers once (use max-k and slice later).
+        need_bilateral = True
+        k_grid = bilateral_k_grid
+        if k_grid is None:
+            k_grid = [int(bilateral_k)]
+        else:
+            k_grid = [int(k) for k in k_grid]
+        k_grid = [int(max(1, k)) for k in k_grid]
+        k_grid = sorted(set(k_grid))
+        k_max = int(max(k_grid))
+        k_query = int(min(k_max + 1, n_bins))  # +1 for self when possible
+
+        tree_bins = cKDTree(centers, balanced_tree=True, compact_nodes=True)
+        d_all, idx_all = tree_bins.query(centers, k=k_query, workers=neighbor_workers)
+        if k_query == 1:
+            d_all = d_all[:, None]
+            idx_all = idx_all[:, None]
+        d_all = d_all.astype(np.float32, copy=False)
+        idx_all = idx_all.astype(np.int32, copy=False)
+
+        # Determine whether the first neighbor is "self" (common for KDTree with k+1).
+        if idx_all.shape[1] >= 1:
+            is_self = (idx_all[:, 0] == np.arange(n_bins, dtype=idx_all.dtype))
+            includes_self = bool(is_self.mean() >= 0.9)
+        else:
+            includes_self = False
+        start_pos = 1 if includes_self and idx_all.shape[1] > 1 else 0
+
+        # Pre-generate a deterministic edge sample (src indices + uniform neighbor selector).
+        n_edges = int(max(1, score_sample_edges))
+        src = rng.integers(0, n_bins, size=n_edges, dtype=np.int32)
+        u = rng.random(size=n_edges).astype(np.float32, copy=False)
+
+        # Derive a data-adaptive default sigma_r grid from median neighbor diffs.
+        edge_sep = None
+        if bilateral_sigma_r_grid is None:
+            k_for_sigma = int(max(2, min(k_query, 16)))  # small-k is enough for stats
+            span = int(max(1, k_for_sigma - start_pos))
+            pos_sigma = start_pos + (u * span).astype(np.int32)
+            dst_sigma = idx_all[src, pos_sigma]
+            medians = []
+            seps = []
+            for j in range(E_bins.shape[1]):
+                d0 = np.abs(E_bins[src, j] - E_bins[dst_sigma, j])
+                medians.append(float(np.quantile(d0, 0.5)))
+                ql = float(np.quantile(d0, score_q_low))
+                qh = float(np.quantile(d0, score_q_high))
+                seps.append(qh / max(1e-12, ql))
+            sigma_base = float(np.median(medians)) if len(medians) else 0.1
+            sigma_base = float(np.clip(sigma_base, 1e-3, 2.0))
+            edge_sep = float(np.median(seps)) if len(seps) else None
+            # Higher sigma_r => weaker range penalty => stronger smoothing.
+            # Use a wide default grid so users don't have to hand-tune "strength".
+            mult = np.asarray(
+                [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0],
+                dtype=np.float32,
+            )
+            grid = (sigma_base * mult).tolist()
+            # Keep within typical [0,1] embedding range, but allow a bit above.
+            bilateral_sigma_r_grid = sorted(set(float(np.clip(x, 1e-3, 2.0)) for x in grid))
+        else:
+            bilateral_sigma_r_grid = sorted(set(float(x) for x in bilateral_sigma_r_grid))
+
+        if bilateral_t_grid is None:
+            # More steps => stronger smoothing. Use a wide default window.
+            bilateral_t_grid = [1, 2, 3, 4, 5, 6, 8, 10, 12]
+        bilateral_t_grid = sorted(set(int(max(1, t)) for t in bilateral_t_grid))
+
+        if selection_mode == "gain_then_edge" and select_gain_fraction_val is None:
+            # Auto tradeoff: if edges are strongly separated from flats (large edge_sep),
+            # allow more aggressive smoothing; otherwise be more conservative.
+            if edge_sep is None or not np.isfinite(edge_sep) or edge_sep <= 0:
+                select_gain_fraction_val = 0.8
+            else:
+                select_gain_fraction_val = float(np.clip(0.65 + 0.08 * np.log(edge_sep), 0.6, 0.9))
+            if verbose:
+                log.info("tune_smooth_image_params: auto select_gain_fraction=%.3g (edge_sep=%.3g).", select_gain_fraction_val, float(edge_sep) if edge_sep is not None else float("nan"))
+        elif selection_mode == "gain_then_edge":
+            # Default when user does not request auto.
+            if select_gain_fraction_val is None:
+                select_gain_fraction_val = 0.8
+
+        # Scoring helper: ratios on low/high-diff edges.
+        def _score_candidate(E0_bins: np.ndarray, E1_bins: np.ndarray, *, k_eff: int) -> dict:
+            k_eff = int(max(1, min(k_eff, idx_all.shape[1] - (0 if not includes_self else 0))))
+            span = int(max(1, min(k_eff + (1 if includes_self else 0), idx_all.shape[1]) - start_pos))
+            pos = start_pos + (u * span).astype(np.int32)
+            dst = idx_all[src, pos]
+
+            scores = []
+            ratio_low_all = []
+            ratio_high_all = []
+            ratio_all_all = []
+            w_edge_eff = float(score_w_edge)
+            w_all_eff = float(score_w_all)
+            for j in range(E0_bins.shape[1]):
+                d0 = np.abs(E0_bins[src, j] - E0_bins[dst, j])
+                d1 = np.abs(E1_bins[src, j] - E1_bins[dst, j])
+                thr_lo = float(np.quantile(d0, score_q_low))
+                thr_hi = float(np.quantile(d0, score_q_high))
+                low_mask = d0 <= thr_lo
+                high_mask = d0 >= thr_hi
+                d0_low = float(d0[low_mask].mean()) if bool(low_mask.any()) else float(d0.mean())
+                d1_low = float(d1[low_mask].mean()) if bool(low_mask.any()) else float(d1.mean())
+                d0_hi = float(d0[high_mask].mean()) if bool(high_mask.any()) else float(d0.mean())
+                d1_hi = float(d1[high_mask].mean()) if bool(high_mask.any()) else float(d1.mean())
+                d0_all = float(d0.mean())
+                d1_all = float(d1.mean())
+                eps = 1e-12
+                r_low = d1_low / max(eps, d0_low)
+                r_hi = d1_hi / max(eps, d0_hi)
+                r_all = d1_all / max(eps, d0_all)
+                score = (1.0 - r_low) - w_edge_eff * abs(float(np.log(max(eps, r_hi)))) - w_all_eff * abs(
+                    float(np.log(max(eps, r_all)))
+                )
+                scores.append(float(score))
+                ratio_low_all.append(float(r_low))
+                ratio_high_all.append(float(r_hi))
+                ratio_all_all.append(float(r_all))
+
+            return {
+                "score": float(np.mean(scores)) if len(scores) else float("nan"),
+                "ratio_low": float(np.mean(ratio_low_all)) if len(ratio_low_all) else float("nan"),
+                "ratio_high": float(np.mean(ratio_high_all)) if len(ratio_high_all) else float("nan"),
+                "ratio_all": float(np.mean(ratio_all_all)) if len(ratio_all_all) else float("nan"),
+            }
+
+        # Base precomputed dictionary for _process_dimension (bilateral only; graph already inside approx_info if needed).
+        precomputed = {}
+        if approx_info.get("graph") is not None:
+            precomputed["graph"] = approx_info["graph"]
+
+        results = []
+        for k_eff, sigma_r, t_eff in product(k_grid, bilateral_sigma_r_grid, bilateral_t_grid):
+            k_eff = int(max(1, min(int(k_eff), k_max)))
+            # Slice neighbors for bilateral (keep self if present).
+            k_slice = int(min(k_eff + (1 if includes_self else 0), idx_all.shape[1]))
+            d_bi = d_all[:, :k_slice]
+            idx_bi = idx_all[:, :k_slice]
+            if k_slice - start_pos > 1:
+                sigma_s = (np.median(d_bi[:, start_pos:], axis=1).astype(np.float32) + 1e-9).astype(np.float32)
+            else:
+                sigma_s = np.full(d_bi.shape[0], 1.0, dtype=np.float32)
+            precomputed["bilateral"] = {"dists": d_bi, "idx": idx_bi, "sigma_s": sigma_s}
+
+            # Apply smoothing on bins for each eval dim (sequential, to avoid process overhead).
+            E1_cols = []
+            for j in range(E_bins.shape[1]):
+                out_j = _process_dimension(
+                    E_bins[:, j].astype(np.float32, copy=False),
+                    methods,
+                    precomputed,
+                    knn_sigma,
+                    knn_chunk,
+                    float(sigma_r),
+                    int(t_eff),
+                    int(graph_t),
+                    graph_tol,
+                    int(graph_check_every),
+                    1,  # gaussian_t (unused unless 'gaussian' in methods)
+                    1.0,  # gaussian_sigma (unused unless 'gaussian' in methods)
+                    1e-3,  # guided_eps (unused unless 'guided' in methods)
+                    None,  # guided_sigma (unused unless 'guided' in methods)
+                    1,  # guided_t (unused unless 'guided' in methods)
+                    0.0,  # heat_time (unused unless 'heat' in methods)
+                    "krylov",  # heat_method (unused unless 'heat' in methods)
+                    1e-4,  # heat_tol (unused unless 'heat' in methods)
+                    0,  # heat_min_k (unused)
+                    None,  # heat_max_k (unused)
+                    rescale_mode,
+                    fast_float32,
+                ).astype(np.float32, copy=False)
+                # Match `smooth_image(rescale_mode='final')`: rescale after all methods.
+                if str(rescale_mode).strip().lower() == "final":
+                    mn = float(out_j.min())
+                    mx = float(out_j.max())
+                    denom = max(1e-12, mx - mn)
+                    out_j = (out_j - mn) / denom
+                E1_cols.append(out_j)
+            E1_bins = np.stack(E1_cols, axis=1).astype(np.float32, copy=False)
+
+            score = _score_candidate(E_bins, E1_bins, k_eff=k_eff)
+            cand_id = len(results)
+            results.append(
+                {
+                    "candidate_id": int(cand_id),
+                    "bilateral_k": int(k_eff),
+                    "bilateral_sigma_r": float(sigma_r),
+                    "bilateral_t": int(t_eff),
+                    **score,
+                }
+            )
+
+        df = pd.DataFrame(results)
+        if df.shape[0] == 0:
+            raise RuntimeError("No candidates evaluated.")
+        df["smooth_gain"] = 1.0 - df["ratio_low"]
+        df["edge_preserve"] = df["ratio_high"]
+        df["tradeoff_product"] = df["smooth_gain"] * df["edge_preserve"]
+
+        # Select "best" without requiring a manual strength knob.
+        if selection_mode == "score":
+            best_id = int(df.sort_values(["score"], ascending=False, kind="mergesort").iloc[0]["candidate_id"])
+        elif selection_mode == "product":
+            best_id = int(
+                df.sort_values(["tradeoff_product"], ascending=False, kind="mergesort").iloc[0]["candidate_id"]
+            )
+        elif selection_mode == "max_gain":
+            keep = np.ones(df.shape[0], dtype=bool)
+            if min_edge_val is not None:
+                keep = keep & (df["edge_preserve"] >= min_edge_val)
+            kept = df[keep]
+            if kept.shape[0] == 0:
+                # Fallback to product objective if constraint is too strict.
+                best_id = int(
+                    df.sort_values(["tradeoff_product"], ascending=False, kind="mergesort").iloc[0]["candidate_id"]
+                )
+            else:
+                best_id = int(
+                    kept.sort_values(["smooth_gain", "edge_preserve", "score"], ascending=[False, False, False], kind="mergesort")
+                    .iloc[0]["candidate_id"]
+                )
+        else:
+            # gain_then_edge:
+            # 1) keep candidates with at least a fraction of the best smoothing gain
+            # 2) among them, choose the one with best edge preservation
+            max_gain = float(df["smooth_gain"].max())
+            gain_thr = select_gain_fraction_val * max_gain
+            keep = df["smooth_gain"] >= gain_thr
+            if min_edge_val is not None:
+                keep = keep & (df["edge_preserve"] >= min_edge_val)
+            kept = df[keep]
+            if kept.shape[0] == 0:
+                # Fallback to product objective (reasonable balance).
+                best_id = int(
+                    df.sort_values(["tradeoff_product"], ascending=False, kind="mergesort").iloc[0]["candidate_id"]
+                )
+            else:
+                kept = kept.sort_values(
+                    ["edge_preserve", "smooth_gain", "score"],
+                    ascending=[False, False, False],
+                    kind="mergesort",
+                )
+                best_id = int(kept.iloc[0]["candidate_id"])
+
+        df["is_best"] = df["candidate_id"] == int(best_id)
+        # Present best first, then by balanced tradeoff.
+        df = df.sort_values(["is_best", "tradeoff_product"], ascending=[False, False], kind="mergesort").reset_index(drop=True)
+
+        best_row = df.iloc[0].to_dict()
+        best = {
+            "methods": list(methods),
+            "embedding": embedding,
+            "bilateral_k": int(best_row["bilateral_k"]),
+            "bilateral_sigma_r": float(best_row["bilateral_sigma_r"]),
+            "bilateral_t": int(best_row["bilateral_t"]),
+            "rescale_mode": str(rescale_mode),
+        }
+        # Preserve user intent: if they passed embedding_dims, keep it; otherwise let
+        # smooth_image default to "all dims".
+        if embedding_dims is not None:
+            best["embedding_dims"] = list(embedding_dims)
+        if isinstance(obs_mask, (str, bytes)):
+            best["obs_mask"] = str(obs_mask)
+
+        if verbose:
+            log.info(
+                "tune_smooth_image_params: best k=%d, sigma_r=%.4g, t=%d | gain=%.3g edge=%.3g | selection=%s on %d bins, dims=%s",
+                best["bilateral_k"],
+                best["bilateral_sigma_r"],
+                best["bilateral_t"],
+                float(best_row.get("smooth_gain", float("nan"))),
+                float(best_row.get("edge_preserve", float("nan"))),
+                selection_mode,
+                n_bins,
+                dims_eval,
+            )
+
+        return {
+            "best": best,
+            "candidates": df,
+            "dims_eval": dims_eval,
+            "approx": {
+                "n_bins": int(n_bins),
+                "bin_size": float(approx_info.get("bin_size")),
+            },
+        }
+    finally:
+        if not verbose:
+            log.setLevel(prev_level)

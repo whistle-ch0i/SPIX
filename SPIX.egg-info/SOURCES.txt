@@ -10,7 +10,9 @@ SPIX/analysis/__init__.py
 SPIX/analysis/calculate_original_moranI.py
 SPIX/analysis/enrichment_analysis.py
 SPIX/analysis/gene_expression_embedding.py
+SPIX/analysis/multiscale_moran_ranks.py
 SPIX/analysis/perform_pseudo_bulk_analysis.py
+SPIX/analysis/segment_svg_enrichment.py
 SPIX/image_processing/__init__.py
 SPIX/image_processing/equalization.py
 SPIX/image_processing/image_cache.py
@@ -35,4 +37,5 @@ SPIX/utils/__init__.py
 SPIX/utils/utils.py
 SPIX/visualization/__init__.py
 SPIX/visualization/plotting.py
+SPIX/visualization/raster.py
 benchmarks/visiumhd_segment_benchmark.py
