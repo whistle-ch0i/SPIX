@@ -349,20 +349,34 @@ def image_plot(
         raise ValueError(f"'{embedding}' embedding does not exist in adata.obsm.")
 
     # Extract spatial coordinates
-    if origin:
-        tiles = adata.uns["tiles"][adata.uns["tiles"]["origin"] == 1]
+    tiles_all = adata.uns["tiles"]
+    if origin and ("origin" in tiles_all.columns):
+        origin_mask = pd.to_numeric(tiles_all["origin"], errors="coerce").fillna(0) == 1
+        tiles = tiles_all[origin_mask]
     else:
-        tiles = adata.uns["tiles"]
-    # Guard against duplicated barcodes in adata.uns['tiles'] (can cause apparent overlaps).
+        tiles = tiles_all
+    # Guard against duplicated barcodes in adata.uns['tiles'].
+    # NOTE: When `origin=False`, duplicates are often expected because each barcode can
+    # expand to multiple raster points (origin==0 + origin==1). In that case, we must
+    # keep duplicates; otherwise `origin` appears to have no effect.
     if "barcode" in tiles.columns:
         tiles = tiles.copy()
         tiles["barcode"] = tiles["barcode"].astype(str)
         if tiles["barcode"].duplicated().any():
-            if verbose:
-                logger.warning(
-                    "adata.uns['tiles'] contains duplicated barcodes; keeping first occurrence for plotting."
-                )
-            tiles = tiles.drop_duplicates("barcode", keep="first")
+            origin_vals = pd.to_numeric(tiles.get("origin", 1), errors="coerce").fillna(1)
+            has_non_origin = (origin_vals != 1).any()
+            keep_dups = (not origin) and has_non_origin
+            if keep_dups:
+                if verbose:
+                    logger.info(
+                        "adata.uns['tiles'] contains duplicated barcodes (expected for origin=False raster tiles); keeping duplicates."
+                    )
+            else:
+                if verbose:
+                    logger.warning(
+                        "adata.uns['tiles'] contains duplicated barcodes; keeping first occurrence for plotting."
+                    )
+                tiles = tiles.drop_duplicates("barcode", keep="first")
 
     # Prepare tile colors and merge with coordinates
     embedding_dims = np.array(adata.obsm[embedding])[:, dimensions]
@@ -657,6 +671,20 @@ def image_plot(
     s_data_units_for_imshow = None
 
     if use_imshow:
+        # For raster-expanded tiles (origin=False with non-origin points present),
+        # the number of points can be orders of magnitude larger than the number of
+        # underlying barcodes. Use the barcode count for density-based tile-size
+        # capping and auto canvas sizing, otherwise the pitch gets capped too small
+        # and leaves "holes" in the filled tiles.
+        n_points_eff = int(coordinates.shape[0])
+        try:
+            if (not origin) and ("origin" in coordinates.columns) and ("barcode" in coordinates.columns):
+                origin_vals_eff = pd.to_numeric(coordinates["origin"], errors="coerce").fillna(1)
+                if (origin_vals_eff != 1).any():
+                    n_points_eff = int(coordinates["barcode"].nunique())
+        except Exception:
+            pass
+
         pts = coordinates[["x", "y"]].values
         pts_for_imshow = pts
         imshow_tile_size_shrink_eff = 1.0 if pixel_perfect else float(imshow_tile_size_shrink)
@@ -678,7 +706,7 @@ def image_plot(
             s_data_units=float(s_data_units0),
             x_range=float(max(1.0, x_max - x_min)),
             y_range=float(max(1.0, y_max - y_min)),
-            n_points=int(coordinates.shape[0]),
+            n_points=int(n_points_eff),
             logger=logger,
             context="image_plot(auto-size)",
         )
@@ -699,7 +727,7 @@ def image_plot(
             y_range=float(y_range_eff0),
             s_data_units=float(s_data_units0),
             pixel_perfect=bool(pixel_perfect),
-            n_points=int(coordinates.shape[0]),
+            n_points=int(n_points_eff),
             logger=logger,
         )
 
@@ -776,7 +804,7 @@ def image_plot(
                     ),
                     x_range=float(max(1.0, x_max - x_min)),
                     y_range=float(max(1.0, y_max - y_min)),
-                    n_points=int(len(pts)),
+                    n_points=int(n_points_eff),
                     logger=logger,
                     context="image_plot",
                 )
@@ -1773,20 +1801,34 @@ def image_plot_with_spatial_image(
     )
 
     # Extract spatial coordinates
-    if origin:
-        tiles = adata.uns["tiles"][adata.uns["tiles"]["origin"] == 1]
+    tiles_all = adata.uns["tiles"]
+    if origin and ("origin" in tiles_all.columns):
+        origin_mask = pd.to_numeric(tiles_all["origin"], errors="coerce").fillna(0) == 1
+        tiles = tiles_all[origin_mask]
     else:
-        tiles = adata.uns["tiles"]
-    # Guard against duplicated barcodes in adata.uns['tiles'] (can cause apparent overlaps).
+        tiles = tiles_all
+    # Guard against duplicated barcodes in adata.uns['tiles'].
+    # NOTE: When `origin=False`, duplicates are often expected because each barcode can
+    # expand to multiple raster points (origin==0 + origin==1). In that case, we must
+    # keep duplicates; otherwise `origin` appears to have no effect.
     if "barcode" in tiles.columns:
         tiles = tiles.copy()
         tiles["barcode"] = tiles["barcode"].astype(str)
         if tiles["barcode"].duplicated().any():
-            if verbose:
-                logger.warning(
-                    "adata.uns['tiles'] contains duplicated barcodes; keeping first occurrence for plotting."
-                )
-            tiles = tiles.drop_duplicates("barcode", keep="first")
+            origin_vals = pd.to_numeric(tiles.get("origin", 1), errors="coerce").fillna(1)
+            has_non_origin = (origin_vals != 1).any()
+            keep_dups = (not origin) and has_non_origin
+            if keep_dups:
+                if verbose:
+                    logger.info(
+                        "adata.uns['tiles'] contains duplicated barcodes (expected for origin=False raster tiles); keeping duplicates."
+                    )
+            else:
+                if verbose:
+                    logger.warning(
+                        "adata.uns['tiles'] contains duplicated barcodes; keeping first occurrence for plotting."
+                    )
+                tiles = tiles.drop_duplicates("barcode", keep="first")
 
     # Prepare tile colors and merge with coordinates
     embedding_dims = np.array(adata.obsm[embedding])[:, dimensions]
@@ -2026,6 +2068,16 @@ def image_plot_with_spatial_image(
     s_data_units_for_imshow = None
 
     if use_imshow:
+        # Same logic as image_plot(): use barcode count for raster-expanded tiles.
+        n_points_eff = int(coordinates.shape[0])
+        try:
+            if (not origin) and ("origin" in coordinates.columns) and ("barcode" in coordinates.columns):
+                origin_vals_eff = pd.to_numeric(coordinates["origin"], errors="coerce").fillna(1)
+                if (origin_vals_eff != 1).any():
+                    n_points_eff = int(coordinates["barcode"].nunique())
+        except Exception:
+            pass
+
         pts = coordinates[["x", "y"]].values
         pts_for_imshow = pts
         imshow_tile_size_shrink_eff = 1.0 if pixel_perfect else float(imshow_tile_size_shrink)
@@ -2045,7 +2097,7 @@ def image_plot_with_spatial_image(
             s_data_units=float(s_data_units0),
             x_range=float(max(1.0, x_max - x_min)),
             y_range=float(max(1.0, y_max - y_min)),
-            n_points=int(coordinates.shape[0]),
+            n_points=int(n_points_eff),
             logger=logger,
             context="image_plot_with_spatial_image(auto-size)",
         )
@@ -2066,7 +2118,7 @@ def image_plot_with_spatial_image(
             y_range=float(y_range_eff0),
             s_data_units=float(s_data_units0),
             pixel_perfect=bool(pixel_perfect),
-            n_points=int(coordinates.shape[0]),
+            n_points=int(n_points_eff),
             logger=logger,
         )
 
@@ -2168,7 +2220,7 @@ def image_plot_with_spatial_image(
                     ),
                     x_range=float(max(1.0, x_max - x_min)),
                     y_range=float(max(1.0, y_max - y_min)),
-                    n_points=int(len(pts)),
+                    n_points=int(n_points_eff),
                     logger=logger,
                     context="image_plot_with_spatial_image",
                 )

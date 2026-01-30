@@ -142,6 +142,7 @@ def _rasterise_chunk(
     for region, point, idx in chunk_args:
         # exactly the same per‐tile logic as before
         try:
+            barcode = idx
             verts = _GLOBAL_VOR.vertices[region]
             poly = Polygon(verts)
             if _GLOBAL_BOUNDARY is not None:
@@ -174,16 +175,18 @@ def _rasterise_chunk(
                     rng = _GLOBAL_RASTER_RNG or np.random.default_rng()
                     keep_n = max(1, int(np.floor(_GLOBAL_RASTER_SAMPLE_FRAC * pixels.shape[0])))
                     if keep_n < pixels.shape[0]:
-                        idx = rng.choice(pixels.shape[0], size=keep_n, replace=False)
-                        pixels = pixels[idx]
+                        sample_idx = rng.choice(pixels.shape[0], size=keep_n, replace=False)
+                        pixels = pixels[sample_idx]
                 except Exception:
                     pass
 
             if _GLOBAL_RASTER_MAX_PER_TILE is not None and pixels.shape[0] > _GLOBAL_RASTER_MAX_PER_TILE:
                 try:
                     rng = _GLOBAL_RASTER_RNG or np.random.default_rng()
-                    idx = rng.choice(pixels.shape[0], size=_GLOBAL_RASTER_MAX_PER_TILE, replace=False)
-                    pixels = pixels[idx]
+                    sample_idx = rng.choice(
+                        pixels.shape[0], size=_GLOBAL_RASTER_MAX_PER_TILE, replace=False
+                    )
+                    pixels = pixels[sample_idx]
                 except Exception:
                     pixels = pixels[:_GLOBAL_RASTER_MAX_PER_TILE]
 
@@ -193,7 +196,7 @@ def _rasterise_chunk(
                 {
                     "x": pixels[:, 0],
                     "y": pixels[:, 1],
-                    "barcode": str(idx),
+                    "barcode": str(barcode),
                     "origin": origin_flags,
                 }
             )
@@ -203,7 +206,12 @@ def _rasterise_chunk(
                     [
                         df,
                         pd.DataFrame(
-                            {"x": [ox], "y": [oy], "barcode": [str(idx)], "origin": [1]}
+                            {
+                                "x": [ox],
+                                "y": [oy],
+                                "barcode": [str(barcode)],
+                                "origin": [1],
+                            }
                         ),
                     ],
                     ignore_index=True,
