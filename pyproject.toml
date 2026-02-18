@@ -34,7 +34,11 @@ dependencies = [
     "shapely",
     "tqdm",
     "alphashape",
-    "igraph",
+    "igraph"
+]
+
+[project.optional-dependencies]
+harmony = [
     "harmonypy"
 ]
 
@@ -47,4 +51,3 @@ packages = { find = { where = ["."] } }
 [tool.black]
 line-length = 88
 target-version = ['py38']
-
