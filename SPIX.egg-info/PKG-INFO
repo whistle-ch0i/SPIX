@@ -6,6 +6,7 @@ Author-email: Your Name <your.email@example.com>, Patrick CN Martin <patrick.mar
 License: MIT
 Requires-Python: >=3.8
 Description-Content-Type: text/markdown
+Requires-Dist: setuptools<81
 Requires-Dist: numpy
 Requires-Dist: scipy
 Requires-Dist: matplotlib
@@ -27,7 +28,8 @@ Requires-Dist: shapely
 Requires-Dist: tqdm
 Requires-Dist: alphashape
 Requires-Dist: igraph
-Requires-Dist: harmonypy
+Provides-Extra: harmony
+Requires-Dist: harmonypy; extra == "harmony"
 
 # Vesalius_SuperPixel_Python
 

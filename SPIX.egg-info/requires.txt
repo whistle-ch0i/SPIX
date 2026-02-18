@@ -1,3 +1,4 @@
+setuptools<81
 numpy
 scipy
 matplotlib
@@ -19,4 +20,6 @@ shapely
 tqdm
 alphashape
 igraph
+
+[harmony]
 harmonypy
