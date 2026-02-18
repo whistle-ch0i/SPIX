@@ -46,6 +46,12 @@ def _limit_blas_openmp(threads: Optional[int]):
         # If threadpoolctl is missing or does not support user_api, do nothing
         yield
 
+
+def _coerce_string_indices_inplace(adata: AnnData) -> None:
+    """Normalize obs/var names to plain string Index to avoid CategoricalIndex issues."""
+    adata.obs_names = pd.Index(adata.obs_names.astype(str))
+    adata.var_names = pd.Index(adata.var_names.astype(str))
+
 from .tiles import generate_tiles
 from ..utils.utils import _process_in_parallel_map, calculate_pca_loadings, run_lsi, smooth_polygon
 
@@ -204,6 +210,7 @@ def generate_embeddings(
           and utilize cores efficiently.
 
     """
+    _coerce_string_indices_inplace(adata)
     if verbose:
         logging.info("Starting generate_embeddings...")
 
@@ -339,6 +346,7 @@ def process_counts(
     AnnData
         The processed AnnData object.
     """
+    _coerce_string_indices_inplace(adata)
     if verbose:
         logging.info(f"Processing counts with method: {method}")
 
@@ -357,16 +365,16 @@ def process_counts(
 
         X = counts.copy() if hasattr(counts, "copy") else counts
         adata_proc = AnnData(X=X, obs=adata.obs.copy(), var=var_df)
-        adata_proc.obs_names = adata.obs_names.copy()
-        adata_proc.var_names = var_names
+        adata_proc.obs_names = pd.Index(adata.obs_names.astype(str))
+        adata_proc.var_names = pd.Index(var_names.astype(str))
     else:
         if use_counts not in adata.layers:
             raise ValueError(f"Layer '{use_counts}' not found in adata.layers.")
         counts = adata.layers[use_counts]
         X = counts.copy() if hasattr(counts, "copy") else counts
         adata_proc = AnnData(X=X, obs=adata.obs.copy(), var=adata.var.copy())
-        adata_proc.obs_names = adata.obs_names.copy()
-        adata_proc.var_names = adata.var_names.copy()
+        adata_proc.obs_names = pd.Index(adata.obs_names.astype(str))
+        adata_proc.var_names = pd.Index(adata.var_names.astype(str))
 
     # Apply normalization and feature selection
     if method == 'log_norm':

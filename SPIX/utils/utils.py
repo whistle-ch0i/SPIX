@@ -142,7 +142,6 @@ def _rasterise_chunk(
     for region, point, idx in chunk_args:
         # exactly the same per‐tile logic as before
         try:
-            barcode = idx
             verts = _GLOBAL_VOR.vertices[region]
             poly = Polygon(verts)
             if _GLOBAL_BOUNDARY is not None:
@@ -175,18 +174,16 @@ def _rasterise_chunk(
                     rng = _GLOBAL_RASTER_RNG or np.random.default_rng()
                     keep_n = max(1, int(np.floor(_GLOBAL_RASTER_SAMPLE_FRAC * pixels.shape[0])))
                     if keep_n < pixels.shape[0]:
-                        sample_idx = rng.choice(pixels.shape[0], size=keep_n, replace=False)
-                        pixels = pixels[sample_idx]
+                        idx = rng.choice(pixels.shape[0], size=keep_n, replace=False)
+                        pixels = pixels[idx]
                 except Exception:
                     pass
 
             if _GLOBAL_RASTER_MAX_PER_TILE is not None and pixels.shape[0] > _GLOBAL_RASTER_MAX_PER_TILE:
                 try:
                     rng = _GLOBAL_RASTER_RNG or np.random.default_rng()
-                    sample_idx = rng.choice(
-                        pixels.shape[0], size=_GLOBAL_RASTER_MAX_PER_TILE, replace=False
-                    )
-                    pixels = pixels[sample_idx]
+                    idx = rng.choice(pixels.shape[0], size=_GLOBAL_RASTER_MAX_PER_TILE, replace=False)
+                    pixels = pixels[idx]
                 except Exception:
                     pixels = pixels[:_GLOBAL_RASTER_MAX_PER_TILE]
 
@@ -196,7 +193,7 @@ def _rasterise_chunk(
                 {
                     "x": pixels[:, 0],
                     "y": pixels[:, 1],
-                    "barcode": str(barcode),
+                    "barcode": str(idx),
                     "origin": origin_flags,
                 }
             )
@@ -206,12 +203,7 @@ def _rasterise_chunk(
                     [
                         df,
                         pd.DataFrame(
-                            {
-                                "x": [ox],
-                                "y": [oy],
-                                "barcode": [str(barcode)],
-                                "origin": [1],
-                            }
+                            {"x": [ox], "y": [oy], "barcode": [str(idx)], "origin": [1]}
                         ),
                     ],
                     ignore_index=True,
@@ -647,7 +639,7 @@ def run_lsi(adata: AnnData, n_components: int = 30, remove_first: bool = True) -
     return embeddings
 
 
-def rebalance_colors(coordinates, dimensions, method="minmax"):
+def rebalance_colors(coordinates, dimensions, method="minmax", vmin=None, vmax=None):
     """
     Rebalance color values based on the given method.
 
@@ -659,17 +651,35 @@ def rebalance_colors(coordinates, dimensions, method="minmax"):
         List of dimensions to consider (1D or 3D).
     method : str
         Method for rebalancing ('minmax' is default).
+    vmin, vmax : float or array-like, optional
+        If provided, apply a fixed min/max scaling instead of computing min/max
+        from the passed-in (possibly cropped) coordinates. For 3D, these can be
+        length-3 arrays for per-channel scaling.
 
     Returns
     -------
     pd.DataFrame
         DataFrame with rebalanced colors.
     """
+    def _fixed_scale(arr: np.ndarray, vmin_, vmax_) -> np.ndarray:
+        arr = arr.astype(float, copy=False)
+        if vmin_ is None:
+            vmin_ = np.nanmin(arr, axis=0)
+        if vmax_ is None:
+            vmax_ = np.nanmax(arr, axis=0)
+        vmin_arr = np.asarray(vmin_, dtype=float)
+        vmax_arr = np.asarray(vmax_, dtype=float)
+        denom = (vmax_arr - vmin_arr) + 1e-10
+        scaled = (arr - vmin_arr) / denom
+        return np.clip(scaled, 0.0, 1.0)
+
     if len(dimensions) == 3:
         template = coordinates.loc[:, ["barcode", "x", "y", "origin"]].copy()
         colors = coordinates.iloc[:, [4, 5, 6]].values
 
-        if method == "minmax":
+        if (vmin is not None) or (vmax is not None):
+            colors = _fixed_scale(colors, vmin, vmax)
+        elif method == "minmax":
             colors = np.apply_along_axis(min_max, 0, colors)
         else:
             colors = np.clip(colors, 0, 1)
@@ -680,7 +690,9 @@ def rebalance_colors(coordinates, dimensions, method="minmax"):
         template = coordinates.loc[:, ["barcode", "x", "y", "origin"]].copy()
         colors = coordinates.iloc[:, 4].values
 
-        if method == "minmax":
+        if (vmin is not None) or (vmax is not None):
+            colors = _fixed_scale(np.asarray(colors), vmin, vmax).astype(float)
+        elif method == "minmax":
             colors = min_max(colors)
         else:
             colors = np.clip(colors, 0, 1)

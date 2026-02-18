@@ -370,6 +370,9 @@ def perform_pseudo_bulk_analysis(
         obs=pd.DataFrame(index=pseudo_bulk_coords.index), # Start with empty obs, index is the segment names
         var=pd.DataFrame(index=adata.var.index) # Keep original var index
     )
+    # Normalize index dtypes early to avoid downstream CategoricalIndex-related issues.
+    new_adata.obs_names = pd.Index(new_adata.obs_names.astype(str))
+    new_adata.var_names = pd.Index(new_adata.var_names.astype(str))
     # Add spatial coordinates to obsm
     new_adata.obsm['spatial'] = pseudo_bulk_coords.values
     _logger.info("New AnnData object initialized with spatial coordinates.")

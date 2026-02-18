@@ -271,7 +271,7 @@ def cache_embedding_image(
     if store_barcodes not in {"auto", "always", "never"}:
         raise ValueError("store_barcodes must be one of {'auto','always','never'}.")
 
-    # Align tiles (coords) to obs order without a full pandas merge
+    # Align tiles to obs index. Keep raster duplicates when origin=False.
     tiles_df = adata.uns["tiles"]
     tiles = tiles_df[tiles_df.get("origin", 1) == 1] if origin else tiles_df
     if "barcode" not in tiles.columns:
@@ -279,21 +279,40 @@ def cache_embedding_image(
     if "x" not in tiles.columns or "y" not in tiles.columns:
         raise ValueError("adata.uns['tiles'] must contain 'x' and 'y' columns.")
 
-    obs_barcodes = adata.obs.index.astype(str)
+    obs_index = pd.Index(adata.obs.index.astype(str))
     tiles_idx = tiles.copy()
     tiles_idx["barcode"] = tiles_idx["barcode"].astype(str)
     if tiles_idx["barcode"].duplicated().any():
-        # Typical only when origin=False; keep first occurrence for caching.
-        tiles_idx = tiles_idx.drop_duplicates("barcode", keep="first")
-    tiles_aligned = tiles_idx.set_index("barcode").reindex(pd.Index(obs_barcodes))
-    xy = tiles_aligned[["x", "y"]]
-    valid_mask = (~xy.isna().any(axis=1)).to_numpy()
-    if not valid_mask.any():
-        raise ValueError("No coordinates found after aligning tiles to embeddings.")
+        origin_vals = pd.to_numeric(tiles_idx.get("origin", 1), errors="coerce").fillna(1)
+        has_non_origin = (origin_vals != 1).any()
+        keep_dups = (not origin) and has_non_origin
+        if keep_dups:
+            if verbose:
+                print(
+                    "[cache_embedding_image] Duplicated barcodes detected (origin=False raster tiles); keeping duplicates."
+                )
+        else:
+            if verbose:
+                print(
+                    "[cache_embedding_image] Duplicated barcodes detected; keeping first occurrence for caching."
+                )
+            tiles_idx = tiles_idx.drop_duplicates("barcode", keep="first")
+
+    tile_barcodes = tiles_idx["barcode"].to_numpy()
+    tile_obs_indices = obs_index.get_indexer(tile_barcodes)
+    xy = tiles_idx[["x", "y"]]
+    valid_mask = (tile_obs_indices >= 0) & (~xy.isna().any(axis=1)).to_numpy()
+    if not np.any(valid_mask):
+        raise ValueError("No coordinates found after aligning tiles to adata.obs.")
     if verbose:
         missing = int((~valid_mask).sum())
         if missing:
-            print(f"[cache_embedding_image] Dropping {missing} observations with missing coordinates.")
+            print(f"[cache_embedding_image] Dropping {missing} tiles with missing coordinates or unmatched barcodes.")
+
+    tile_obs_indices = tile_obs_indices[valid_mask].astype(np.int64, copy=False)
+    tile_barcodes = tile_barcodes[valid_mask]
+    spatial_coords = xy.to_numpy(dtype=float)[valid_mask]
+    origin_flags = pd.to_numeric(tiles_idx.get("origin", 1), errors="coerce").fillna(1).to_numpy()[valid_mask]
 
     coord_mode = str(coordinate_mode or "spatial").lower()
     if coord_mode not in {"spatial", "array", "visium", "visiumhd", "auto"}:
@@ -310,18 +329,23 @@ def cache_embedding_image(
             )
         col = pd.to_numeric(adata.obs[array_col_key], errors="coerce").to_numpy(dtype=float)
         row = pd.to_numeric(adata.obs[array_row_key], errors="coerce").to_numpy(dtype=float)
-        coord_mask = valid_mask & (~np.isnan(col)) & (~np.isnan(row))
+        col_tile = col[tile_obs_indices]
+        row_tile = row[tile_obs_indices]
+        coord_mask = (~np.isnan(col_tile)) & (~np.isnan(row_tile))
+        if verbose:
+            missing_array = int((~coord_mask).sum())
+            if missing_array:
+                print(f"[cache_embedding_image] Dropping {missing_array} tiles missing array coordinates.")
         if coord_mode == "visium":
-            parity = (row.astype(np.int64, copy=False) % 2).astype(np.float64)
-            x = col.astype(np.float64, copy=False) + 0.5 * parity
-            y = row.astype(np.float64, copy=False) * (np.sqrt(3.0) / 2.0)
+            parity = (row_tile.astype(np.int64, copy=False) % 2).astype(np.float64)
+            x = col_tile.astype(np.float64, copy=False) + 0.5 * parity
+            y = row_tile.astype(np.float64, copy=False) * (np.sqrt(3.0) / 2.0)
             spatial_coords = np.column_stack([x, y])[coord_mask]
         else:
-            spatial_coords = np.column_stack([col, row])[coord_mask]
-        valid_mask = coord_mask
-    else:
-        spatial_coords = xy.to_numpy(dtype=float)[valid_mask]
-    origin_flags = tiles_aligned.get("origin", pd.Series(index=tiles_aligned.index, data=1)).to_numpy()[valid_mask]
+            spatial_coords = np.column_stack([col_tile, row_tile])[coord_mask]
+        tile_obs_indices = tile_obs_indices[coord_mask]
+        tile_barcodes = tile_barcodes[coord_mask]
+        origin_flags = origin_flags[coord_mask]
 
     # Select embedding channels (support embeddings that already contain only these dims)
     E_full = np.asarray(adata.obsm[embedding])
@@ -333,10 +357,8 @@ def cache_embedding_image(
         emb = E_full
     else:
         emb = E_full[:, dimensions]
-    embeddings = emb[valid_mask]
-    # Tile->obs mapping is trivial now (tile order == obs order subset)
-    tile_obs_indices = np.flatnonzero(valid_mask).astype(np.int64)
-    barcodes = obs_barcodes.to_numpy()[valid_mask]
+    embeddings = emb[tile_obs_indices]
+    barcodes = tile_barcodes
     dim_cols = [f"dim{i}" for i, _ in enumerate(range(embeddings.shape[1]))]
 
     segment_series = None
@@ -357,7 +379,7 @@ def cache_embedding_image(
 
     if segment_available and seg_col is not None:
         segment_series = adata.obs[seg_col]
-        seg_vals = segment_series.to_numpy()[valid_mask]
+        seg_vals = segment_series.to_numpy()[tile_obs_indices]
         seg_missing = pd.isna(seg_vals)
         if seg_missing.any():
             missing = int(seg_missing.sum())
@@ -375,6 +397,16 @@ def cache_embedding_image(
         seg_col = None
 
     # Geometry and pixel scaling
+    # Match image_plot behavior for origin=False raster-expanded tiles:
+    # use one point per barcode for density-based tile-size capping, otherwise
+    # the cap can become too small and produce visible holes.
+    n_points_eff = int(spatial_coords.shape[0])
+    try:
+        if (not origin) and np.asarray(origin_flags).size > 0 and (np.asarray(origin_flags) != 1).any():
+            n_points_eff = int(pd.Index(np.asarray(barcodes, dtype=str)).nunique())
+    except Exception:
+        n_points_eff = int(spatial_coords.shape[0])
+
     x_min, x_max = spatial_coords[:, 0].min(), spatial_coords[:, 0].max()
     y_min, y_max = spatial_coords[:, 1].min(), spatial_coords[:, 1].max()
 
@@ -399,7 +431,7 @@ def cache_embedding_image(
         s_data_units=float(s_data_units),
         x_range=float(max(1.0, x_max - x_min)),
         y_range=float(max(1.0, y_max - y_min)),
-        n_points=int(spatial_coords.shape[0]),
+        n_points=int(n_points_eff),
         logger=None,
         context="cache_embedding_image",
     )
@@ -422,7 +454,7 @@ def cache_embedding_image(
         y_range=float(y_range_eff),
         s_data_units=float(s_data_units),
         pixel_perfect=bool(pixel_perfect),
-        n_points=int(spatial_coords.shape[0]),
+        n_points=int(n_points_eff),
         logger=None,
     )
     if figsize is None:
@@ -922,6 +954,15 @@ def _cache_embedding_image_legacy(
     embeddings = coordinates_df[dim_cols].to_numpy(dtype=float)
 
     # Geometry and pixel scaling
+    n_points_eff = int(spatial_coords.shape[0])
+    try:
+        if (not origin) and ("origin" in coordinates_df.columns):
+            origin_vals = pd.to_numeric(coordinates_df["origin"], errors="coerce").fillna(1).to_numpy()
+            if (origin_vals != 1).any():
+                n_points_eff = int(coordinates_df["barcode"].astype(str).nunique())
+    except Exception:
+        n_points_eff = int(spatial_coords.shape[0])
+
     x_min, x_max = spatial_coords[:, 0].min(), spatial_coords[:, 0].max()
     y_min, y_max = spatial_coords[:, 1].min(), spatial_coords[:, 1].max()
 
@@ -946,7 +987,7 @@ def _cache_embedding_image_legacy(
         s_data_units=float(s_data_units),
         x_range=float(max(1.0, x_max - x_min)),
         y_range=float(max(1.0, y_max - y_min)),
-        n_points=int(spatial_coords.shape[0]),
+        n_points=int(n_points_eff),
         logger=None,
         context="cache_embedding_image(legacy)",
     )
@@ -968,7 +1009,7 @@ def _cache_embedding_image_legacy(
         y_range=float(y_range),
         s_data_units=float(s_data_units),
         pixel_perfect=bool(pixel_perfect),
-        n_points=int(spatial_coords.shape[0]),
+        n_points=int(n_points_eff),
         logger=None,
     )
     if figsize is None:

@@ -43,33 +43,53 @@ def _aggregate_labels_majority(
 
     out_rows = []
     for bc, sub in df.groupby("barcode", sort=False):
-        counts = sub["Segment"].value_counts()
-        max_count = counts.max()
-        candidates = counts[counts == max_count].index.to_list()
-        if len(candidates) == 1:
-            chosen = candidates[0]
-        else:
-            # Prefer the label that appears most often among origin==1 tiles
-            sub_origin = sub[sub["_origin"] == 1]
-            if len(sub_origin) > 0:
-                origin_counts = sub_origin["Segment"].value_counts()
-                best_origin = None
-                best_origin_count = -1
-                for c in candidates:
-                    cnt = int(origin_counts.get(c, 0))
-                    if cnt > best_origin_count:
-                        best_origin = c
-                        best_origin_count = cnt
-                tie_after_origin = [c for c in candidates if int(origin_counts.get(c, 0)) == best_origin_count]
-                if len(tie_after_origin) == 1:
-                    chosen = tie_after_origin[0]
-                else:
-                    # Final deterministic fallback
-                    chosen = sorted(tie_after_origin)[0]
-            else:
-                chosen = sorted(candidates)[0]
-        out_rows.append((bc, chosen))
+        out_rows.append((bc, _choose_majority_label(sub)))
     return pd.DataFrame(out_rows, columns=["barcode", "Segment"])
+
+
+def _choose_majority_label(sub: pd.DataFrame):
+    """Choose one label with deterministic tie-breaks for a grouped tile subset."""
+    counts = sub["Segment"].value_counts()
+    max_count = counts.max()
+    candidates = counts[counts == max_count].index.to_list()
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # Prefer the label that appears most often among origin==1 tiles.
+    sub_origin = sub[sub["_origin"] == 1]
+    if len(sub_origin) > 0:
+        origin_counts = sub_origin["Segment"].value_counts()
+        best_origin_count = max(int(origin_counts.get(c, 0)) for c in candidates)
+        tie_after_origin = [c for c in candidates if int(origin_counts.get(c, 0)) == best_origin_count]
+        if len(tie_after_origin) == 1:
+            return tie_after_origin[0]
+        return sorted(tie_after_origin)[0]
+
+    # Final deterministic fallback.
+    return sorted(candidates)[0]
+
+
+def _aggregate_labels_majority_by_obs_index(
+    obs_indices: np.ndarray | pd.Series | list,
+    labels: np.ndarray,
+    origin_flags: np.ndarray | pd.Series | list | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Aggregate tile-level labels to one label per observation index."""
+    df = pd.DataFrame({
+        "obs_index": np.asarray(obs_indices, dtype=np.int64),
+        "Segment": np.asarray(labels),
+    })
+    if origin_flags is not None:
+        df["_origin"] = np.asarray(origin_flags).astype(int)
+    else:
+        df["_origin"] = 0
+
+    out_idx: list[int] = []
+    out_labels: list = []
+    for obs_idx, sub in df.groupby("obs_index", sort=False):
+        out_idx.append(int(obs_idx))
+        out_labels.append(_choose_majority_label(sub))
+    return np.asarray(out_idx, dtype=np.int64), np.asarray(out_labels)
 
 
 def _aggregate_matrix_by_barcode(
@@ -546,10 +566,24 @@ def segment_image(
         tiles = tiles_all[tiles_all.get("origin", 1) == 1]
     else:
         tiles = tiles_all
-    if "barcode" in tiles.columns and tiles["barcode"].duplicated().any():
-        if verbose:
-            print("[warning] adata.uns['tiles'] has duplicated barcodes; keeping first occurrence for segmentation.")
-        tiles = tiles.drop_duplicates("barcode", keep="first")
+    if "barcode" in tiles.columns:
+        tiles = tiles.copy()
+        tiles["barcode"] = tiles["barcode"].astype(str)
+        if tiles["barcode"].duplicated().any():
+            origin_vals = pd.to_numeric(tiles.get("origin", 1), errors="coerce").fillna(1)
+            has_non_origin = (origin_vals != 1).any()
+            keep_dups = (not origin) and has_non_origin
+            if keep_dups:
+                if verbose:
+                    print(
+                        "[info] adata.uns['tiles'] has duplicated barcodes (expected for origin=False raster tiles); keeping duplicates."
+                    )
+            else:
+                if verbose:
+                    print(
+                        "[warning] adata.uns['tiles'] has duplicated barcodes; keeping first occurrence for segmentation."
+                    )
+                tiles = tiles.drop_duplicates("barcode", keep="first")
 
     # For target-based segment estimation, always base on origin==1 spots
     tiles_for_n = tiles_all
@@ -580,8 +614,11 @@ def segment_image(
         cache = adata.uns[image_cache_key]
         cached_emb = cache.get("embedding_key", None)
         cached_dims = cache.get("dimensions", None)
+        cached_origin = cache.get("origin", None)
         if (cached_emb is None or cached_emb == embedding) and (
             cached_dims is None or list(cached_dims) == list(dimensions)
+        ) and (
+            cached_origin is None or bool(cached_origin) == bool(origin)
         ):
             if show_image:
                 cache_figsize = cache.get("figsize", None)
@@ -622,23 +659,12 @@ def segment_image(
                 if np.unique(idx).size == idx.size:
                     seg_codes[idx] = tile_labels.astype(np.int32, copy=False)
                 else:
-                    # Fallback: if duplicates exist, use barcode aggregation if available.
-                    cache_barcodes = pd.Series(cache.get("barcodes") or [], dtype=str)
-                    if cache_barcodes.empty:
-                        raise ValueError(
-                            f"Cached image '{image_cache_key}' has duplicate tile_obs_indices but no barcodes to aggregate."
-                        )
-                    clusters_df = _aggregate_labels_majority(
-                        cache_barcodes,
+                    agg_idx, agg_labels = _aggregate_labels_majority_by_obs_index(
+                        idx,
                         tile_labels,
                         origin_flags=cache.get("origin_flags", None),
                     )
-                    tile_barcodes = clusters_df["barcode"].astype(str).to_numpy()
-                    tile_labels2 = clusters_df["Segment"].to_numpy()
-                    obs_barcodes = pd.Index(adata.obs.index.astype(str))
-                    obs_pos = obs_barcodes.get_indexer(pd.Index(tile_barcodes))
-                    ok = obs_pos >= 0
-                    seg_codes[obs_pos[ok]] = np.asarray(tile_labels2[ok], dtype=np.int32)
+                    seg_codes[agg_idx] = np.asarray(agg_labels, dtype=np.int32)
             else:
                 # Backward-compatible mapping by barcode list
                 cache_barcodes = pd.Series(cache.get("barcodes") or [], dtype=str)
@@ -709,10 +735,14 @@ def segment_image(
             if verbose:
                 print(f"[perf] cached SLIC (fast path): {t1 - t0:.3f}s")
             return
+        elif cached_origin is not None and bool(cached_origin) != bool(origin) and verbose:
+            print(
+                f"[warning] Cached image origin={bool(cached_origin)} differs from requested origin={bool(origin)}; regenerating image."
+            )
 
     # Create a DataFrame from the selected embedding dimensions and add barcode from adata.obs index
     tile_colors = pd.DataFrame(np.array(adata.obsm[embedding])[:, dimensions])
-    tile_colors["barcode"] = adata.obs.index
+    tile_colors["barcode"] = adata.obs.index.astype(str)
     # Base per-barcode embeddings for centroid computation (unique index)
     base_embeddings_df = tile_colors.drop(columns=["barcode"]).copy()
     base_embeddings_df.index = tile_colors["barcode"].astype(str)
@@ -911,12 +941,19 @@ def segment_image(
                 cache = adata.uns[image_cache_key]
                 cached_emb = cache.get("embedding_key", None)
                 cached_dims = cache.get("dimensions", None)
+                cached_origin = cache.get("origin", None)
                 try:
                     if (cached_emb is not None and cached_emb != embedding) or (
                         cached_dims is not None and list(cached_dims) != list(dimensions)
                     ):
                         if verbose:
                             print("[warning] Cached image embedding/dimensions differ; regenerating image.")
+                        raise KeyError
+                    if (cached_origin is not None) and (bool(cached_origin) != bool(origin)):
+                        if verbose:
+                            print(
+                                f"[warning] Cached image origin={bool(cached_origin)} differs from requested origin={bool(origin)}; regenerating image."
+                            )
                         raise KeyError
 
                     # When using cached image, always display with cached figsize/dpi
@@ -948,18 +985,48 @@ def segment_image(
                         fig_dpi=None,
                     )
                     t1 = time.perf_counter()
-                    cache_barcodes = pd.Series(cache.get("barcodes", []), dtype=str)
-                    if not cache_barcodes.duplicated().any():
-                        clusters_df = pd.DataFrame({
-                            "barcode": cache_barcodes.values,
-                            "Segment": labels_tile,
-                        })
+                    tile_obs_indices = cache.get("tile_obs_indices", None)
+                    if tile_obs_indices is not None:
+                        idx = np.asarray(tile_obs_indices, dtype=np.int64)
+                        tile_labels = np.asarray(labels_tile)
+                        if idx.ndim != 1 or idx.size != tile_labels.size:
+                            raise ValueError(
+                                f"Cached image '{image_cache_key}' has tile_obs_indices of length {idx.size}, "
+                                f"but got {tile_labels.size} tile labels."
+                            )
+                        obs_barcodes = adata.obs.index.astype(str).to_numpy()
+                        if np.unique(idx).size == idx.size:
+                            clusters_df = pd.DataFrame({
+                                "barcode": obs_barcodes[idx],
+                                "Segment": tile_labels,
+                            })
+                        else:
+                            agg_idx, agg_labels = _aggregate_labels_majority_by_obs_index(
+                                idx,
+                                tile_labels,
+                                origin_flags=cache.get("origin_flags", None),
+                            )
+                            clusters_df = pd.DataFrame({
+                                "barcode": obs_barcodes[agg_idx],
+                                "Segment": agg_labels,
+                            })
                     else:
-                        clusters_df = _aggregate_labels_majority(
-                            cache_barcodes,
-                            labels_tile,
-                            origin_flags=cache.get("origin_flags", None),
-                        )
+                        cache_barcodes = pd.Series(cache.get("barcodes", []), dtype=str)
+                        if cache_barcodes.empty:
+                            raise ValueError(
+                                f"Cached image '{image_cache_key}' missing both tile_obs_indices and barcodes."
+                            )
+                        if not cache_barcodes.duplicated().any():
+                            clusters_df = pd.DataFrame({
+                                "barcode": cache_barcodes.values,
+                                "Segment": labels_tile,
+                            })
+                        else:
+                            clusters_df = _aggregate_labels_majority(
+                                cache_barcodes,
+                                labels_tile,
+                                origin_flags=cache.get("origin_flags", None),
+                            )
                     t2 = time.perf_counter()
                     pseudo_centroids = _pseudo_centroids_from_clusters_df(
                         adata,

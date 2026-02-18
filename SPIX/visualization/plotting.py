@@ -25,6 +25,7 @@ from skimage.segmentation import find_boundaries
 from scipy.ndimage import gaussian_filter, binary_dilation
 
 import logging
+from time import perf_counter
 
 from SPIX.visualization import raster as _raster
 
@@ -43,6 +44,65 @@ from SPIX.utils.utils import (
 logging.basicConfig(
     level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s"
 )
+
+
+def _infer_regular_grid_step(values, *, q: float = 0.05, max_samples: int = 200_000):
+    """Infer a 1D lattice step from integer-like coordinates (raster-expanded tiles)."""
+    vals = np.asarray(values, dtype=float)
+    if vals.size < 2:
+        return None
+    vals = vals[np.isfinite(vals)]
+    if vals.size < 2:
+        return None
+    if vals.size > int(max_samples):
+        try:
+            idx = np.random.choice(vals.size, int(max_samples), replace=False)
+            vals = vals[idx]
+        except Exception:
+            vals = vals[: int(max_samples)]
+
+    try:
+        frac = np.abs(vals - np.rint(vals))
+        if float(np.nanmax(frac)) > 1e-3:
+            return None
+    except Exception:
+        return None
+
+    vals_i = np.rint(vals).astype(np.int64, copy=False)
+    u = np.unique(vals_i)
+    if u.size < 2:
+        return None
+    u.sort()
+    d = np.diff(u)
+    d = d[d > 0]
+    if d.size == 0:
+        return None
+    try:
+        qq = float(q)
+        if not (0.0 < qq <= 1.0):
+            qq = 0.05
+    except Exception:
+        qq = 0.05
+    step = int(np.quantile(d, qq))
+    if step <= 0:
+        step = int(np.min(d))
+    return int(step) if step > 0 else None
+
+
+def _coords_to_grid_indices(x, y, *, step: int):
+    """Map integer-like x/y onto a (0..w-1, 0..h-1) grid with given step."""
+    x_i = np.rint(np.asarray(x, dtype=float)).astype(np.int64, copy=False)
+    y_i = np.rint(np.asarray(y, dtype=float)).astype(np.int64, copy=False)
+    x0 = int(x_i.min())
+    y0 = int(y_i.min())
+    s = int(max(1, step))
+    xi = np.floor((x_i - x0) / s + 0.5).astype(np.int64, copy=False)
+    yi = np.floor((y_i - y0) / s + 0.5).astype(np.int64, copy=False)
+    xi -= int(xi.min(initial=0))
+    yi -= int(yi.min(initial=0))
+    w0 = int(xi.max(initial=0)) + 1
+    h0 = int(yi.max(initial=0)) + 1
+    return xi, yi, w0, h0, x0, y0
 
 
 def _compute_alpha_from_values(values, alpha_range=(0.1, 1.0), clip=None, invert=False):
@@ -265,6 +325,13 @@ def image_plot(
     dim_other_segments=0.3,  # Dimming factor for non-highlighted segments
     dim_to_grey=True,  # Convert dimmed segments to grey
     cmap=None,  # Colormap for 1D embeddings (if not categorical)
+    # Normalization controls for consistent colors across crops
+    rebalance_method: str = "minmax",  # 'minmax' (default) or 'clip'
+    rebalance_vmin=None,              # scalar (1D) or length-3 (3D) for fixed scaling
+    rebalance_vmax=None,              # scalar (1D) or length-3 (3D) for fixed scaling
+    color_vmin=None,                  # fixed scaling for numeric color_by
+    color_vmax=None,                  # fixed scaling for numeric color_by
+    color_percentiles=(1, 99),        # used when color_vmin/vmax are None
     pixel_smoothing_sigma=0,
     # Pixel-boundary rendering controls (boundary_method='pixel' only)
     pixel_boundary_render: str = "contour",  # 'contour'|'raster'
@@ -316,6 +383,8 @@ def image_plot(
     coordinate_mode: str = "spatial",  # 'spatial'|'array'|'visium'|'visiumhd'|'auto'
     array_row_key: str = "array_row",
     array_col_key: str = "array_col",
+    # Raster-expanded rendering controls (origin=False)
+    gapless: bool = False,  # If True, render raster-expanded tiles as a packed grid (no holes, faster)
 ):
     """Visualize embeddings as a raster image with optional boundaries and per-spot alpha.
 
@@ -340,6 +409,8 @@ def image_plot(
         formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
         handler.setFormatter(formatter)
         logger.addHandler(handler)
+
+    t_all = perf_counter()
 
     if len(dimensions) not in [1, 3]:
         raise ValueError("Visualization requires 1D or 3D embeddings.")
@@ -378,16 +449,28 @@ def image_plot(
                     )
                 tiles = tiles.drop_duplicates("barcode", keep="first")
 
-    # Prepare tile colors and merge with coordinates
-    embedding_dims = np.array(adata.obsm[embedding])[:, dimensions]
+    # Prepare tile colors and align to tile rows (avoid large pandas merge for origin=False).
+    t0 = perf_counter()
+    obs_index = pd.Index(adata.obs.index.astype(str))
+    tiles = tiles.copy()
+    tiles["barcode"] = tiles["barcode"].astype(str)
+    tile_barcodes = tiles["barcode"].to_numpy()
+    pos = obs_index.get_indexer(tile_barcodes)
+    valid = pos >= 0
+    if not np.any(valid):
+        raise ValueError("No tile barcodes match adata.obs index.")
+    embedding_full = np.asarray(adata.obsm[embedding])
+    embedding_dims = embedding_full[:, dimensions]
     dim_names = ["dim0", "dim1", "dim2"] if len(dimensions) == 3 else ["dim0"]
-    tile_colors = pd.DataFrame(embedding_dims, columns=dim_names)
-    tile_colors["barcode"] = adata.obs.index.astype(str)
-    coordinates_df = (
-        pd.merge(tiles, tile_colors, on="barcode", how="right")
-        .dropna()
-        .reset_index(drop=True)
-    )
+    coordinates_df = tiles.loc[valid].copy()
+    coordinates_df.loc[:, dim_names] = embedding_dims[pos[valid]]
+    coordinates_df = coordinates_df.dropna(subset=["x", "y"]).reset_index(drop=True)
+    if verbose:
+        logger.info(
+            "Prepared coordinates_df rows=%d in %.3fs",
+            int(coordinates_df.shape[0]),
+            perf_counter() - t0,
+        )
 
     coord_mode = str(coordinate_mode or "spatial").lower()
     if coord_mode not in {"spatial", "array", "visium", "visiumhd", "auto"}:
@@ -476,6 +559,8 @@ def image_plot(
         raw_vals = coordinates_df[dim_names[0]].values
     else:
         raw_vals = None
+    color_norm_vmin = None
+    color_norm_vmax = None
 
     # --- Per-spot alpha mapping (optional) ---
     alpha_arr = None
@@ -523,12 +608,21 @@ def image_plot(
             raw_vals = v
             finite = np.isfinite(v)
             if finite.any():
-                vmin = float(np.nanpercentile(v[finite], 1))
-                vmax = float(np.nanpercentile(v[finite], 99))
+                if (color_vmin is not None) or (color_vmax is not None):
+                    vmin = float(np.nanmin(v[finite]) if color_vmin is None else color_vmin)
+                    vmax = float(np.nanmax(v[finite]) if color_vmax is None else color_vmax)
+                else:
+                    try:
+                        p_lo, p_hi = color_percentiles
+                    except Exception:
+                        p_lo, p_hi = 1, 99
+                    vmin = float(np.nanpercentile(v[finite], p_lo))
+                    vmax = float(np.nanpercentile(v[finite], p_hi))
             else:
                 vmin, vmax = 0.0, 1.0
             if vmax <= vmin:
                 vmax = vmin + 1e-9
+            color_norm_vmin, color_norm_vmax = vmin, vmax
             t = np.clip((v - vmin) / (vmax - vmin), 0.0, 1.0)
             cm = plt.get_cmap(cmap or "viridis")
             cols = cm(t)[:, :3]
@@ -626,7 +720,21 @@ def image_plot(
             use_categorical = True
     else:
         # Continuous coloring path
-        coordinates = rebalance_colors(coordinates_df, dimensions)
+        coordinates = rebalance_colors(
+            coordinates_df, dimensions, method=rebalance_method, vmin=rebalance_vmin, vmax=rebalance_vmax
+        )
+        if len(dimensions) == 1:
+            if (rebalance_vmin is not None) or (rebalance_vmax is not None):
+                vmin0 = raw_vals.min() if raw_vals is not None else 0.0
+                vmax0 = raw_vals.max() if raw_vals is not None else 1.0
+                try:
+                    vmin0 = float(np.asarray(rebalance_vmin).reshape(-1)[0]) if rebalance_vmin is not None else float(vmin0)
+                    vmax0 = float(np.asarray(rebalance_vmax).reshape(-1)[0]) if rebalance_vmax is not None else float(vmax0)
+                except Exception:
+                    pass
+                color_norm_vmin, color_norm_vmax = vmin0, vmax0
+            elif raw_vals is not None and len(raw_vals) > 0:
+                color_norm_vmin, color_norm_vmax = float(np.nanmin(raw_vals)), float(np.nanmax(raw_vals))
         if len(dimensions) == 3:
             cols = coordinates[["R", "G", "B"]].values
 
@@ -740,7 +848,8 @@ def image_plot(
         fig, ax = plt.subplots(figsize=figsize, dpi=fig_dpi)
     if verbose:
         logger.info(
-            "Auto-size uses n_tiles=%d; final figsize=%s, fig_dpi=%s",
+            "Auto-size uses n_eff=%d (rows=%d); final figsize=%s, fig_dpi=%s",
+            int(n_points_eff) if "n_points_eff" in locals() else int(coordinates.shape[0]),
             int(coordinates.shape[0]),
             tuple(figsize),
             fig.get_dpi(),
@@ -780,6 +889,78 @@ def image_plot(
             highlight_linewidth = boundary_linewidth * 2
 
     if use_imshow:
+        # Optional gapless packed-grid rendering for raster-expanded tiles (origin=False).
+        # This avoids visible "holes" when raster_stride > 1 and is much faster because
+        # it paints one pixel per sampled coordinate (with optional downsampling).
+        if gapless and (not origin) and (not plot_boundaries) and ("origin" in coordinates.columns):
+            try:
+                origin_vals_eff = pd.to_numeric(coordinates["origin"], errors="coerce").fillna(1)
+                has_non_origin = (origin_vals_eff != 1).any()
+            except Exception:
+                has_non_origin = False
+            if has_non_origin and ("x" in coordinates.columns) and ("y" in coordinates.columns):
+                x = coordinates["x"].to_numpy(dtype=float, copy=False)
+                y = coordinates["y"].to_numpy(dtype=float, copy=False)
+                step_x = _infer_regular_grid_step(x)
+                step_y = _infer_regular_grid_step(y)
+                step = None
+                if step_x is not None and step_y is not None:
+                    step = int(max(1, min(int(step_x), int(step_y))))
+                elif step_x is not None:
+                    step = int(max(1, int(step_x)))
+                elif step_y is not None:
+                    step = int(max(1, int(step_y)))
+
+                if step is not None:
+                    t_grid = perf_counter()
+                    xi0, yi0, w0, h0, x0_int, y0_int = _coords_to_grid_indices(x, y, step=step)
+
+                    max_raster_px = int(os.environ.get("SPIX_PLOT_MAX_RASTER_PIXELS", "25000000"))
+                    max_raster_px = max(1, max_raster_px)
+                    total0 = int(w0) * int(h0)
+                    ds = int(max(1, int(np.ceil(np.sqrt(float(total0) / float(max_raster_px))))))
+                    xi = (xi0 // ds).astype(np.int64, copy=False)
+                    yi = (yi0 // ds).astype(np.int64, copy=False)
+                    w = int(xi.max(initial=0)) + 1
+                    h = int(yi.max(initial=0)) + 1
+
+                    img = np.zeros((h, w, 4), dtype=np.float32)
+                    img[yi, xi, :3] = cols
+                    if alpha_arr is not None:
+                        img[yi, xi, 3] = np.asarray(alpha_arr, dtype=np.float32)
+                    else:
+                        img[yi, xi, 3] = 1.0
+
+                    step_eff = float(step) * float(ds)
+                    x_min_eff = float(x0_int) - 0.5 * step_eff
+                    x_max_eff = float(x0_int) + (float(w) - 0.5) * step_eff
+                    y_min_eff = float(y0_int) - 0.5 * step_eff
+                    y_max_eff = float(y0_int) + (float(h) - 0.5) * step_eff
+
+                    if verbose:
+                        logger.info(
+                            "gapless grid render: step=%d, ds=%d, buffer=(%d,%d) from (%d,%d) in %.3fs",
+                            int(step),
+                            int(ds),
+                            int(w),
+                            int(h),
+                            int(w0),
+                            int(h0),
+                            perf_counter() - t_grid,
+                        )
+                    ax.imshow(
+                        img,
+                        origin="lower",
+                        extent=[x_min_eff, x_max_eff, y_min_eff, y_max_eff],
+                        interpolation="nearest",
+                    )
+                    ax.set_xlim(x_min_eff, x_max_eff)
+                    ax.set_ylim(y_min_eff, y_max_eff)
+                    if verbose:
+                        logger.info("image_plot total time: %.3fs", perf_counter() - t_all)
+                    plt.show()
+                    return
+
         # --- Stable IMShow rendering with RGBA for per-spot alpha ---
         # 1) Estimate tile size in data units
         pts = pts_for_imshow if pts_for_imshow is not None else coordinates[["x", "y"]].values
@@ -959,6 +1140,8 @@ def image_plot(
             extent=[x_min_eff, x_max_eff, y_min_eff, y_max_eff],
             interpolation="nearest",
         )
+        if verbose:
+            logger.info("image_plot total time: %.3fs", perf_counter() - t_all)
 
         # Categorical legend (imshow path)
         if use_categorical and show_legend:
@@ -1313,8 +1496,11 @@ def image_plot(
     ax.set_title(title_text, fontsize=figsize[0] * 1.5)
     if show_colorbar and len(dimensions) == 1 and not use_categorical:
         cm = plt.get_cmap(cmap if cmap is not None else "Greys")
-        vmin = raw_vals.min() if raw_vals is not None else grey_vals.min()
-        vmax = raw_vals.max() if raw_vals is not None else grey_vals.max()
+        if (color_norm_vmin is not None) and (color_norm_vmax is not None):
+            vmin, vmax = float(color_norm_vmin), float(color_norm_vmax)
+        else:
+            vmin = raw_vals.min() if raw_vals is not None else grey_vals.min()
+            vmax = raw_vals.max() if raw_vals is not None else grey_vals.max()
         norm = plt.Normalize(vmin=vmin, vmax=vmax)
         sm = plt.cm.ScalarMappable(norm=norm, cmap=cm)
         sm.set_array([])
@@ -1713,6 +1899,13 @@ def image_plot_with_spatial_image(
     dim_other_segments=0.3,
     dim_to_grey=True,
     cmap=None,
+    # Normalization controls for consistent colors across crops
+    rebalance_method: str = "minmax",  # 'minmax' (default) or 'clip'
+    rebalance_vmin=None,              # scalar (1D) or length-3 (3D) for fixed scaling
+    rebalance_vmax=None,              # scalar (1D) or length-3 (3D) for fixed scaling
+    color_vmin=None,                  # fixed scaling for numeric color_by
+    color_vmax=None,                  # fixed scaling for numeric color_by
+    color_percentiles=(1, 99),        # used when color_vmin/vmax are None
     pixel_smoothing_sigma=0,
     # Pixel-boundary rendering controls (boundary_method='pixel' only)
     pixel_boundary_render: str = "contour",  # 'contour'|'raster'
@@ -1759,6 +1952,8 @@ def image_plot_with_spatial_image(
     coordinate_mode: str = "spatial",  # 'spatial'|'array'|'visium'|'visiumhd'|'auto'
     array_row_key: str = "array_row",
     array_col_key: str = "array_col",
+    # Raster-expanded rendering controls (origin=False)
+    gapless: bool = False,  # If True, render raster-expanded tiles as a packed grid (no holes, faster)
 ):
     """
     Visualize embeddings as an image with optional segment boundaries and background image overlay.
@@ -1776,6 +1971,8 @@ def image_plot_with_spatial_image(
         formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
         handler.setFormatter(formatter)
         logger.addHandler(handler)
+
+    t_all = perf_counter()
 
     if len(dimensions) not in [1, 3]:
         raise ValueError("Only 1 or 3 dimensions can be used for visualization.")
@@ -1830,16 +2027,28 @@ def image_plot_with_spatial_image(
                     )
                 tiles = tiles.drop_duplicates("barcode", keep="first")
 
-    # Prepare tile colors and merge with coordinates
-    embedding_dims = np.array(adata.obsm[embedding])[:, dimensions]
+    # Prepare tile colors and align to tile rows (avoid large pandas merge for origin=False).
+    t0 = perf_counter()
+    obs_index = pd.Index(adata.obs.index.astype(str))
+    tiles = tiles.copy()
+    tiles["barcode"] = tiles["barcode"].astype(str)
+    tile_barcodes = tiles["barcode"].to_numpy()
+    pos = obs_index.get_indexer(tile_barcodes)
+    valid = pos >= 0
+    if not np.any(valid):
+        raise ValueError("No tile barcodes match adata.obs index.")
+    embedding_full = np.asarray(adata.obsm[embedding])
+    embedding_dims = embedding_full[:, dimensions]
     dim_names = ["dim0", "dim1", "dim2"] if len(dimensions) == 3 else ["dim0"]
-    tile_colors = pd.DataFrame(embedding_dims, columns=dim_names)
-    tile_colors["barcode"] = adata.obs.index.astype(str)
-    coordinates_df = (
-        pd.merge(tiles, tile_colors, on="barcode", how="right")
-        .dropna()
-        .reset_index(drop=True)
-    )
+    coordinates_df = tiles.loc[valid].copy()
+    coordinates_df.loc[:, dim_names] = embedding_dims[pos[valid]]
+    coordinates_df = coordinates_df.dropna(subset=["x", "y"]).reset_index(drop=True)
+    if verbose:
+        logger.info(
+            "Prepared coordinates_df rows=%d in %.3fs",
+            int(coordinates_df.shape[0]),
+            perf_counter() - t0,
+        )
 
     coord_mode = str(coordinate_mode or "spatial").lower()
     if coord_mode not in {"spatial", "array", "visium", "visiumhd", "auto"}:
@@ -1925,6 +2134,8 @@ def image_plot_with_spatial_image(
         raw_vals = coordinates_df[dim_names[0]].values
     else:
         raw_vals = None
+    color_norm_vmin = None
+    color_norm_vmax = None
 
     # --- Per-spot alpha mapping (optional) ---
     alpha_arr = None
@@ -1961,12 +2172,21 @@ def image_plot_with_spatial_image(
             raw_vals = v
             finite = np.isfinite(v)
             if finite.any():
-                vmin = float(np.nanpercentile(v[finite], 1))
-                vmax = float(np.nanpercentile(v[finite], 99))
+                if (color_vmin is not None) or (color_vmax is not None):
+                    vmin = float(np.nanmin(v[finite]) if color_vmin is None else color_vmin)
+                    vmax = float(np.nanmax(v[finite]) if color_vmax is None else color_vmax)
+                else:
+                    try:
+                        p_lo, p_hi = color_percentiles
+                    except Exception:
+                        p_lo, p_hi = 1, 99
+                    vmin = float(np.nanpercentile(v[finite], p_lo))
+                    vmax = float(np.nanpercentile(v[finite], p_hi))
             else:
                 vmin, vmax = 0.0, 1.0
             if vmax <= vmin:
                 vmax = vmin + 1e-9
+            color_norm_vmin, color_norm_vmax = vmin, vmax
             t = np.clip((v - vmin) / (vmax - vmin), 0.0, 1.0)
             cm = plt.get_cmap(cmap or "viridis")
             cols = cm(t)[:, :3]
@@ -2044,7 +2264,21 @@ def image_plot_with_spatial_image(
 
             use_categorical = True
     else:
-        coordinates = rebalance_colors(coordinates_df, dimensions)
+        coordinates = rebalance_colors(
+            coordinates_df, dimensions, method=rebalance_method, vmin=rebalance_vmin, vmax=rebalance_vmax
+        )
+        if len(dimensions) == 1:
+            if (rebalance_vmin is not None) or (rebalance_vmax is not None):
+                vmin0 = raw_vals.min() if raw_vals is not None else 0.0
+                vmax0 = raw_vals.max() if raw_vals is not None else 1.0
+                try:
+                    vmin0 = float(np.asarray(rebalance_vmin).reshape(-1)[0]) if rebalance_vmin is not None else float(vmin0)
+                    vmax0 = float(np.asarray(rebalance_vmax).reshape(-1)[0]) if rebalance_vmax is not None else float(vmax0)
+                except Exception:
+                    pass
+                color_norm_vmin, color_norm_vmax = vmin0, vmax0
+            elif raw_vals is not None and len(raw_vals) > 0:
+                color_norm_vmin, color_norm_vmax = float(np.nanmin(raw_vals)), float(np.nanmax(raw_vals))
         if len(dimensions) == 3:
             cols = coordinates[["R", "G", "B"]].values
         else:
@@ -2131,7 +2365,8 @@ def image_plot_with_spatial_image(
         fig, ax = plt.subplots(figsize=figsize, dpi=fig_dpi)
     if verbose:
         logger.info(
-            "Auto-size uses n_tiles=%d; final figsize=%s, fig_dpi=%s",
+            "Auto-size uses n_eff=%d (rows=%d); final figsize=%s, fig_dpi=%s",
+            int(n_points_eff) if "n_points_eff" in locals() else int(coordinates.shape[0]),
             int(coordinates.shape[0]),
             tuple(figsize),
             fig.get_dpi(),
@@ -2197,6 +2432,76 @@ def image_plot_with_spatial_image(
         ax.set_ylim(y_max, y_min)
 
     if use_imshow:
+        # Optional gapless packed-grid rendering for raster-expanded tiles (origin=False).
+        if gapless and (not origin) and (not plot_boundaries) and ("origin" in coordinates.columns):
+            try:
+                origin_vals_eff = pd.to_numeric(coordinates["origin"], errors="coerce").fillna(1)
+                has_non_origin = (origin_vals_eff != 1).any()
+            except Exception:
+                has_non_origin = False
+            if has_non_origin and ("x" in coordinates.columns) and ("y" in coordinates.columns):
+                x = coordinates["x"].to_numpy(dtype=float, copy=False)
+                y = coordinates["y"].to_numpy(dtype=float, copy=False)
+                step_x = _infer_regular_grid_step(x)
+                step_y = _infer_regular_grid_step(y)
+                step = None
+                if step_x is not None and step_y is not None:
+                    step = int(max(1, min(int(step_x), int(step_y))))
+                elif step_x is not None:
+                    step = int(max(1, int(step_x)))
+                elif step_y is not None:
+                    step = int(max(1, int(step_y)))
+
+                if step is not None:
+                    t_grid = perf_counter()
+                    xi0, yi0, w0, h0, x0_int, y0_int = _coords_to_grid_indices(x, y, step=step)
+
+                    max_raster_px = int(os.environ.get("SPIX_PLOT_MAX_RASTER_PIXELS", "25000000"))
+                    max_raster_px = max(1, max_raster_px)
+                    total0 = int(w0) * int(h0)
+                    ds = int(max(1, int(np.ceil(np.sqrt(float(total0) / float(max_raster_px))))))
+                    xi = (xi0 // ds).astype(np.int64, copy=False)
+                    yi = (yi0 // ds).astype(np.int64, copy=False)
+                    w = int(xi.max(initial=0)) + 1
+                    h = int(yi.max(initial=0)) + 1
+
+                    img_rgba = np.zeros((h, w, 4), dtype=np.float32)
+                    img_rgba[yi, xi, :3] = cols
+                    if alpha_arr is not None:
+                        img_rgba[yi, xi, 3] = np.asarray(alpha_arr, dtype=np.float32)
+                    else:
+                        img_rgba[yi, xi, 3] = 1.0
+
+                    step_eff = float(step) * float(ds)
+                    x_min_eff = float(x0_int) - 0.5 * step_eff
+                    x_max_eff = float(x0_int) + (float(w) - 0.5) * step_eff
+                    y_min_eff = float(y0_int) - 0.5 * step_eff
+                    y_max_eff = float(y0_int) + (float(h) - 0.5) * step_eff
+
+                    if verbose:
+                        logger.info(
+                            "gapless grid render: step=%d, ds=%d, buffer=(%d,%d) from (%d,%d) in %.3fs",
+                            int(step),
+                            int(ds),
+                            int(w),
+                            int(h),
+                            int(w0),
+                            int(h0),
+                            perf_counter() - t_grid,
+                        )
+                    ax.imshow(
+                        img_rgba,
+                        origin="lower",
+                        extent=[x_min_eff, x_max_eff, y_min_eff, y_max_eff],
+                        interpolation="nearest",
+                    )
+                    ax.set_xlim(x_min_eff, x_max_eff)
+                    ax.set_ylim(y_min_eff, y_max_eff)
+                    if verbose:
+                        logger.info("image_plot_with_spatial_image total time: %.3fs", perf_counter() - t_all)
+                    plt.show()
+                    return
+
         # --- Stable IMShow rendering with RGBA for per-spot alpha ---
         pts = pts_for_imshow if pts_for_imshow is not None else coordinates[["x", "y"]].values
         imshow_tile_size_eff = imshow_tile_size
@@ -2336,6 +2641,8 @@ def image_plot_with_spatial_image(
             extent=[x_min_eff, x_max_eff, y_min_eff, y_max_eff],
             interpolation="nearest",
         )
+        if verbose:
+            logger.info("image_plot_with_spatial_image total time: %.3fs", perf_counter() - t_all)
         if label_img is not None:
             _plot_boundaries_from_label_image(
                 ax,
@@ -2713,8 +3020,11 @@ def image_plot_with_spatial_image(
     ax.set_title(title_text, fontsize=figsize[0] * 1.5)
     if show_colorbar and len(dimensions) == 1 and not use_categorical:
         cm = plt.get_cmap(cmap if cmap is not None else "Greys")
-        vmin = raw_vals.min() if raw_vals is not None else grey_vals.min()
-        vmax = raw_vals.max() if raw_vals is not None else grey_vals.max()
+        if (color_norm_vmin is not None) and (color_norm_vmax is not None):
+            vmin, vmax = float(color_norm_vmin), float(color_norm_vmax)
+        else:
+            vmin = raw_vals.min() if raw_vals is not None else grey_vals.min()
+            vmax = raw_vals.max() if raw_vals is not None else grey_vals.max()
         norm = plt.Normalize(vmin=vmin, vmax=vmax)
         sm = plt.cm.ScalarMappable(norm=norm, cmap=cm)
         sm.set_array([])
