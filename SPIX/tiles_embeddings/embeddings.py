@@ -17,6 +17,7 @@ from shapely.vectorized import contains
 from collections import Counter
 import itertools
 import os
+import hashlib
 import scipy
 from scipy.sparse import csr_matrix
 from typing import Optional
@@ -45,6 +46,127 @@ def _limit_blas_openmp(threads: Optional[int]):
     except Exception:
         # If threadpoolctl is missing or does not support user_api, do nothing
         yield
+
+
+def _resolve_thread_limit(n_jobs: Optional[int]) -> Optional[int]:
+    """Resolve n_jobs-style values to a concrete thread cap for BLAS/OpenMP."""
+    if n_jobs is None:
+        return None
+    try:
+        n = int(n_jobs)
+    except Exception:
+        return None
+    if n > 0:
+        return n
+    if n == -1:
+        return os.cpu_count() or None
+    return None
+
+
+def _thread_cap_enabled() -> bool:
+    """
+    Whether to enforce BLAS/OpenMP thread limits via threadpoolctl.
+
+    Default is disabled to preserve previous behavior and avoid per-call
+    threadpool reconfiguration overhead on very large PCA workloads.
+    Enable with SPIX_ENABLE_THREAD_CAP=1.
+    """
+    val = os.environ.get("SPIX_ENABLE_THREAD_CAP", "0").strip().lower()
+    return val in {"1", "true", "yes", "on"}
+
+
+_LOG_NORM_CACHE_KEY = "_spix_log_norm_cache"
+
+
+def _var_names_signature(var_names: pd.Index) -> str:
+    """Stable signature for var_names compatibility checks."""
+    values = pd.Index(var_names).astype(str).to_numpy(dtype=str, copy=False)
+    joined = "\x1f".join(values.tolist())
+    return hashlib.sha1(joined.encode("utf-8")).hexdigest()
+
+
+def _cache_log_norm_hvg(
+    adata: AnnData,
+    adata_proc: AnnData,
+    nfeatures: int,
+    verbose: bool = False,
+) -> None:
+    """Cache HVG metadata for log-normalized layer reuse across repeated runs."""
+    if 'highly_variable' not in adata_proc.var:
+        return
+    try:
+        adata.uns[_LOG_NORM_CACHE_KEY] = {
+            'nfeatures': int(nfeatures),
+            'var_names_sig': _var_names_signature(adata_proc.var_names),
+            'hvg_mask': adata_proc.var['highly_variable'].to_numpy(dtype=bool, copy=True),
+        }
+    except Exception as e:
+        if verbose:
+            logging.warning(f"Failed to cache log_norm HVG metadata: {e}")
+
+
+def _try_restore_log_norm_cache(
+    adata: AnnData,
+    nfeatures: int,
+    dim_reduction: str,
+    compute_threads: Optional[int],
+    verbose: bool = True,
+) -> Optional[AnnData]:
+    """
+    Rebuild processed AnnData from cached log_norm layer and cached/recomputed HVGs.
+    Returns None if cache cannot be used safely.
+    """
+    if 'log_norm' not in adata.layers:
+        return None
+
+    if adata.raw is not None:
+        var_df = adata.raw.var.copy()
+        var_names = adata.raw.var_names.copy()
+    else:
+        var_df = adata.var.copy()
+        var_names = adata.var_names.copy()
+
+    X_cached = adata.layers['log_norm']
+    if X_cached.shape[0] != adata.n_obs or X_cached.shape[1] != len(var_names):
+        return None
+
+    adata_proc = AnnData(X=X_cached, obs=adata.obs.copy(), var=var_df)
+    adata_proc.obs_names = pd.Index(adata.obs_names.astype(str))
+    adata_proc.var_names = pd.Index(var_names.astype(str))
+
+    restored_hvg = False
+    cache = adata.uns.get(_LOG_NORM_CACHE_KEY)
+    if isinstance(cache, dict):
+        try:
+            cached_nfeatures = int(cache.get('nfeatures', -1))
+            cached_var_sig = cache.get('var_names_sig')
+            cached_hvg_mask = cache.get('hvg_mask')
+            if (
+                cached_nfeatures == int(nfeatures)
+                and cached_hvg_mask is not None
+                and len(cached_hvg_mask) == adata_proc.n_vars
+                and cached_var_sig is not None
+                and str(cached_var_sig) == _var_names_signature(adata_proc.var_names)
+            ):
+                adata_proc.var['highly_variable'] = np.asarray(cached_hvg_mask, dtype=bool)
+                restored_hvg = True
+        except Exception:
+            restored_hvg = False
+
+    if restored_hvg:
+        if verbose:
+            logging.info("Reused cached log_norm layer and HVG mask.")
+        return adata_proc
+
+    # Cache exists but metadata is missing/stale; recompute HVG only (faster than full log_norm).
+    with _limit_blas_openmp(compute_threads):
+        if dim_reduction == 'Harmony':
+            sc.pp.highly_variable_genes(adata_proc, batch_key='library_id', inplace=True)
+        else:
+            sc.pp.highly_variable_genes(adata_proc, n_top_genes=nfeatures)
+    if verbose:
+        logging.info("Reused log_norm layer and recomputed HVGs.")
+    return adata_proc
 
 
 def _coerce_string_indices_inplace(adata: AnnData) -> None:
@@ -247,15 +369,38 @@ def generate_embeddings(
     # Process counts with specified normalization
     if verbose:
         logging.info("Processing counts...")
-    adata_proc = process_counts(
-        adata,
-        method=normalization,
-        dim_reduction=dim_reduction,
-        use_counts=use_counts,
-        nfeatures=nfeatures,
-        min_cutoff=min_cutoff,
-        verbose=verbose
-    )
+    cap_threads = _thread_cap_enabled()
+    compute_threads = _resolve_thread_limit(n_jobs) if cap_threads else None
+    if verbose and compute_threads is not None:
+        logging.info(f"Applying BLAS/OpenMP thread cap for normalization/PCA: {compute_threads}")
+    elif verbose and n_jobs is not None and not cap_threads:
+        logging.info("BLAS/OpenMP thread cap disabled (set SPIX_ENABLE_THREAD_CAP=1 to enable).")
+    adata_proc = None
+    if normalization == 'log_norm' and use_counts == 'raw':
+        adata_proc = _try_restore_log_norm_cache(
+            adata=adata,
+            nfeatures=nfeatures,
+            dim_reduction=dim_reduction,
+            compute_threads=compute_threads,
+            verbose=verbose,
+        )
+        if adata_proc is not None and verbose:
+            logging.info("Counts processing completed (cache hit).")
+
+    if adata_proc is None:
+        adata_proc = process_counts(
+            adata,
+            method=normalization,
+            dim_reduction=dim_reduction,
+            use_counts=use_counts,
+            nfeatures=nfeatures,
+            min_cutoff=min_cutoff,
+            verbose=verbose,
+            compute_threads=compute_threads,
+        )
+
+    if normalization == 'log_norm' and use_counts == 'raw':
+        _cache_log_norm_hvg(adata, adata_proc, nfeatures=nfeatures, verbose=verbose)
 
     # Store processed counts in a new layer when shapes match the parent AnnData.
     # AnnData layers must have the same shape (n_obs, n_vars). In TFIDF mode we
@@ -321,7 +466,8 @@ def process_counts(
     use_counts: str = 'raw',
     nfeatures: int = 2000,
     min_cutoff: str = 'q5',
-    verbose: bool = True
+    verbose: bool = True,
+    compute_threads: Optional[int] = None,
 ) -> AnnData:
     """
     Process count data with specified normalization and feature selection.
@@ -340,6 +486,8 @@ def process_counts(
         Minimum cutoff for feature selection (e.g., 'q5' for 5th percentile).
     verbose : bool, optional (default=True)
         Whether to display progress messages.
+    compute_threads : int or None, optional (default=None)
+        Optional BLAS/OpenMP thread cap for heavy normalization/HVG steps.
     
     Returns
     -------
@@ -378,12 +526,13 @@ def process_counts(
 
     # Apply normalization and feature selection
     if method == 'log_norm':
-        sc.pp.normalize_total(adata_proc, target_sum=1e4)
-        sc.pp.log1p(adata_proc)
-        if dim_reduction == 'Harmony':
-            sc.pp.highly_variable_genes(adata_proc, batch_key='library_id', inplace=True)
-        else:
-            sc.pp.highly_variable_genes(adata_proc, n_top_genes=nfeatures)
+        with _limit_blas_openmp(compute_threads):
+            sc.pp.normalize_total(adata_proc, target_sum=1e4)
+            sc.pp.log1p(adata_proc)
+            if dim_reduction == 'Harmony':
+                sc.pp.highly_variable_genes(adata_proc, batch_key='library_id', inplace=True)
+            else:
+                sc.pp.highly_variable_genes(adata_proc, n_top_genes=nfeatures)
     elif method == 'SCT':
         raise NotImplementedError("SCTransform normalization is not implemented in this code.")
     elif method == 'TFIDF':
@@ -493,18 +642,22 @@ def embed_latent_space(
         adata_proc = adata_proc[:, features]
 
     embeds = None
+    pca_threads = _resolve_thread_limit(n_jobs) if _thread_cap_enabled() else None
 
     if dim_reduction == 'PCA':
         # Optionally restrict to HVGs
         if use_hvg_only and 'highly_variable' in adata_proc.var:
             hv_mask = adata_proc.var['highly_variable'].values
             if hv_mask.any():
-                adata_proc = adata_proc[:, hv_mask]
-        sc.tl.pca(adata_proc, n_comps=dimensions)
+                # Force an explicit copy to avoid lazy view materialization variance.
+                adata_proc = adata_proc[:, hv_mask].copy()
+        with _limit_blas_openmp(pca_threads):
+            sc.tl.pca(adata_proc, n_comps=dimensions)
         embeds = adata_proc.obsm['X_pca']
         embeds = MinMaxScaler().fit_transform(embeds)
     elif dim_reduction == 'PCA_L':
-        sc.tl.pca(adata_proc, n_comps=dimensions)
+        with _limit_blas_openmp(pca_threads):
+            sc.tl.pca(adata_proc, n_comps=dimensions)
         loadings = adata_proc.varm['PCs']
         counts = adata_proc.X
 
@@ -601,9 +754,10 @@ def embed_latent_space(
         if use_hvg_only and 'highly_variable' in adata_proc.var:
             hv_mask = adata_proc.var['highly_variable'].values
             if hv_mask.any():
-                adata_proc = adata_proc[:, hv_mask]
+                adata_proc = adata_proc[:, hv_mask].copy()
         # Perform PCA before Harmony integration
-        sc.tl.pca(adata_proc, n_comps=dimensions)
+        with _limit_blas_openmp(pca_threads):
+            sc.tl.pca(adata_proc, n_comps=dimensions)
         # Run Harmony integration using 'library_id' as the batch key
         sc.external.pp.harmony_integrate(adata_proc, key=library_id)
         # Retrieve the Harmony integrated embeddings; these are stored in 'X_pca_harmony'

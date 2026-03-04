@@ -304,9 +304,15 @@ def generate_tiles(
         if rescale_flag is None:
             rescale_flag = (coords_compaction != 'tight')
 
-        # Compute original median 1-NN distance (for optional rescaling)
+        # Only attempt NN-preserving rescale when compaction is actually enabled.
+        will_attempt_compaction = (
+            coords_compaction == 'tight'
+            or (coords_max_gap_factor is not None and coords_max_gap_factor > 0)
+        )
+
+        # Compute original median 1-NN distance only when needed for rescaling.
         med_nn_orig = None
-        if rescale_flag:
+        if rescale_flag and will_attempt_compaction:
             try:
                 t_nn0 = time.perf_counter()
                 # Keep float64 for strict backward-compatible distances/scales.
@@ -323,10 +329,12 @@ def generate_tiles(
             except Exception:
                 med_nn_orig = None
 
+        compaction_applied = False
         if coords_compaction == 'tight':
             try:
                 tiles['x'] = _rank_compact(tiles['x'].to_numpy(dtype=float), float(coords_tight_step))
                 tiles['y'] = _rank_compact(tiles['y'].to_numpy(dtype=float), float(coords_tight_step))
+                compaction_applied = True
                 if verbose:
                     logging.info("Coords-as-tiles tight packing applied (rank-based).")
             except Exception as e:
@@ -338,6 +346,7 @@ def generate_tiles(
                 y_new = _limit_axis_gaps(tiles['y'].to_numpy(dtype=float), float(coords_max_gap_factor))
                 tiles['x'] = x_new
                 tiles['y'] = y_new
+                compaction_applied = True
                 if verbose:
                     logging.info(
                         f"Coords-as-tiles compaction applied (gap cap factor={coords_max_gap_factor})."
@@ -347,7 +356,10 @@ def generate_tiles(
                 logging.warning(f"Coordinate compaction skipped due to error: {e}")
 
         # Optionally rescale to match original median 1-NN distance
-        if rescale_flag and med_nn_orig is not None and med_nn_orig > 0:
+        if rescale_flag and not compaction_applied and verbose:
+            logging.info("Skipping NN-distance rescale because no compaction was applied.")
+
+        if rescale_flag and compaction_applied and med_nn_orig is not None and med_nn_orig > 0:
             try:
                 t_nn1 = time.perf_counter()
                 # Keep float64 for strict backward-compatible distances/scales.
@@ -386,7 +398,12 @@ def generate_tiles(
             # Compare as strings to avoid label/positional ambiguity when obs_names are ints
             obs_names_str = adata.obs_names.astype(str)
             keep_mask = obs_names_str.isin(pd.Index(filtered_barcodes).astype(str))
-            adata = adata[keep_mask, :].copy()
+            if keep_mask.size == initial_obs and bool(np.all(keep_mask)):
+                # Nothing was filtered; avoid an expensive full AnnData copy.
+                if verbose:
+                    logging.info("No observations were filtered in coords mode; skipping adata subsetting copy.")
+            else:
+                adata = adata[keep_mask, :].copy()
         except Exception:
             # Fallback to label-based selection; may raise if types differ
             adata = adata[filtered_barcodes, :].copy()

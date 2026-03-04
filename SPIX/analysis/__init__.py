@@ -4,3 +4,4 @@ from .perform_pseudo_bulk_analysis import *
 from .gene_expression_embedding import *
 from .multiscale_moran_ranks import *
 from .segment_svg_enrichment import *
+from .celltype_enrichment import *

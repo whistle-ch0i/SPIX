@@ -4,9 +4,16 @@ import pandas as pd
 import numpy as np
 from scipy.sparse import issparse, csr_matrix, vstack
 import gc
+import time
+from contextlib import nullcontext
 from typing import Optional, Tuple, Dict, Any, List
 import logging
 from pandas.api.types import CategoricalDtype, is_numeric_dtype
+
+try:
+    from threadpoolctl import threadpool_limits
+except Exception:
+    threadpool_limits = None
 
 # Set up logging 
 # This checks if handlers are already configured to avoid adding duplicates
@@ -40,9 +47,13 @@ def perform_pseudo_bulk_analysis(
     sq_neighbors_kwargs: Optional[Dict[str, Any]] = None,
     sq_autocorr_kwargs: Optional[Dict[str, Any]] = None,
     add_bulked_layer_to_original_adata: bool = False,
+    store_counts_layer: bool = True,
     highly_variable: bool = True,
     perform_pca: bool = True,
+    perform_neighbors: bool = True,
     sc_neighbors_params: Optional[Dict[str, Any]] = None,
+    sc_pca_params: Optional[Dict[str, Any]] = None,
+    pca_blas_threads: Optional[int] = None,
     segment_graph_strategy: str = "collapsed",
     segment_coords_strategy: str = "centroid",
     # Collapsed-graph performance/shape controls
@@ -112,6 +123,9 @@ def perform_pseudo_bulk_analysis(
         will get the sum expression of the segment it belongs to.
         This step is performed *after* aggregation but *before* normalization/log1p
         of the pseudo-bulk data, using the sum values.
+    store_counts_layer : bool, optional (default=True)
+        If True, store a raw aggregated copy in `new_adata.layers['counts']`.
+        Set to False to reduce peak memory usage on very large datasets.
     highly_variable : bool, optional (default=True)
         Whether to calculate Highly Variable Genes on the pseudo-bulk data (`new_adata`).
         Uses `new_adata.X` (normalized/log1p if applied). If `batch_key` is provided,
@@ -120,9 +134,20 @@ def perform_pseudo_bulk_analysis(
         Whether to perform PCA (and optional Harmony integration using `batch_key`
         if provided) on the pseudo-bulk data (`new_adata`). Uses HVGs if computed
         and available.
+    perform_neighbors : bool, optional (default=True)
+        Whether to run `scanpy.pp.neighbors` after PCA. Set to False to skip
+        KNN graph construction when diagnosing kernel crashes.
     sc_neighbors_params : dict, optional
         Additional arguments to pass to `scanpy.pp.neighbors` when computing
         neighbors on the PCA space of the pseudo-bulk data (`new_adata`).
+    sc_pca_params : dict, optional
+        Additional arguments to pass to `scanpy.tl.pca`. If not provided,
+        memory-safe defaults are applied for large sparse matrices.
+    pca_blas_threads : int or None, optional (default=None)
+        BLAS thread limit applied only during `scanpy.tl.pca`. When None, a
+        stability-focused default is used for very large sparse pseudo-bulk
+        objects (`n_obs >= 200000`): BLAS threads are temporarily limited to 1.
+        Set an explicit value to override or set to 0/negative to disable.
     segment_graph_strategy : {"centroid", "collapsed"}, optional (default="centroid")
         Strategy for building the segment-level spatial graph used by Squidpy:
         - "centroid": compute neighbors on segment centroids stored in `new_adata.obsm['spatial']`.
@@ -207,6 +232,8 @@ def perform_pseudo_bulk_analysis(
         sq_autocorr_kwargs = {}
     if sc_neighbors_params is None:
         sc_neighbors_params = {}
+    if sc_pca_params is None:
+        sc_pca_params = {}
     # Validate segment graph strategy
     if segment_graph_strategy not in ("centroid", "collapsed"):
         _logger.error(f"Invalid segment_graph_strategy '{segment_graph_strategy}'. Must be 'centroid' or 'collapsed'.")
@@ -291,7 +318,7 @@ def perform_pseudo_bulk_analysis(
     _logger.info("Aggregating spatial coordinates (mean)...")
     pseudo_bulk_coords_df = pd.DataFrame(adata_obsm_coords, index=adata.obs_names)
     # observed=True ensures that only categories present in the data are used as group keys
-    pseudo_bulk_coords = pseudo_bulk_coords_df.groupby(segments, observed=True).mean()
+    pseudo_bulk_coords = pseudo_bulk_coords_df.groupby(segments, observed=True).mean().astype(np.float32)
     _logger.info("Spatial coordinate aggregation complete.")
     del pseudo_bulk_coords_df
     gc.collect() # Clean up temporary DataFrame
@@ -306,55 +333,56 @@ def perform_pseudo_bulk_analysis(
         segment_list_ordered = list(pseudo_bulk_coords.index) # Ensure order matches aggregated coords
         # Create categorical series *again* to ensure codes match the ordered unique_segments from coords groupby
         segments_cat_ordered = pd.Categorical(segments, categories=segment_list_ordered)
-        original_to_bulked_row_indices = segments_cat_ordered.codes
+        original_to_bulked_row_indices = segments_cat_ordered.codes.astype(np.int32, copy=False)
 
         # Filter out any cells whose segment wasn't in the final aggregated segments (e.g. due to NaNs if not handled upstream)
         valid_cell_mask = original_to_bulked_row_indices != -1
-        row_indices_map = np.arange(adata_X.shape[0])[valid_cell_mask]
-        col_indices_map = original_to_bulked_row_indices[valid_cell_mask]
+        row_indices_map = np.flatnonzero(valid_cell_mask).astype(np.int32, copy=False)
+        col_indices_map = original_to_bulked_row_indices[valid_cell_mask].astype(np.int32, copy=False)
 
         num_cells_orig = adata_X.shape[0] # Original number of cells
         num_bulked_segments = len(segment_list_ordered) # Number of resulting pseudo-bulk samples
         _logger.info(f"Aggregating data from {num_cells_orig} cells into {num_bulked_segments} segments.")
 
         # Create an indicator matrix: rows=original cells (valid), cols=bulked segments
-        data_map = np.ones(len(row_indices_map))
-        indicator_matrix = csr_matrix((data_map, (row_indices_map, col_indices_map)), shape=(num_cells_orig, num_bulked_segments))
+        data_map = np.ones(row_indices_map.shape[0], dtype=np.float32)
+        indicator_matrix = csr_matrix(
+            (data_map, (row_indices_map, col_indices_map)),
+            shape=(num_cells_orig, num_bulked_segments),
+            dtype=np.float32,
+        )
 
-        # For dot product (indicator_matrix.T @ adata_X), if adata_X is CSR, indicator should be CSC
         # We need X_bulk_sum[j, k] = sum of adata_X[i, k] for all i belonging to segment j
         # This is achieved by indicator_matrix.T @ adata_X
         # indicator_matrix is (N_cells x N_segments), X is (N_cells x N_genes)
         # (N_segments x N_cells) @ (N_cells x N_genes) = (N_segments x N_genes)
-        indicator_matrix_csc = indicator_matrix.tocsc()
-        X_bulk_sum = indicator_matrix_csc.T @ adata_X # Result is (bulked_segments x genes) sparse matrix
+        # Avoid materializing an extra CSC copy for lower peak memory.
+        X_bulk_sum = indicator_matrix.T @ adata_X  # Result is (bulked_segments x genes) sparse matrix
 
         if expr_agg == "mean":
             _logger.info("Calculating mean expression per segment...")
             # Calculate mean by dividing by cell counts per segment
             # Get counts per segment based on the original_to_bulked_row_indices for valid cells
-            counts_per_segment = np.bincount(original_to_bulked_row_indices[valid_cell_mask], minlength=num_bulked_segments)
-            counts_col_vector = counts_per_segment.reshape(-1, 1)
-
-            # Avoid division by zero for segments with 0 cells (shouldn't happen with observed=True and valid_mask but safer)
-            safe_counts = np.maximum(counts_col_vector, 1)
-
-            # Element-wise division using sparse matrix multiplication (identity matrix with inverse counts)
-            # Result = Diag(1/counts) @ X_bulk_sum
-            inv_counts_diag = csr_matrix((1.0 / safe_counts.flatten(), (np.arange(num_bulked_segments), np.arange(num_bulked_segments))), shape=(num_bulked_segments, num_bulked_segments))
-            X_bulk = inv_counts_diag @ X_bulk_sum
+            counts_per_segment = np.bincount(col_indices_map, minlength=num_bulked_segments).astype(np.float32, copy=False)
+            safe_counts = np.maximum(counts_per_segment, 1.0).astype(np.float32, copy=False)
+            X_bulk = csr_matrix(X_bulk_sum).multiply((1.0 / safe_counts)[:, None]).tocsr()
 
         else:
             _logger.info("Calculating sum expression per segment...")
-            X_bulk = csr_matrix(X_bulk_sum) # Ensure final format is CSR
+            X_bulk = csr_matrix(X_bulk_sum)  # Ensure final format is CSR
 
-        del indicator_matrix, indicator_matrix_csc, X_bulk_sum, original_to_bulked_row_indices, segments_cat_ordered, valid_cell_mask
+        # Keep pseudo-bulk matrix in float32 to reduce memory pressure.
+        X_bulk = X_bulk.astype(np.float32, copy=False)
+
+        del indicator_matrix, X_bulk_sum, original_to_bulked_row_indices, segments_cat_ordered
+        del valid_cell_mask, row_indices_map, col_indices_map, data_map
         gc.collect()
 
     else:
         # For dense matrix, use pandas groupby is efficient enough
         _logger.info("Input data is dense. Using pandas groupby aggregation.")
-        X_bulk_df = pd.DataFrame(adata_X, index=adata.obs_names).groupby(segments, observed=True).mean()
+        agg_fn = "mean" if expr_agg == "mean" else "sum"
+        X_bulk_df = pd.DataFrame(adata_X, index=adata.obs_names).groupby(segments, observed=True).agg(agg_fn)
         # Ensure order matches pseudo_bulk_coords index
         X_bulk_df = X_bulk_df.loc[pseudo_bulk_coords.index]
         X_bulk = csr_matrix(X_bulk_df.values.astype('float32')) # Convert to sparse for consistency later
@@ -374,8 +402,10 @@ def perform_pseudo_bulk_analysis(
     new_adata.obs_names = pd.Index(new_adata.obs_names.astype(str))
     new_adata.var_names = pd.Index(new_adata.var_names.astype(str))
     # Add spatial coordinates to obsm
-    new_adata.obsm['spatial'] = pseudo_bulk_coords.values
+    new_adata.obsm['spatial'] = pseudo_bulk_coords.values.astype(np.float32, copy=False)
     _logger.info("New AnnData object initialized with spatial coordinates.")
+    new_adata.obs_names = new_adata.obs_names.astype(str)
+    new_adata.var_names = new_adata.var_names.astype(str)
     del pseudo_bulk_coords
     gc.collect()
 
@@ -397,9 +427,15 @@ def perform_pseudo_bulk_analysis(
         _logger.warning(f"Failed to initialize segment-level tiles table for plotting: {exc}")
 
     # Add 'counts' layer (the raw aggregated means before norm/log)
-    # This is useful to keep the original mean values
-    new_adata.layers['counts'] = new_adata.X.copy()
-    _logger.info("Aggregated mean counts added to 'counts' layer.")
+    # This is useful to keep the original values, but can be memory heavy on very large datasets.
+    if store_counts_layer:
+        if issparse(new_adata.X):
+            new_adata.layers['counts'] = new_adata.X.astype(np.float32, copy=True)
+        else:
+            new_adata.layers['counts'] = np.asarray(new_adata.X, dtype=np.float32).copy()
+        _logger.info("Aggregated mean counts added to 'counts' layer.")
+    else:
+        _logger.info("Skipping 'counts' layer copy (store_counts_layer=False).")
 
     # Optionally aggregate additional obs columns (e.g., other Segment labels) to segment-level summaries
     if segment_obs_columns is None:
@@ -488,40 +524,55 @@ def perform_pseudo_bulk_analysis(
     # Optionally aggregate additional embeddings from obsm onto the pseudo-bulk object
     if aggregate_obsm_keys:
         _logger.info(f"Aggregating additional obsm keys per segment: {aggregate_obsm_keys}")
+        seg_codes_agg = pd.Categorical(segments, categories=new_adata.obs_names).codes.astype(np.int32, copy=False)
+        valid_seg_mask = seg_codes_agg >= 0
+        seg_codes_valid = seg_codes_agg[valid_seg_mask]
+        n_segs = new_adata.n_obs
+        counts_per_seg = np.bincount(seg_codes_valid, minlength=n_segs).astype(np.float32, copy=False)
+        safe_counts_per_seg = np.maximum(counts_per_seg, 1.0).astype(np.float32, copy=False)
         for key in aggregate_obsm_keys:
             if key not in adata.obsm:
                 _logger.warning(f"Requested obsm key '{key}' not found in adata.obsm; skipping.")
                 continue
             emb_data = adata.obsm[key]
             if isinstance(emb_data, pd.DataFrame):
-                emb_df = emb_data.copy()
+                numeric_cols = emb_data.select_dtypes(include=[np.number]).columns
+                if len(numeric_cols) == 0:
+                    _logger.warning(f"obsm key '{key}' does not contain numeric data; skipping aggregation.")
+                    continue
+                emb_array = emb_data.loc[:, numeric_cols].to_numpy(dtype=np.float32, copy=False)
+                emb_col_names = [str(c) for c in numeric_cols]
             else:
                 emb_array = np.asarray(emb_data)
+                if emb_array.ndim == 1:
+                    emb_array = emb_array[:, None]
                 if emb_array.shape[0] != adata.n_obs:
                     _logger.warning(
                         f"obsm key '{key}' has shape {emb_array.shape}; expected first dimension to equal n_obs ({adata.n_obs}). Skipping aggregation."
                     )
                     continue
-                emb_df = pd.DataFrame(emb_array, index=adata.obs_names)
-
-            # Ensure only numeric columns are used for aggregation
-            numeric_cols = emb_df.select_dtypes(include=[np.number]).columns
-            if emb_df.shape[1] != len(numeric_cols):
-                if len(numeric_cols) == 0:
-                    _logger.warning(f"obsm key '{key}' does not contain numeric data; skipping aggregation.")
+                if not np.issubdtype(emb_array.dtype, np.number):
+                    _logger.warning(f"obsm key '{key}' is non-numeric; skipping aggregation.")
                     continue
-                emb_df = emb_df[numeric_cols]
-                _logger.debug(f"Subset obsm '{key}' to numeric columns for aggregation: {list(numeric_cols)}")
+                emb_array = emb_array.astype(np.float32, copy=False)
+                emb_col_names = [f"{key}_{i}" for i in range(emb_array.shape[1])]
 
-            emb_means = (
-                emb_df.groupby(segments, observed=True)
-                .mean()
-                .reindex(new_adata.obs_names)
-                .astype(np.float32)
-            )
+            n_dim = emb_array.shape[1]
+            sums = np.zeros((n_segs, n_dim), dtype=np.float64)
+            for j in range(n_dim):
+                col_vals = emb_array[:, j]
+                if not np.all(valid_seg_mask):
+                    col_vals = col_vals[valid_seg_mask]
+                sums[:, j] = np.bincount(seg_codes_valid, weights=col_vals, minlength=n_segs)
+            means = (sums / safe_counts_per_seg[:, None]).astype(np.float32, copy=False)
+            if np.any(counts_per_seg == 0):
+                means[counts_per_seg == 0, :] = np.nan
+            emb_means = pd.DataFrame(means, index=new_adata.obs_names, columns=emb_col_names)
             key_out = key if obsm_aggregate_suffix is None else f"{key}{obsm_aggregate_suffix}"
             new_adata.obsm[key_out] = emb_means
             _logger.debug(f"Stored aggregated obsm key '{key_out}' with shape {emb_means.shape}.")
+            del emb_array, emb_means, sums, means
+            gc.collect()
 
     # Optionally aggregate tile-level information to segment summaries
     if aggregate_tiles:
@@ -638,7 +689,11 @@ def perform_pseudo_bulk_analysis(
         _logger.info("Adding bulked expression layer to original adata...")
         try:
             # Get the aggregated mean expression matrix (the initial new_adata.X before filtering/norm)
-            bulked_mean_X = new_adata.layers['counts'] # Use the 'counts' layer which holds the mean
+            if 'counts' in new_adata.layers:
+                bulked_mean_X = new_adata.layers['counts']
+            else:
+                bulked_mean_X = new_adata.X
+                _logger.info("'counts' layer not found; using current new_adata.X for 'bulked' mapping.")
 
             # Create a mapping from original cell index to the row index in bulked_mean_X
             # Uses the processed segments and the index of the bulked matrix (new_adata.obs_names)
@@ -713,9 +768,11 @@ def perform_pseudo_bulk_analysis(
 
     # --- Compute Spatial Neighbors and Autocorrelation on new_adata ---
     _logger.info("--- Computing Spatial Neighbors and Autocorrelation ---")
+    if not compute_spatial_autocorr:
+        _logger.info("compute_spatial_autocorr=False: skipping spatial graph construction/autocorrelation.")
 
     neighbors_built = False
-    if segment_graph_strategy == "collapsed":
+    if compute_spatial_autocorr and segment_graph_strategy == "collapsed":
         _logger.info("Building segment graph by collapsing spot-level neighbor graph (M.T @ A @ M)...")
         try:
             # Ensure original spot-level spatial neighbors exist; if not, compute them.
@@ -998,7 +1055,7 @@ def perform_pseudo_bulk_analysis(
             _logger.warning("Falling back to centroid-based neighbors for segments.")
             segment_graph_strategy = "centroid"
 
-    if segment_graph_strategy == "centroid" and not neighbors_built:
+    if compute_spatial_autocorr and segment_graph_strategy == "centroid" and not neighbors_built:
         _logger.info("Computing spatial neighbors on pseudo-bulk centroids (coord_type='generic')...")
         try:
             sq.gr.spatial_neighbors(new_adata, coord_type='generic', **sq_neighbors_kwargs)
@@ -1080,7 +1137,84 @@ def perform_pseudo_bulk_analysis(
              _logger.warning("No highly variable genes computed or found. PCA will use all genes.")
 
         try:
-             sc.tl.pca(new_adata, use_highly_variable=use_hvg)
+             # Build PCA kwargs with memory-safe defaults on large sparse matrices.
+             pca_kwargs = dict(sc_pca_params)
+             if 'mask_var' not in pca_kwargs and 'use_highly_variable' not in pca_kwargs:
+                 pca_kwargs['mask_var'] = 'highly_variable' if use_hvg else None
+             if 'dtype' not in pca_kwargs:
+                 pca_kwargs['dtype'] = 'float32'
+
+             if issparse(new_adata.X):
+                 n_obs, n_vars = new_adata.shape
+                 if 'zero_center' not in pca_kwargs:
+                     pca_kwargs['zero_center'] = False
+                 if 'svd_solver' not in pca_kwargs:
+                     pca_kwargs['svd_solver'] = 'randomized'
+                 # Scanpy chunked PCA densifies sparse chunks -> can spike memory.
+                 if pca_kwargs.get('chunked', False):
+                     _logger.warning(
+                         "chunked PCA on sparse input densifies chunks and can cause OOM; "
+                         "overriding chunked=False."
+                     )
+                     pca_kwargs['chunked'] = False
+                     pca_kwargs.pop('chunk_size', None)
+                 _logger.info(
+                     "Sparse PCA path selected (shape=%s x %s, zero_center=%s, svd_solver=%s, chunked=%s).",
+                     n_obs,
+                     n_vars,
+                     pca_kwargs.get('zero_center'),
+                     pca_kwargs.get('svd_solver'),
+                     pca_kwargs.get('chunked', False),
+                 )
+             elif new_adata.n_obs >= 200000 and 'chunked' not in pca_kwargs:
+                 # Dense large matrix fallback: chunked incremental PCA can reduce peak memory.
+                 pca_kwargs['chunked'] = True
+                 pca_kwargs.setdefault('chunk_size', 20000)
+
+             effective_pca_blas_threads = pca_blas_threads
+             if effective_pca_blas_threads is not None and effective_pca_blas_threads <= 0:
+                 effective_pca_blas_threads = None
+             if (
+                 effective_pca_blas_threads is None
+                 and issparse(new_adata.X)
+                 and new_adata.n_obs >= 20
+             ):
+                 # Large sparse randomized SVD can segfault intermittently in native BLAS.
+                 # Limit BLAS threads for PCA only to prioritize kernel stability.
+                 effective_pca_blas_threads = 1
+
+             if effective_pca_blas_threads is not None:
+                 if threadpool_limits is None:
+                     _logger.warning(
+                         "PCA BLAS thread limit requested (%s) but threadpoolctl is unavailable. "
+                         "Proceeding without runtime BLAS thread control.",
+                         effective_pca_blas_threads,
+                     )
+                     pca_thread_ctx = nullcontext()
+                 else:
+                     _logger.info(
+                         "Applying BLAS thread limit during PCA: %s",
+                         effective_pca_blas_threads,
+                     )
+                     pca_thread_ctx = threadpool_limits(
+                         limits=int(effective_pca_blas_threads),
+                         user_api='blas',
+                     )
+             else:
+                 pca_thread_ctx = nullcontext()
+
+             with pca_thread_ctx:
+                 try:
+                     sc.tl.pca(new_adata, **pca_kwargs)
+                 except TypeError as te:
+                     # Backward compatibility for older Scanpy versions lacking mask_var.
+                     if 'mask_var' in pca_kwargs and "mask_var" in str(te):
+                         mask_var = pca_kwargs.pop('mask_var')
+                         if 'use_highly_variable' not in pca_kwargs:
+                             pca_kwargs['use_highly_variable'] = bool(mask_var == 'highly_variable')
+                         sc.tl.pca(new_adata, **pca_kwargs)
+                     else:
+                         raise
              _logger.info("PCA complete.")
 
              # Perform Harmony integration if batch_key is available and multiple batches exist
@@ -1103,10 +1237,41 @@ def perform_pseudo_bulk_analysis(
 
 
              # Compute neighbors on the PCA space
-             _logger.info("Computing neighbors on PCA space...")
-             # Use the potentially Harmony-integrated X_pca
-             sc.pp.neighbors(new_adata, use_rep='X_pca', **sc_neighbors_params)
-             _logger.info("Neighbors computation complete.")
+             if perform_neighbors:
+                 _logger.info("Computing neighbors on PCA space...")
+                 neighbors_params = dict(sc_neighbors_params)
+                 neighbors_params.setdefault("random_state", 0)
+                 # On very large pseudo-bulk objects, avoid pynndescent/numba instability
+                 # unless the caller explicitly requested a transformer.
+                 if "transformer" not in neighbors_params and new_adata.n_obs >= 200000:
+                     neighbors_params["transformer"] = "sklearn"
+                     _logger.info(
+                         "Large pseudo-bulk object detected (n_obs=%d). "
+                         "Using transformer='sklearn' for neighbor stability.",
+                         new_adata.n_obs,
+                     )
+
+                 t_neighbors = time.perf_counter()
+                 try:
+                     # Use the potentially Harmony-integrated X_pca
+                     sc.pp.neighbors(new_adata, use_rep='X_pca', **neighbors_params)
+                 except Exception as e:
+                     if "transformer" in neighbors_params:
+                         _logger.warning(
+                             "Neighbors with transformer='%s' failed (%s). Retrying without transformer override.",
+                             neighbors_params.get("transformer"),
+                             e,
+                         )
+                         neighbors_params.pop("transformer", None)
+                         sc.pp.neighbors(new_adata, use_rep='X_pca', **neighbors_params)
+                     else:
+                         raise
+                 _logger.info(
+                     "Neighbors computation complete (%.2fs).",
+                     time.perf_counter() - t_neighbors,
+                 )
+             else:
+                 _logger.info("Skipping neighbors computation (perform_neighbors=False).")
 
         except Exception as e:
              _logger.error(f"Error during PCA or Neighbors computation: {e}")
