@@ -205,6 +205,31 @@ def _cap_tile_size_by_density(
     )
 
 
+def _cap_tile_size_by_render_extent(
+    *,
+    s_data_units: float,
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: float,
+    pixel_perfect: bool,
+    n_points: int,
+    logger=None,
+    context: str = "",
+) -> float:
+    return _raster.cap_tile_size_by_render_extent(
+        s_data_units=float(s_data_units),
+        x_min=float(x_min),
+        x_max=float(x_max),
+        y_min=float(y_min),
+        y_max=float(y_max),
+        pixel_perfect=bool(pixel_perfect),
+        n_points=int(n_points),
+        logger=logger,
+        context=str(context or ""),
+    )
+
+
 def _plot_boundaries_from_label_image(
     ax,
     label_img,
@@ -795,49 +820,33 @@ def image_plot(
 
         pts = coordinates[["x", "y"]].values
         pts_for_imshow = pts
-        imshow_tile_size_shrink_eff = 1.0 if pixel_perfect else float(imshow_tile_size_shrink)
         imshow_tile_size_eff = imshow_tile_size
         if coord_mode == "visiumhd" and imshow_tile_size_eff is None:
             # VisiumHD uses a dense square lattice in array_row/array_col space.
             # Force pitch=1 (in array units) unless the user overrides it.
             imshow_tile_size_eff = 1.0
-        s_data_units0 = _estimate_tile_size_units(
-            pts,
-            imshow_tile_size_eff,
-            imshow_scale_factor,
-            imshow_tile_size_mode,
-            imshow_tile_size_quantile,
-            imshow_tile_size_shrink_eff,
-            logger=logger,
-        )
-        s_data_units0 = _cap_tile_size_by_density(
-            s_data_units=float(s_data_units0),
-            x_range=float(max(1.0, x_max - x_min)),
-            y_range=float(max(1.0, y_max - y_min)),
+        raster_canvas = _raster.resolve_raster_canvas(
+            pts=pts,
+            x_min=float(x_min),
+            x_max=float(x_max),
+            y_min=float(y_min),
+            y_max=float(y_max),
+            figsize=figsize,
+            fig_dpi=fig_dpi,
+            imshow_tile_size=imshow_tile_size_eff,
+            imshow_scale_factor=imshow_scale_factor,
+            imshow_tile_size_mode=imshow_tile_size_mode,
+            imshow_tile_size_quantile=imshow_tile_size_quantile,
+            imshow_tile_size_rounding=imshow_tile_size_rounding,
+            imshow_tile_size_shrink=imshow_tile_size_shrink,
+            pixel_perfect=bool(pixel_perfect),
             n_points=int(n_points_eff),
             logger=logger,
             context="image_plot(auto-size)",
         )
-        s_data_units_for_imshow = float(s_data_units0)
-        if pixel_perfect:
-            x_min_eff0 = float(x_min) - 0.5 * float(s_data_units0)
-            x_max_eff0 = float(x_max) + 0.5 * float(s_data_units0)
-            y_min_eff0 = float(y_min) - 0.5 * float(s_data_units0)
-            y_max_eff0 = float(y_max) + 0.5 * float(s_data_units0)
-        else:
-            x_min_eff0, x_max_eff0, y_min_eff0, y_max_eff0 = float(x_min), float(x_max), float(y_min), float(y_max)
-        x_range_eff0 = x_max_eff0 - x_min_eff0 if x_max_eff0 > x_min_eff0 else 1.0
-        y_range_eff0 = y_max_eff0 - y_min_eff0 if y_max_eff0 > y_min_eff0 else 1.0
-        figsize, fig_dpi = _resolve_figsize_dpi_for_tiles(
-            figsize=figsize,
-            fig_dpi=fig_dpi,
-            x_range=float(x_range_eff0),
-            y_range=float(y_range_eff0),
-            s_data_units=float(s_data_units0),
-            pixel_perfect=bool(pixel_perfect),
-            n_points=int(n_points_eff),
-            logger=logger,
-        )
+        s_data_units_for_imshow = float(raster_canvas["s_data_units"])
+        figsize = raster_canvas["figsize"]
+        fig_dpi = raster_canvas["fig_dpi"]
 
     if figsize is None:
         figsize = (10, 10)
@@ -967,80 +976,46 @@ def image_plot(
         imshow_tile_size_eff = imshow_tile_size
         if coord_mode == "visiumhd" and imshow_tile_size_eff is None:
             imshow_tile_size_eff = 1.0
-        s_data_units = (
-            float(s_data_units_for_imshow)
-            if s_data_units_for_imshow is not None
-            else float(
-                _cap_tile_size_by_density(
-                    s_data_units=float(
-                        _estimate_tile_size_units(
-                            pts,
-                            imshow_tile_size_eff,
-                            imshow_scale_factor,
-                            imshow_tile_size_mode,
-                            imshow_tile_size_quantile,
-                            1.0 if pixel_perfect else float(imshow_tile_size_shrink),
-                            logger=logger,
-                        )
-                    ),
-                    x_range=float(max(1.0, x_max - x_min)),
-                    y_range=float(max(1.0, y_max - y_min)),
-                    n_points=int(n_points_eff),
-                    logger=logger,
-                    context="image_plot",
-                )
-            )
-        )
-
-        # For pixel-perfect rendering, treat coordinates as tile centers and pad by half a tile.
-        # This avoids half-tile empty margins when zooming/cropping.
-        if pixel_perfect:
-            x_min_eff = float(x_min) - 0.5 * float(s_data_units)
-            x_max_eff = float(x_max) + 0.5 * float(s_data_units)
-            y_min_eff = float(y_min) - 0.5 * float(s_data_units)
-            y_max_eff = float(y_max) + 0.5 * float(s_data_units)
-        else:
-            x_min_eff, x_max_eff, y_min_eff, y_max_eff = x_min, x_max, y_min, y_max
-
-        # 2) Output buffer size
-        fig_dpi = fig.get_dpi()
-        w_pixels = int(np.ceil(figsize[0] * fig_dpi))
-        h_pixels = int(np.ceil(figsize[1] * fig_dpi))
-
-        x_range = x_max_eff - x_min_eff if x_max_eff > x_min_eff else 1
-        y_range = y_max_eff - y_min_eff if y_max_eff > y_min_eff else 1
-
-        scale_raw = _raster.scale_raw_from_canvas(
-            w_pixels=int(w_pixels),
-            h_pixels=int(h_pixels),
-            x_range=float(x_range),
-            y_range=float(y_range),
+        raster_canvas = _raster.resolve_raster_canvas(
+            pts=pts,
+            x_min=float(x_min),
+            x_max=float(x_max),
+            y_min=float(y_min),
+            y_max=float(y_max),
+            figsize=figsize,
+            fig_dpi=fig.get_dpi(),
+            imshow_tile_size=imshow_tile_size_eff,
+            imshow_scale_factor=imshow_scale_factor,
+            imshow_tile_size_mode=imshow_tile_size_mode,
+            imshow_tile_size_quantile=imshow_tile_size_quantile,
+            imshow_tile_size_rounding=imshow_tile_size_rounding,
+            imshow_tile_size_shrink=imshow_tile_size_shrink,
             pixel_perfect=bool(pixel_perfect),
-            auto_sized=bool(auto_sized),
+            n_points=int(n_points_eff),
+            logger=logger,
+            context="image_plot",
         )
-        if pixel_perfect and s_data_units > 0:
-            pitch_px = max(1, int(np.round(float(s_data_units) * float(scale_raw))))
-            scale = float(pitch_px) / float(s_data_units)
-            s = int(pitch_px)
-        else:
-            scale = scale_raw
-            s = _round_tile_size_px(s_data_units, scale, imshow_tile_size_rounding)
-
-        w = int(np.ceil(x_range * scale))
-        h = int(np.ceil(y_range * scale))
-        w, h = max(w, 1), max(h, 1)
+        s_data_units = float(raster_canvas["s_data_units"])
+        x_min_eff = float(raster_canvas["x_min_eff"])
+        x_max_eff = float(raster_canvas["x_max_eff"])
+        y_min_eff = float(raster_canvas["y_min_eff"])
+        y_max_eff = float(raster_canvas["y_max_eff"])
+        scale = float(raster_canvas["scale"])
+        s = int(raster_canvas["tile_px"])
+        w = int(raster_canvas["w"])
+        h = int(raster_canvas["h"])
         if verbose and not (coord_mode == "visiumhd" and pixel_perfect):
             logger.info("Rendering to an image buffer of size (w, h): (%d, %d)", int(w), int(h))
 
         # 3) Scale coordinates and tile size to buffer
-        if pixel_perfect:
-            # Avoid banker's rounding ties (e.g., *.5) which can introduce 1px pitch jitter
-            # and cause apparent overlaps/gaps on regular grids.
-            cx = np.floor((coordinates["x"] - x_min_eff) * scale + 0.5).astype(np.int32).values
-            cy = np.floor((coordinates["y"] - y_min_eff) * scale + 0.5).astype(np.int32).values
-        else:
-            cx = np.rint((coordinates["x"] - x_min_eff) * scale).astype(np.int32).values
-            cy = np.rint((coordinates["y"] - y_min_eff) * scale).astype(np.int32).values
+        # Avoid banker's rounding ties (e.g., *.5) on regular grids when pixel_perfect=True.
+        cx, cy = _raster.scale_points_to_canvas(
+            coordinates[["x", "y"]].to_numpy(dtype=float, copy=False),
+            x_min_eff=float(x_min_eff),
+            y_min_eff=float(y_min_eff),
+            scale=float(scale),
+            pixel_perfect=bool(pixel_perfect),
+        )
         if coord_mode == "visiumhd" and pixel_perfect:
             # VisiumHD: rasterize directly on the (array_row/array_col) grid.
             # This removes any dependence on fig pixel scaling and eliminates overlap/gap artifacts.
@@ -1081,20 +1056,8 @@ def image_plot(
             seg_codes = pd.Categorical(coordinates_df["Segment"]).codes
 
         # Precompute offsets for circle/square tiles (relative to the tile center).
-        center_off = int(s // 2)
-        if pixel_shape == "circle":
-            yy, xx = np.ogrid[:s, :s]
-            center = (s - 1) / 2
-            mask = (xx - center) ** 2 + (yy - center) ** 2 <= (s / 2) ** 2
-            oy, ox = np.nonzero(mask)
-            ox = ox.astype(np.int32) - center_off
-            oy = oy.astype(np.int32) - center_off
-            pixels_per_tile = int(ox.size)
-        else:
-            tx, ty = np.meshgrid(np.arange(s, dtype=np.int32), np.arange(s, dtype=np.int32))
-            ox = (tx - center_off).ravel()
-            oy = (ty - center_off).ravel()
-            pixels_per_tile = int(s * s)
+        ox, oy = _raster.tile_pixel_offsets(int(s), pixel_shape=pixel_shape)
+        pixels_per_tile = int(ox.size)
 
         # Keep intermediate index arrays bounded to reduce RAM spikes and improve speed.
         target_pixels = int(os.environ.get("SPIX_PLOT_RASTER_TARGET_PIXELS", "10000000"))
@@ -2314,47 +2277,31 @@ def image_plot_with_spatial_image(
 
         pts = coordinates[["x", "y"]].values
         pts_for_imshow = pts
-        imshow_tile_size_shrink_eff = 1.0 if pixel_perfect else float(imshow_tile_size_shrink)
         imshow_tile_size_eff = imshow_tile_size
         if coord_mode == "visiumhd" and imshow_tile_size_eff is None:
             imshow_tile_size_eff = 1.0
-        s_data_units0 = _estimate_tile_size_units(
-            pts,
-            imshow_tile_size_eff,
-            imshow_scale_factor,
-            imshow_tile_size_mode,
-            imshow_tile_size_quantile,
-            imshow_tile_size_shrink_eff,
-            logger=logger,
-        )
-        s_data_units0 = _cap_tile_size_by_density(
-            s_data_units=float(s_data_units0),
-            x_range=float(max(1.0, x_max - x_min)),
-            y_range=float(max(1.0, y_max - y_min)),
+        raster_canvas = _raster.resolve_raster_canvas(
+            pts=pts,
+            x_min=float(x_min),
+            x_max=float(x_max),
+            y_min=float(y_min),
+            y_max=float(y_max),
+            figsize=figsize,
+            fig_dpi=fig_dpi,
+            imshow_tile_size=imshow_tile_size_eff,
+            imshow_scale_factor=imshow_scale_factor,
+            imshow_tile_size_mode=imshow_tile_size_mode,
+            imshow_tile_size_quantile=imshow_tile_size_quantile,
+            imshow_tile_size_rounding=imshow_tile_size_rounding,
+            imshow_tile_size_shrink=imshow_tile_size_shrink,
+            pixel_perfect=bool(pixel_perfect),
             n_points=int(n_points_eff),
             logger=logger,
             context="image_plot_with_spatial_image(auto-size)",
         )
-        s_data_units_for_imshow = float(s_data_units0)
-        if pixel_perfect:
-            x_min_eff0 = float(x_min) - 0.5 * float(s_data_units0)
-            x_max_eff0 = float(x_max) + 0.5 * float(s_data_units0)
-            y_min_eff0 = float(y_min) - 0.5 * float(s_data_units0)
-            y_max_eff0 = float(y_max) + 0.5 * float(s_data_units0)
-        else:
-            x_min_eff0, x_max_eff0, y_min_eff0, y_max_eff0 = float(x_min), float(x_max), float(y_min), float(y_max)
-        x_range_eff0 = x_max_eff0 - x_min_eff0 if x_max_eff0 > x_min_eff0 else 1.0
-        y_range_eff0 = y_max_eff0 - y_min_eff0 if y_max_eff0 > y_min_eff0 else 1.0
-        figsize, fig_dpi = _resolve_figsize_dpi_for_tiles(
-            figsize=figsize,
-            fig_dpi=fig_dpi,
-            x_range=float(x_range_eff0),
-            y_range=float(y_range_eff0),
-            s_data_units=float(s_data_units0),
-            pixel_perfect=bool(pixel_perfect),
-            n_points=int(n_points_eff),
-            logger=logger,
-        )
+        s_data_units_for_imshow = float(raster_canvas["s_data_units"])
+        figsize = raster_canvas["figsize"]
+        fig_dpi = raster_canvas["fig_dpi"]
 
     if figsize is None:
         figsize = (10, 10)
@@ -2507,74 +2454,44 @@ def image_plot_with_spatial_image(
         imshow_tile_size_eff = imshow_tile_size
         if coord_mode == "visiumhd" and imshow_tile_size_eff is None:
             imshow_tile_size_eff = 1.0
-        s_data_units = (
-            float(s_data_units_for_imshow)
-            if s_data_units_for_imshow is not None
-            else float(
-                _cap_tile_size_by_density(
-                    s_data_units=float(
-                        _estimate_tile_size_units(
-                            pts,
-                            imshow_tile_size_eff,
-                            imshow_scale_factor,
-                            imshow_tile_size_mode,
-                            imshow_tile_size_quantile,
-                            1.0 if pixel_perfect else float(imshow_tile_size_shrink),
-                            logger=logger,
-                        )
-                    ),
-                    x_range=float(max(1.0, x_max - x_min)),
-                    y_range=float(max(1.0, y_max - y_min)),
-                    n_points=int(n_points_eff),
-                    logger=logger,
-                    context="image_plot_with_spatial_image",
-                )
-            )
-        )
-
-        if pixel_perfect:
-            x_min_eff = float(x_min) - 0.5 * float(s_data_units)
-            x_max_eff = float(x_max) + 0.5 * float(s_data_units)
-            y_min_eff = float(y_min) - 0.5 * float(s_data_units)
-            y_max_eff = float(y_max) + 0.5 * float(s_data_units)
-        else:
-            x_min_eff, x_max_eff, y_min_eff, y_max_eff = x_min, x_max, y_min, y_max
-
-        fig_dpi = fig.get_dpi()
-        w_pixels = int(np.ceil(figsize[0] * fig_dpi))
-        h_pixels = int(np.ceil(figsize[1] * fig_dpi))
-
-        x_range = x_max_eff - x_min_eff if x_max_eff > x_min_eff else 1
-        y_range = y_max_eff - y_min_eff if y_max_eff > y_min_eff else 1
-
-        scale_raw = _raster.scale_raw_from_canvas(
-            w_pixels=int(w_pixels),
-            h_pixels=int(h_pixels),
-            x_range=float(x_range),
-            y_range=float(y_range),
+        raster_canvas = _raster.resolve_raster_canvas(
+            pts=pts,
+            x_min=float(x_min),
+            x_max=float(x_max),
+            y_min=float(y_min),
+            y_max=float(y_max),
+            figsize=figsize,
+            fig_dpi=fig.get_dpi(),
+            imshow_tile_size=imshow_tile_size_eff,
+            imshow_scale_factor=imshow_scale_factor,
+            imshow_tile_size_mode=imshow_tile_size_mode,
+            imshow_tile_size_quantile=imshow_tile_size_quantile,
+            imshow_tile_size_rounding=imshow_tile_size_rounding,
+            imshow_tile_size_shrink=imshow_tile_size_shrink,
             pixel_perfect=bool(pixel_perfect),
-            auto_sized=bool(auto_sized),
+            n_points=int(n_points_eff),
+            logger=logger,
+            context="image_plot_with_spatial_image",
         )
-        if pixel_perfect and s_data_units > 0:
-            pitch_px = max(1, int(np.round(float(s_data_units) * float(scale_raw))))
-            scale = float(pitch_px) / float(s_data_units)
-            s = int(pitch_px)
-        else:
-            scale = scale_raw
-            s = _round_tile_size_px(s_data_units, scale, imshow_tile_size_rounding)
-
-        w = int(np.ceil(x_range * scale))
-        h = int(np.ceil(y_range * scale))
-        w, h = max(w, 1), max(h, 1)
+        s_data_units = float(raster_canvas["s_data_units"])
+        x_min_eff = float(raster_canvas["x_min_eff"])
+        x_max_eff = float(raster_canvas["x_max_eff"])
+        y_min_eff = float(raster_canvas["y_min_eff"])
+        y_max_eff = float(raster_canvas["y_max_eff"])
+        scale = float(raster_canvas["scale"])
+        s = int(raster_canvas["tile_px"])
+        w = int(raster_canvas["w"])
+        h = int(raster_canvas["h"])
         if verbose:
             logger.info("Rendering to an image buffer of size (w, h): (%d, %d)", int(w), int(h))
 
-        if pixel_perfect:
-            cx = np.floor((coordinates["x"] - x_min_eff) * scale + 0.5).astype(np.int32).values
-            cy = np.floor((coordinates["y"] - y_min_eff) * scale + 0.5).astype(np.int32).values
-        else:
-            cx = np.rint((coordinates["x"] - x_min_eff) * scale).astype(np.int32).values
-            cy = np.rint((coordinates["y"] - y_min_eff) * scale).astype(np.int32).values
+        cx, cy = _raster.scale_points_to_canvas(
+            coordinates[["x", "y"]].to_numpy(dtype=float, copy=False),
+            x_min_eff=float(x_min_eff),
+            y_min_eff=float(y_min_eff),
+            scale=float(scale),
+            pixel_perfect=bool(pixel_perfect),
+        )
         if verbose:
             logger.info("Scaled tile size (in pixels): %d", int(s))
 
@@ -2585,20 +2502,8 @@ def image_plot_with_spatial_image(
             label_img = np.full((h, w), -1, dtype=int)
             seg_codes = pd.Categorical(coordinates_df["Segment"]).codes
 
-        center_off = int(s // 2)
-        if pixel_shape == "circle":
-            yy, xx = np.ogrid[:s, :s]
-            center = (s - 1) / 2
-            mask = (xx - center) ** 2 + (yy - center) ** 2 <= (s / 2) ** 2
-            oy, ox = np.nonzero(mask)
-            ox = ox.astype(np.int32) - center_off
-            oy = oy.astype(np.int32) - center_off
-            pixels_per_tile = int(ox.size)
-        else:
-            tx, ty = np.meshgrid(np.arange(s, dtype=np.int32), np.arange(s, dtype=np.int32))
-            ox = (tx - center_off).ravel()
-            oy = (ty - center_off).ravel()
-            pixels_per_tile = int(s * s)
+        ox, oy = _raster.tile_pixel_offsets(int(s), pixel_shape=pixel_shape)
+        pixels_per_tile = int(ox.size)
 
         target_pixels = int(os.environ.get("SPIX_PLOT_RASTER_TARGET_PIXELS", "10000000"))
         chunk_n = int(max(1, min(int(chunk_size), int(max(1, target_pixels // max(1, pixels_per_tile))))))

@@ -17,6 +17,25 @@ class ScaleSegments:
     n_segments: Optional[int] = None
 
 
+def _resolve_indexed_path(raw_path: str, base_dir: Path) -> Path:
+    p = Path(str(raw_path))
+    if p.is_absolute() and p.exists():
+        return p
+    if p.exists():
+        return p.resolve()
+
+    candidates = [
+        base_dir / p,
+        base_dir.parent / p,
+        base_dir / p.name,
+        base_dir.parent / p.name,
+    ]
+    for c in candidates:
+        if c.exists():
+            return c.resolve()
+    return (base_dir / p).resolve()
+
+
 def load_segments_index(segments_index_csv: str) -> pd.DataFrame:
     """Load `segments_index.csv` and resolve `path` relative to its folder."""
     p = Path(segments_index_csv).resolve()
@@ -26,7 +45,7 @@ def load_segments_index(segments_index_csv: str) -> pd.DataFrame:
     base = p.parent
     df = df.copy()
     df["scale_id"] = df["scale_id"].astype(str)
-    df["path_resolved"] = [str((base / Path(x)).resolve()) for x in df["path"].astype(str).tolist()]
+    df["path_resolved"] = [str(_resolve_indexed_path(x, base)) for x in df["path"].astype(str).tolist()]
     return df
 
 
@@ -224,4 +243,3 @@ def add_scale_svg_enrichment_to_adata(
         "seg_counts": seg_counts,
         "seg_score": score_seg,
     }
-

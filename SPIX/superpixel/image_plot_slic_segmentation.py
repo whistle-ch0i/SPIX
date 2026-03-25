@@ -80,74 +80,38 @@ def image_plot_slic_segmentation(
 
     x_min, x_max = spatial_coords[:, 0].min(), spatial_coords[:, 0].max()
     y_min, y_max = spatial_coords[:, 1].min(), spatial_coords[:, 1].max()
-    user_figsize_given = figsize is not None
-    user_dpi_given = fig_dpi is not None
-    auto_sized = (not user_figsize_given) or (not user_dpi_given)
-
     log = logger if verbose else None
-    shrink_eff = 1.0 if pixel_perfect else float(imshow_tile_size_shrink)
-    s_data_units = _raster.estimate_tile_size_units(
-        spatial_coords,
-        imshow_tile_size,
-        imshow_scale_factor,
-        imshow_tile_size_mode,
-        imshow_tile_size_quantile,
-        shrink_eff,
-        logger=log,
-    )
-    s_data_units = _raster.cap_tile_size_by_density(
-        s_data_units=float(s_data_units),
-        x_range=float(max(1.0, x_max - x_min)),
-        y_range=float(max(1.0, y_max - y_min)),
-        n_points=int(spatial_coords.shape[0]),
-        logger=log,
-        context="image_plot_slic_segmentation",
-    )
-
-    # Auto-size (match image_plot) when figsize or dpi is None.
-    x_min_eff, x_max_eff, y_min_eff, y_max_eff = _raster.effective_extent(
+    raster_canvas = _raster.resolve_raster_canvas(
+        pts=spatial_coords,
         x_min=float(x_min),
         x_max=float(x_max),
         y_min=float(y_min),
         y_max=float(y_max),
-        s_data_units=float(s_data_units),
-        pixel_perfect=bool(pixel_perfect),
-    )
-    x_range_eff = (x_max_eff - x_min_eff) or 1.0
-    y_range_eff = (y_max_eff - y_min_eff) or 1.0
-    figsize, fig_dpi = _raster.resolve_figsize_dpi_for_tiles(
         figsize=figsize,
         fig_dpi=fig_dpi,
-        x_range=float(x_range_eff),
-        y_range=float(y_range_eff),
-        s_data_units=float(s_data_units),
+        imshow_tile_size=imshow_tile_size,
+        imshow_scale_factor=imshow_scale_factor,
+        imshow_tile_size_mode=imshow_tile_size_mode,
+        imshow_tile_size_quantile=imshow_tile_size_quantile,
+        imshow_tile_size_rounding=imshow_tile_size_rounding,
+        imshow_tile_size_shrink=imshow_tile_size_shrink,
         pixel_perfect=bool(pixel_perfect),
         n_points=int(spatial_coords.shape[0]),
         logger=log,
+        context="image_plot_slic_segmentation",
     )
-    if figsize is None:
-        figsize = (10, 10)
-
-    dpi = int(fig_dpi) if fig_dpi is not None else 100
-    w_pixels, h_pixels = int(np.ceil(figsize[0] * dpi)), int(np.ceil(figsize[1] * dpi))
-    x_range, y_range = (x_max_eff - x_min_eff) or 1.0, (y_max_eff - y_min_eff) or 1.0
-    scale_raw = _raster.scale_raw_from_canvas(
-        w_pixels=int(w_pixels),
-        h_pixels=int(h_pixels),
-        x_range=float(x_range),
-        y_range=float(y_range),
-        pixel_perfect=bool(pixel_perfect),
-        auto_sized=bool(auto_sized),
-    )
-    if pixel_perfect and s_data_units > 0:
-        pitch_px = max(1, int(np.round(float(s_data_units) * float(scale_raw))))
-        scale = float(pitch_px) / float(s_data_units)
-        s = int(pitch_px)
-    else:
-        scale = float(scale_raw)
-        s = _raster.round_tile_size_px(float(s_data_units), float(scale), imshow_tile_size_rounding)
-
-    w, h = max(1, int(np.ceil(x_range * scale))), max(1, int(np.ceil(y_range * scale)))
+    figsize = raster_canvas["figsize"]
+    fig_dpi = raster_canvas["fig_dpi"]
+    dpi = int(raster_canvas["dpi_in"])
+    s_data_units = float(raster_canvas["s_data_units"])
+    x_min_eff = float(raster_canvas["x_min_eff"])
+    x_max_eff = float(raster_canvas["x_max_eff"])
+    y_min_eff = float(raster_canvas["y_min_eff"])
+    y_max_eff = float(raster_canvas["y_max_eff"])
+    scale = float(raster_canvas["scale"])
+    s = int(raster_canvas["tile_px"])
+    w = int(raster_canvas["w"])
+    h = int(raster_canvas["h"])
 
     scaler = MinMaxScaler()
     cols = scaler.fit_transform(embeddings.astype(np.float32))
@@ -156,29 +120,18 @@ def image_plot_slic_segmentation(
         log.info("Creating image with chunking (chunk size: %d)...", int(chunk_size))
     img = np.ones((h, w, dims), dtype=np.float32)
 
-    center_off = int(s // 2)
-    if pixel_shape == "circle":
-        yy, xx = np.ogrid[:s, :s]
-        center = (s - 1) / 2
-        mask = (xx - center) ** 2 + (yy - center) ** 2 <= (s / 2) ** 2
-        dy, dx = np.nonzero(mask)
-        dx = dx.astype(np.int32) - center_off
-        dy = dy.astype(np.int32) - center_off
-    else:
-        s_range = np.arange(s, dtype=np.int32)
-        gx, gy = np.meshgrid(s_range, s_range)
-        dx = (gx - center_off).ravel()
-        dy = (gy - center_off).ravel()
+    dx, dy = _raster.tile_pixel_offsets(int(s), pixel_shape=pixel_shape)
 
     for i in range(0, num_tiles, chunk_size):
         chunk_end = min(i + chunk_size, num_tiles)
         chunk_indices = np.arange(i, chunk_end)
-        if pixel_perfect:
-            chunk_cx = np.floor((spatial_coords[chunk_indices, 0] - x_min_eff) * scale + 0.5).astype(np.int32)
-            chunk_cy = np.floor((spatial_coords[chunk_indices, 1] - y_min_eff) * scale + 0.5).astype(np.int32)
-        else:
-            chunk_cx = np.rint((spatial_coords[chunk_indices, 0] - x_min_eff) * scale).astype(np.int32)
-            chunk_cy = np.rint((spatial_coords[chunk_indices, 1] - y_min_eff) * scale).astype(np.int32)
+        chunk_cx, chunk_cy = _raster.scale_points_to_canvas(
+            spatial_coords[chunk_indices],
+            x_min_eff=float(x_min_eff),
+            y_min_eff=float(y_min_eff),
+            scale=float(scale),
+            pixel_perfect=bool(pixel_perfect),
+        )
         chunk_all_x = np.clip((chunk_cx[:, None] + dx[None, :]).ravel(), 0, w - 1)
         chunk_all_y = np.clip((chunk_cy[:, None] + dy[None, :]).ravel(), 0, h - 1)
         chunk_tile_indices_map = np.repeat(chunk_indices, len(dx))
@@ -211,12 +164,15 @@ def image_plot_slic_segmentation(
     if log is not None:
         log.info("CPU SLIC complete.")
 
-    if pixel_perfect:
-        cx = np.clip(np.floor((spatial_coords[:, 0] - x_min_eff) * scale + 0.5).astype(np.int32), 0, w - 1)
-        cy = np.clip(np.floor((spatial_coords[:, 1] - y_min_eff) * scale + 0.5).astype(np.int32), 0, h - 1)
-    else:
-        cx = np.clip(np.rint((spatial_coords[:, 0] - x_min_eff) * scale).astype(np.int32), 0, w - 1)
-        cy = np.clip(np.rint((spatial_coords[:, 1] - y_min_eff) * scale).astype(np.int32), 0, h - 1)
+    cx, cy = _raster.scale_points_to_canvas(
+        spatial_coords,
+        x_min_eff=float(x_min_eff),
+        y_min_eff=float(y_min_eff),
+        scale=float(scale),
+        pixel_perfect=bool(pixel_perfect),
+        w=int(w),
+        h=int(h),
+    )
     labels = label_img[cy, cx].astype(int)
     if show_image:
         import matplotlib.pyplot as plt

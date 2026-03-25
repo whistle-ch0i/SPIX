@@ -5,3 +5,7 @@ from .gene_expression_embedding import *
 from .multiscale_moran_ranks import *
 from .segment_svg_enrichment import *
 from .celltype_enrichment import *
+from .svg_specificity import *
+from .svg_gain_explanation import *
+from .moran_geary_comparison import *
+from .geary_supplementary_figure import *

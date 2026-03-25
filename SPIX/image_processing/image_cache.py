@@ -410,79 +410,40 @@ def cache_embedding_image(
     x_min, x_max = spatial_coords[:, 0].min(), spatial_coords[:, 0].max()
     y_min, y_max = spatial_coords[:, 1].min(), spatial_coords[:, 1].max()
 
-    user_figsize_given = figsize is not None
-    user_dpi_given = fig_dpi is not None
-    auto_sized = (not user_figsize_given) or (not user_dpi_given)
-
-    shrink_eff = 1.0 if pixel_perfect else float(imshow_tile_size_shrink)
     imshow_tile_size_eff = imshow_tile_size
     if coord_mode == "visiumhd" and imshow_tile_size_eff is None:
         imshow_tile_size_eff = 1.0
-    s_data_units = _raster.estimate_tile_size_units(
-        spatial_coords,
-        imshow_tile_size_eff,
-        imshow_scale_factor,
-        imshow_tile_size_mode,
-        imshow_tile_size_quantile,
-        shrink_eff,
-        logger=None,
-    )
-    s_data_units = _raster.cap_tile_size_by_density(
-        s_data_units=float(s_data_units),
-        x_range=float(max(1.0, x_max - x_min)),
-        y_range=float(max(1.0, y_max - y_min)),
-        n_points=int(n_points_eff),
-        logger=None,
-        context="cache_embedding_image",
-    )
-
-    # Match image_plot auto-size behavior: if figsize or dpi is None, auto-pick to fit n_tiles.
-    x_min_eff, x_max_eff, y_min_eff, y_max_eff = _raster.effective_extent(
+    raster_canvas = _raster.resolve_raster_canvas(
+        pts=spatial_coords,
         x_min=float(x_min),
         x_max=float(x_max),
         y_min=float(y_min),
         y_max=float(y_max),
-        s_data_units=float(s_data_units),
-        pixel_perfect=bool(pixel_perfect),
-    )
-    x_range_eff = (x_max_eff - x_min_eff) or 1.0
-    y_range_eff = (y_max_eff - y_min_eff) or 1.0
-    figsize, fig_dpi = _raster.resolve_figsize_dpi_for_tiles(
         figsize=figsize,
         fig_dpi=fig_dpi,
-        x_range=float(x_range_eff),
-        y_range=float(y_range_eff),
-        s_data_units=float(s_data_units),
+        imshow_tile_size=imshow_tile_size_eff,
+        imshow_scale_factor=imshow_scale_factor,
+        imshow_tile_size_mode=imshow_tile_size_mode,
+        imshow_tile_size_quantile=imshow_tile_size_quantile,
+        imshow_tile_size_rounding=imshow_tile_size_rounding,
+        imshow_tile_size_shrink=imshow_tile_size_shrink,
         pixel_perfect=bool(pixel_perfect),
         n_points=int(n_points_eff),
         logger=None,
+        context="cache_embedding_image",
     )
-    if figsize is None:
-        figsize = (10, 10)
-    dpi_in = int(fig_dpi) if fig_dpi is not None else 100
-    w_pixels = int(np.ceil(float(figsize[0]) * float(dpi_in)))
-    h_pixels = int(np.ceil(float(figsize[1]) * float(dpi_in)))
-
-    x_range = (x_max_eff - x_min_eff) or 1.0
-    y_range = (y_max_eff - y_min_eff) or 1.0
-    scale_raw = _raster.scale_raw_from_canvas(
-        w_pixels=int(w_pixels),
-        h_pixels=int(h_pixels),
-        x_range=float(x_range),
-        y_range=float(y_range),
-        pixel_perfect=bool(pixel_perfect),
-        auto_sized=bool(auto_sized),
-    )
-    if pixel_perfect and s_data_units > 0:
-        pitch_px = max(1, int(np.round(float(s_data_units) * float(scale_raw))))
-        scale = float(pitch_px) / float(s_data_units)
-        s = int(pitch_px)
-    else:
-        scale = float(scale_raw)
-        s = _raster.round_tile_size_px(float(s_data_units), float(scale), imshow_tile_size_rounding)
-
-    w = max(1, int(np.ceil(x_range * scale)))
-    h = max(1, int(np.ceil(y_range * scale)))
+    figsize = raster_canvas["figsize"]
+    fig_dpi = raster_canvas["fig_dpi"]
+    dpi_in = int(raster_canvas["dpi_in"])
+    s_data_units = float(raster_canvas["s_data_units"])
+    x_min_eff = float(raster_canvas["x_min_eff"])
+    x_max_eff = float(raster_canvas["x_max_eff"])
+    y_min_eff = float(raster_canvas["y_min_eff"])
+    y_max_eff = float(raster_canvas["y_max_eff"])
+    scale = float(raster_canvas["scale"])
+    s = int(raster_canvas["tile_px"])
+    w = int(raster_canvas["w"])
+    h = int(raster_canvas["h"])
 
     # Normalize embedding channels 0..1 per channel
     dims = embeddings.shape[1]
@@ -523,19 +484,7 @@ def cache_embedding_image(
         img = np.ones((h, w, dims), dtype=np.float32)
 
     # Precompute pixel offsets for square/circle tiles (relative to center)
-    center_off = int(s // 2)
-    if pixel_shape == "circle":
-        yy, xx = np.ogrid[:s, :s]
-        center = (s - 1) / 2
-        mask = (xx - center) ** 2 + (yy - center) ** 2 <= (s / 2) ** 2
-        dy, dx = np.nonzero(mask)
-        dx = dx.astype(np.int32) - center_off
-        dy = dy.astype(np.int32) - center_off
-    else:
-        rng = np.arange(s, dtype=np.int32)
-        gx, gy = np.meshgrid(rng, rng)
-        dx = (gx - center_off).ravel()
-        dy = (gy - center_off).ravel()
+    dx, dy = _raster.tile_pixel_offsets(int(s), pixel_shape=pixel_shape)
 
     # Optional depth ordering similar to image_plot (alpha-driven)
     def _compute_alpha_from_values(values, arange=(0.1, 1.0), clip=None, invert=False):
@@ -582,24 +531,26 @@ def cache_embedding_image(
         # Fast path for s==1 square tiles: assign one pixel per tile (center pixel).
         for i in range(0, num_tiles, chunk_n):
             idx = order_idx[i : min(i + chunk_n, num_tiles)]
-            if pixel_perfect:
-                cx0 = np.floor((spatial_coords[idx, 0] - x_min_eff) * scale + 0.5).astype(np.int32)
-                cy0 = np.floor((spatial_coords[idx, 1] - y_min_eff) * scale + 0.5).astype(np.int32)
-            else:
-                cx0 = np.rint((spatial_coords[idx, 0] - x_min_eff) * scale).astype(np.int32)
-                cy0 = np.rint((spatial_coords[idx, 1] - y_min_eff) * scale).astype(np.int32)
-            cx0 = np.clip(cx0, 0, w - 1)
-            cy0 = np.clip(cy0, 0, h - 1)
+            cx0, cy0 = _raster.scale_points_to_canvas(
+                spatial_coords[idx],
+                x_min_eff=float(x_min_eff),
+                y_min_eff=float(y_min_eff),
+                scale=float(scale),
+                pixel_perfect=bool(pixel_perfect),
+                w=int(w),
+                h=int(h),
+            )
             img[cy0, cx0] = cols[idx]
     else:
         for i in range(0, num_tiles, chunk_n):
             idx = order_idx[i : min(i + chunk_n, num_tiles)]
-            if pixel_perfect:
-                cx0 = np.floor((spatial_coords[idx, 0] - x_min_eff) * scale + 0.5).astype(np.int32)
-                cy0 = np.floor((spatial_coords[idx, 1] - y_min_eff) * scale + 0.5).astype(np.int32)
-            else:
-                cx0 = np.rint((spatial_coords[idx, 0] - x_min_eff) * scale).astype(np.int32)
-                cy0 = np.rint((spatial_coords[idx, 1] - y_min_eff) * scale).astype(np.int32)
+            cx0, cy0 = _raster.scale_points_to_canvas(
+                spatial_coords[idx],
+                x_min_eff=float(x_min_eff),
+                y_min_eff=float(y_min_eff),
+                scale=float(scale),
+                pixel_perfect=bool(pixel_perfect),
+            )
             all_x = np.clip((cx0[:, None] + dx[None, :]).ravel(), 0, w - 1)
             all_y = np.clip((cy0[:, None] + dy[None, :]).ravel(), 0, h - 1)
             tile_idx_map = np.repeat(idx, pixels_per_tile)
@@ -613,12 +564,13 @@ def cache_embedding_image(
         label_img = np.full((h, w), -1, dtype=int)
         for i in range(0, num_tiles, max(1, chunk_size)):
             idx = order_idx[i : min(i + chunk_size, num_tiles)]
-            if pixel_perfect:
-                cx0 = np.floor((spatial_coords[idx, 0] - x_min_eff) * scale + 0.5).astype(np.int32)
-                cy0 = np.floor((spatial_coords[idx, 1] - y_min_eff) * scale + 0.5).astype(np.int32)
-            else:
-                cx0 = np.rint((spatial_coords[idx, 0] - x_min_eff) * scale).astype(np.int32)
-                cy0 = np.rint((spatial_coords[idx, 1] - y_min_eff) * scale).astype(np.int32)
+            cx0, cy0 = _raster.scale_points_to_canvas(
+                spatial_coords[idx],
+                x_min_eff=float(x_min_eff),
+                y_min_eff=float(y_min_eff),
+                scale=float(scale),
+                pixel_perfect=bool(pixel_perfect),
+            )
             if pixel_shape == "circle":
                 # Paint circle
                 for j, t in enumerate(idx):
@@ -655,12 +607,15 @@ def cache_embedding_image(
         label_img = label_img.reshape(new_h, factor, new_w, factor).max(axis=(1, 3))
 
     # Compute sampling centers per tile (pixel indices)
-    if pixel_perfect:
-        cx = np.clip(np.floor((spatial_coords[:, 0] - x_min_eff) * scale + 0.5).astype(np.int32), 0, w - 1)
-        cy = np.clip(np.floor((spatial_coords[:, 1] - y_min_eff) * scale + 0.5).astype(np.int32), 0, h - 1)
-    else:
-        cx = np.clip(np.rint((spatial_coords[:, 0] - x_min_eff) * scale).astype(np.int32), 0, w - 1)
-        cy = np.clip(np.rint((spatial_coords[:, 1] - y_min_eff) * scale).astype(np.int32), 0, h - 1)
+    cx, cy = _raster.scale_points_to_canvas(
+        spatial_coords,
+        x_min_eff=float(x_min_eff),
+        y_min_eff=float(y_min_eff),
+        scale=float(scale),
+        pixel_perfect=bool(pixel_perfect),
+        w=int(w),
+        h=int(h),
+    )
 
     cache = {
         "img": img,
@@ -966,76 +921,40 @@ def _cache_embedding_image_legacy(
     x_min, x_max = spatial_coords[:, 0].min(), spatial_coords[:, 0].max()
     y_min, y_max = spatial_coords[:, 1].min(), spatial_coords[:, 1].max()
 
-    user_figsize_given = figsize is not None
-    user_dpi_given = fig_dpi is not None
-    auto_sized = (not user_figsize_given) or (not user_dpi_given)
-
-    shrink_eff = 1.0 if pixel_perfect else float(imshow_tile_size_shrink)
     imshow_tile_size_eff = imshow_tile_size
     if coord_mode == "visiumhd" and imshow_tile_size_eff is None:
         imshow_tile_size_eff = 1.0
-    s_data_units = _raster.estimate_tile_size_units(
-        spatial_coords,
-        imshow_tile_size_eff,
-        imshow_scale_factor,
-        imshow_tile_size_mode,
-        imshow_tile_size_quantile,
-        shrink_eff,
-        logger=None,
-    )
-    s_data_units = _raster.cap_tile_size_by_density(
-        s_data_units=float(s_data_units),
-        x_range=float(max(1.0, x_max - x_min)),
-        y_range=float(max(1.0, y_max - y_min)),
-        n_points=int(n_points_eff),
-        logger=None,
-        context="cache_embedding_image(legacy)",
-    )
-
-    x_min_eff, x_max_eff, y_min_eff, y_max_eff = _raster.effective_extent(
+    raster_canvas = _raster.resolve_raster_canvas(
+        pts=spatial_coords,
         x_min=float(x_min),
         x_max=float(x_max),
         y_min=float(y_min),
         y_max=float(y_max),
-        s_data_units=float(s_data_units),
-        pixel_perfect=bool(pixel_perfect),
-    )
-    x_range = (x_max_eff - x_min_eff) or 1.0
-    y_range = (y_max_eff - y_min_eff) or 1.0
-    figsize, fig_dpi = _raster.resolve_figsize_dpi_for_tiles(
         figsize=figsize,
         fig_dpi=fig_dpi,
-        x_range=float(x_range),
-        y_range=float(y_range),
-        s_data_units=float(s_data_units),
+        imshow_tile_size=imshow_tile_size_eff,
+        imshow_scale_factor=imshow_scale_factor,
+        imshow_tile_size_mode=imshow_tile_size_mode,
+        imshow_tile_size_quantile=imshow_tile_size_quantile,
+        imshow_tile_size_rounding="ceil",
+        imshow_tile_size_shrink=imshow_tile_size_shrink,
         pixel_perfect=bool(pixel_perfect),
         n_points=int(n_points_eff),
         logger=None,
+        context="cache_embedding_image(legacy)",
     )
-    if figsize is None:
-        figsize = (10, 10)
-    dpi_in = int(fig_dpi) if fig_dpi is not None else 100
-    w_pixels = int(np.ceil(float(figsize[0]) * float(dpi_in)))
-    h_pixels = int(np.ceil(float(figsize[1]) * float(dpi_in)))
-
-    scale_raw = _raster.scale_raw_from_canvas(
-        w_pixels=int(w_pixels),
-        h_pixels=int(h_pixels),
-        x_range=float(x_range),
-        y_range=float(y_range),
-        pixel_perfect=bool(pixel_perfect),
-        auto_sized=bool(auto_sized),
-    )
-    if pixel_perfect and s_data_units > 0:
-        pitch_px = max(1, int(np.round(float(s_data_units) * float(scale_raw))))
-        scale = float(pitch_px) / float(s_data_units)
-        s = int(pitch_px)
-    else:
-        scale = float(scale_raw)
-        s = max(1, int(np.ceil(s_data_units * scale)))
-
-    w = max(1, int(np.ceil(x_range * scale)))
-    h = max(1, int(np.ceil(y_range * scale)))
+    figsize = raster_canvas["figsize"]
+    fig_dpi = raster_canvas["fig_dpi"]
+    dpi_in = int(raster_canvas["dpi_in"])
+    s_data_units = float(raster_canvas["s_data_units"])
+    x_min_eff = float(raster_canvas["x_min_eff"])
+    x_max_eff = float(raster_canvas["x_max_eff"])
+    y_min_eff = float(raster_canvas["y_min_eff"])
+    y_max_eff = float(raster_canvas["y_max_eff"])
+    scale = float(raster_canvas["scale"])
+    s = int(raster_canvas["tile_px"])
+    w = int(raster_canvas["w"])
+    h = int(raster_canvas["h"])
 
     dims = embeddings.shape[1]
     scaler = MinMaxScaler()
@@ -1050,19 +969,7 @@ def _cache_embedding_image_legacy(
     img = np.ones((h, w, dims), dtype=np.float32)
 
     # Precompute pixel offsets for square/circle tiles (relative to center)
-    center_off = int(s // 2)
-    if pixel_shape == "circle":
-        yy, xx = np.ogrid[:s, :s]
-        center = (s - 1) / 2
-        mask = (xx - center) ** 2 + (yy - center) ** 2 <= (s / 2) ** 2
-        dy, dx = np.nonzero(mask)
-        dx = dx.astype(np.int32) - center_off
-        dy = dy.astype(np.int32) - center_off
-    else:
-        rng = np.arange(s, dtype=np.int32)
-        gx, gy = np.meshgrid(rng, rng)
-        dx = (gx - center_off).ravel()
-        dy = (gy - center_off).ravel()
+    dx, dy = _raster.tile_pixel_offsets(int(s), pixel_shape=pixel_shape)
 
     def _compute_alpha_from_values(values, arange=(0.1, 1.0), clip=None, invert=False):
         v = np.asarray(values, dtype=float)
@@ -1101,12 +1008,13 @@ def _cache_embedding_image_legacy(
     num_tiles = spatial_coords.shape[0]
     for i in range(0, num_tiles, max(1, chunk_size)):
         idx = order_idx[i : min(i + chunk_size, num_tiles)]
-        if pixel_perfect:
-            cx0 = np.floor((spatial_coords[idx, 0] - x_min_eff) * scale + 0.5).astype(np.int32)
-            cy0 = np.floor((spatial_coords[idx, 1] - y_min_eff) * scale + 0.5).astype(np.int32)
-        else:
-            cx0 = np.rint((spatial_coords[idx, 0] - x_min_eff) * scale).astype(np.int32)
-            cy0 = np.rint((spatial_coords[idx, 1] - y_min_eff) * scale).astype(np.int32)
+        cx0, cy0 = _raster.scale_points_to_canvas(
+            spatial_coords[idx],
+            x_min_eff=float(x_min_eff),
+            y_min_eff=float(y_min_eff),
+            scale=float(scale),
+            pixel_perfect=bool(pixel_perfect),
+        )
         all_x = np.clip((cx0[:, None] + dx[None, :]).ravel(), 0, w - 1)
         all_y = np.clip((cy0[:, None] + dy[None, :]).ravel(), 0, h - 1)
         tile_idx_map = np.repeat(idx, len(dx))
@@ -1118,12 +1026,13 @@ def _cache_embedding_image_legacy(
         label_img = np.full((h, w), -1, dtype=int)
         for i in range(0, num_tiles, max(1, chunk_size)):
             idx = order_idx[i : min(i + chunk_size, num_tiles)]
-            if pixel_perfect:
-                cx0 = np.floor((spatial_coords[idx, 0] - x_min_eff) * scale + 0.5).astype(np.int32)
-                cy0 = np.floor((spatial_coords[idx, 1] - y_min_eff) * scale + 0.5).astype(np.int32)
-            else:
-                cx0 = np.rint((spatial_coords[idx, 0] - x_min_eff) * scale).astype(np.int32)
-                cy0 = np.rint((spatial_coords[idx, 1] - y_min_eff) * scale).astype(np.int32)
+            cx0, cy0 = _raster.scale_points_to_canvas(
+                spatial_coords[idx],
+                x_min_eff=float(x_min_eff),
+                y_min_eff=float(y_min_eff),
+                scale=float(scale),
+                pixel_perfect=bool(pixel_perfect),
+            )
             if pixel_shape == "circle":
                 for j, t in enumerate(idx):
                     lx = np.clip(cx0[j] + dx, 0, w - 1)
@@ -1155,12 +1064,15 @@ def _cache_embedding_image_legacy(
         label_img = label_img[: new_h * factor, : new_w * factor]
         label_img = label_img.reshape(new_h, factor, new_w, factor).max(axis=(1, 3))
 
-    if pixel_perfect:
-        cx = np.clip(np.floor((spatial_coords[:, 0] - x_min_eff) * scale + 0.5).astype(np.int32), 0, w - 1)
-        cy = np.clip(np.floor((spatial_coords[:, 1] - y_min_eff) * scale + 0.5).astype(np.int32), 0, h - 1)
-    else:
-        cx = np.clip(np.rint((spatial_coords[:, 0] - x_min_eff) * scale).astype(np.int32), 0, w - 1)
-        cy = np.clip(np.rint((spatial_coords[:, 1] - y_min_eff) * scale).astype(np.int32), 0, h - 1)
+    cx, cy = _raster.scale_points_to_canvas(
+        spatial_coords,
+        x_min_eff=float(x_min_eff),
+        y_min_eff=float(y_min_eff),
+        scale=float(scale),
+        pixel_perfect=bool(pixel_perfect),
+        w=int(w),
+        h=int(h),
+    )
 
     cache = {
         "img": img,

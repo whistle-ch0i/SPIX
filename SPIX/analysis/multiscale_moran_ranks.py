@@ -56,13 +56,13 @@ def _scoped_thread_limits(n_threads: int):
                 os.environ[k] = v
 
 
-def _rank_min_desc(values: np.ndarray) -> np.ndarray:
+def _rank_min(values: np.ndarray, *, ascending: bool) -> np.ndarray:
     if values.ndim != 1:
         raise ValueError("values must be 1D")
     n = values.size
     if n == 0:
         return np.zeros(0, dtype=np.int32)
-    order = np.argsort(-values, kind="mergesort")
+    order = np.argsort(values if ascending else -values, kind="mergesort")
     sorted_vals = values[order]
 
     change = np.empty(n, dtype=bool)
@@ -76,6 +76,50 @@ def _rank_min_desc(values: np.ndarray) -> np.ndarray:
     ranks = np.empty(n, dtype=np.int32)
     ranks[order] = ranks_sorted
     return ranks
+
+
+def _rank_min_desc(values: np.ndarray) -> np.ndarray:
+    return _rank_min(values, ascending=False)
+
+
+def _rank_min_asc(values: np.ndarray) -> np.ndarray:
+    return _rank_min(values, ascending=True)
+
+
+def _autocorr_metric_config(mode: str) -> Tuple[str, bool]:
+    mode_norm = str(mode).lower()
+    if mode_norm == "geary":
+        return "C", True
+    return "I", False
+
+
+def _extract_autocorr_metric(
+    df: pd.DataFrame,
+    *,
+    mode: str,
+    thresh: float,
+) -> Tuple[np.ndarray, pd.Index]:
+    metric_col, ascending = _autocorr_metric_config(mode)
+    if metric_col not in df.columns:
+        raise KeyError(f"Expected autocorrelation column '{metric_col}' for mode='{mode}'")
+
+    vals = df[metric_col].to_numpy(dtype=np.float64, copy=False)
+    index = df.index.astype(str)
+    keep = np.isfinite(vals)
+
+    if metric_col == "C":
+        # Geary's C is better when smaller; keep the default 0.0 threshold as "no extra filter"
+        # so existing Moran-oriented notebook calls don't silently drop everything.
+        eff_thresh = np.inf if float(thresh) == 0.0 else float(thresh)
+        if np.isfinite(eff_thresh):
+            keep &= vals <= eff_thresh
+        ranker = _rank_min_asc
+    else:
+        if float(thresh) != -np.inf:
+            keep &= vals > float(thresh)
+        ranker = _rank_min_desc
+
+    return ranker(vals[keep]), index[keep]
 
 
 def _compute_moranI_fallback(
@@ -198,11 +242,11 @@ def _moran_rank_worker(
                 moranI_threshold=float(moran_thresh),
                 **pseudo_bulk_kwargs,
             )
-            if moran is None or moran.empty or "I" not in moran.columns:
-                mode = str(pseudo_bulk_kwargs.get("mode", "moran")).lower()
+            mode = str(pseudo_bulk_kwargs.get("mode", "moran")).lower()
+            if moran is None or moran.empty:
                 results_key = f"{mode}C" if mode == "geary" else f"{mode}I"
                 full = new_adata.uns.get(results_key, None)
-                if isinstance(full, pd.DataFrame) and (not full.empty) and ("I" in full.columns or "C" in full.columns):
+                if isinstance(full, pd.DataFrame) and (not full.empty):
                     moran = full
                 else:
                     W = new_adata.obsp.get("spatial_connectivities", None)
@@ -216,19 +260,18 @@ def _moran_rank_worker(
                         available = list(new_adata.uns.keys())
                         del new_adata
                         return sid, None, f"{sid}: empty MoranI (uns keys: {available})"
+                    if mode != "moran":
+                        del new_adata
+                        return sid, None, f"{sid}: fallback autocorr only supports mode='moran' (got mode='{mode}')"
                     moran = _compute_moranI_fallback(new_adata.X, W, new_adata.var_names)
             del new_adata
 
-            i_vals = moran["I"].to_numpy(dtype=np.float64, copy=False)
-            valid = np.isfinite(i_vals)
-            if not np.all(valid):
-                i_vals = i_vals[valid]
-                moran_index = moran.index[valid]
-            else:
-                moran_index = moran.index
-
-            ranks = _rank_min_desc(i_vals)
-            series = pd.Series(ranks, index=moran_index, name=f"rank_{sid}")
+            ranks, rank_index = _extract_autocorr_metric(
+                moran,
+                mode=mode,
+                thresh=float(moran_thresh),
+            )
+            series = pd.Series(ranks, index=rank_index, name=f"rank_{sid}")
             return sid, series, None
     except Exception as e:
         return sid, None, f"{sid}: {type(e).__name__}: {e}"
@@ -575,11 +618,11 @@ def _moran_rank_thread(
             moranI_threshold=float(moran_thresh),
             **pseudo_bulk_kwargs,
         )
-        if moran is None or moran.empty or "I" not in moran.columns:
-            mode = str(pseudo_bulk_kwargs.get("mode", "moran")).lower()
+        mode = str(pseudo_bulk_kwargs.get("mode", "moran")).lower()
+        if moran is None or moran.empty:
             results_key = f"{mode}C" if mode == "geary" else f"{mode}I"
             full = new_adata.uns.get(results_key, None)
-            if isinstance(full, pd.DataFrame) and (not full.empty) and ("I" in full.columns or "C" in full.columns):
+            if isinstance(full, pd.DataFrame) and (not full.empty):
                 moran = full
             else:
                 W = new_adata.obsp.get("spatial_connectivities", None)
@@ -593,19 +636,18 @@ def _moran_rank_thread(
                     available = list(new_adata.uns.keys())
                     del new_adata
                     return sid, None, f"{sid}: empty MoranI (uns keys: {available})"
+                if mode != "moran":
+                    del new_adata
+                    return sid, None, f"{sid}: fallback autocorr only supports mode='moran' (got mode='{mode}')"
                 moran = _compute_moranI_fallback(new_adata.X, W, new_adata.var_names)
         del new_adata
 
-        i_vals = moran["I"].to_numpy(dtype=np.float64, copy=False)
-        valid = np.isfinite(i_vals)
-        if not np.all(valid):
-            i_vals = i_vals[valid]
-            moran_index = moran.index[valid]
-        else:
-            moran_index = moran.index
-
-        ranks = _rank_min_desc(i_vals)
-        series = pd.Series(ranks, index=moran_index, name=f"rank_{sid}")
+        ranks, rank_index = _extract_autocorr_metric(
+            moran,
+            mode=mode,
+            thresh=float(moran_thresh),
+        )
+        series = pd.Series(ranks, index=rank_index, name=f"rank_{sid}")
         return sid, series, None
     except Exception as e:
         return sid, None, f"{sid}: {type(e).__name__}: {e}"
@@ -726,6 +768,9 @@ def multiscale_moran_ranks(
     engine = str(engine).lower()
     if engine not in {"squidpy", "fast"}:
         raise ValueError("engine must be one of: 'squidpy', 'fast'")
+    mode = str(pseudo_bulk_kwargs.get("mode", "moran")).lower()
+    if engine == "fast" and mode != "moran":
+        raise ValueError("engine='fast' currently supports only mode='moran'")
 
     edges: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None
     if engine == "fast":
