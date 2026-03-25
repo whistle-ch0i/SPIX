@@ -138,8 +138,12 @@ def _rasterise_chunk(
     Process a batch of tiles in one go.
     This reduces the number of pickles between main <-> worker.
     """
-    dfs = []
+    x_parts = []
+    y_parts = []
+    barcode_parts = []
+    origin_parts = []
     for region, point, idx in chunk_args:
+        barcode = str(idx)
         # exactly the same per‐tile logic as before
         try:
             verts = _GLOBAL_VOR.vertices[region]
@@ -164,9 +168,10 @@ def _rasterise_chunk(
             if pixels.size == 0:
                 # Optionally keep only the origin pixel
                 if _GLOBAL_RASTER_RESTORE_EMPTY:
-                    dfs.append(
-                        pd.DataFrame({"x": [ox], "y": [oy], "barcode": [str(idx)], "origin": [1]})
-                    )
+                    x_parts.append(np.array([ox], dtype=np.int64))
+                    y_parts.append(np.array([oy], dtype=np.int64))
+                    barcode_parts.append(np.array([barcode], dtype=object))
+                    origin_parts.append(np.array([1], dtype=np.int8))
                 continue
             # Optional subsampling within the tile
             if _GLOBAL_RASTER_SAMPLE_FRAC is not None and pixels.shape[0] > 0:
@@ -174,46 +179,42 @@ def _rasterise_chunk(
                     rng = _GLOBAL_RASTER_RNG or np.random.default_rng()
                     keep_n = max(1, int(np.floor(_GLOBAL_RASTER_SAMPLE_FRAC * pixels.shape[0])))
                     if keep_n < pixels.shape[0]:
-                        idx = rng.choice(pixels.shape[0], size=keep_n, replace=False)
-                        pixels = pixels[idx]
+                        sample_idx = rng.choice(pixels.shape[0], size=keep_n, replace=False)
+                        pixels = pixels[sample_idx]
                 except Exception:
                     pass
 
             if _GLOBAL_RASTER_MAX_PER_TILE is not None and pixels.shape[0] > _GLOBAL_RASTER_MAX_PER_TILE:
                 try:
                     rng = _GLOBAL_RASTER_RNG or np.random.default_rng()
-                    idx = rng.choice(pixels.shape[0], size=_GLOBAL_RASTER_MAX_PER_TILE, replace=False)
-                    pixels = pixels[idx]
+                    sample_idx = rng.choice(
+                        pixels.shape[0], size=_GLOBAL_RASTER_MAX_PER_TILE, replace=False
+                    )
+                    pixels = pixels[sample_idx]
                 except Exception:
                     pixels = pixels[:_GLOBAL_RASTER_MAX_PER_TILE]
 
-            origin_flags = ((pixels[:, 0] == ox) & (pixels[:, 1] == oy)).astype(int)
+            origin_flags = ((pixels[:, 0] == ox) & (pixels[:, 1] == oy)).astype(np.int8, copy=False)
+            if not np.any(origin_flags):
+                pixels = np.vstack([pixels, np.array([[ox, oy]], dtype=pixels.dtype)])
+                origin_flags = np.concatenate([origin_flags, np.array([1], dtype=np.int8)])
 
-            df = pd.DataFrame(
-                {
-                    "x": pixels[:, 0],
-                    "y": pixels[:, 1],
-                    "barcode": str(idx),
-                    "origin": origin_flags,
-                }
-            )
-            # ensure we mark the generating point
-            if df["origin"].sum() == 0:
-                df = pd.concat(
-                    [
-                        df,
-                        pd.DataFrame(
-                            {"x": [ox], "y": [oy], "barcode": [str(idx)], "origin": [1]}
-                        ),
-                    ],
-                    ignore_index=True,
-                )
-            dfs.append(df)
+            x_parts.append(pixels[:, 0])
+            y_parts.append(pixels[:, 1])
+            barcode_parts.append(np.full(pixels.shape[0], barcode, dtype=object))
+            origin_parts.append(origin_flags)
         except Exception as e:
-            logging.error(f"Error in tile {idx}: {e}")
+            logging.error(f"Error in tile {barcode}: {e}")
 
-    if dfs:
-        return pd.concat(dfs, ignore_index=True)
+    if x_parts:
+        return pd.DataFrame(
+            {
+                "x": np.concatenate(x_parts),
+                "y": np.concatenate(y_parts),
+                "barcode": np.concatenate(barcode_parts),
+                "origin": np.concatenate(origin_parts),
+            }
+        )
     else:
         # return empty with correct columns
         return pd.DataFrame(columns=["x", "y", "barcode", "origin"])
@@ -449,10 +450,12 @@ def rasterise(
         f"Rasterise: n_jobs={n_jobs}, tiles={total}, chunksize={chunksize}, stride={raster_stride}, sample_frac={raster_sample_frac}, max_per_tile={raster_max_pixels_per_tile}"
     )
 
-    # prepare batches
-    tasks = list(zip(filtered_regions, filtered_points, index))
-    batches = [tasks[i : i + chunksize] for i in range(0, total, chunksize)]
-    total_batches = len(batches)
+    total_batches = len(range(0, total, chunksize))
+
+    def _iter_batches():
+        for start in range(0, total, chunksize):
+            stop = start + chunksize
+            yield list(zip(filtered_regions[start:stop], filtered_points[start:stop], index[start:stop]))
 
     results = []
     desc = "Rasterising tiles"
@@ -468,7 +471,7 @@ def rasterise(
             random_seed=raster_random_seed,
             restore_zero_pixel_tiles=restore_zero_pixel_tiles,
         )
-        for batch in tqdm(batches, total=total_batches, desc=desc):
+        for batch in tqdm(_iter_batches(), total=total_batches, desc=desc):
             results.append(_rasterise_chunk(batch))
     else:
         # parallel with one init per worker
@@ -486,7 +489,7 @@ def rasterise(
             ),
         ) as exe:
             for df in tqdm(
-                exe.map(_rasterise_chunk, batches), total=total_batches, desc=desc
+                exe.map(_rasterise_chunk, _iter_batches()), total=total_batches, desc=desc
             ):
                 results.append(df)
 

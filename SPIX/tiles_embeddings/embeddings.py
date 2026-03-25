@@ -202,6 +202,13 @@ def generate_embeddings(
     force: bool = False,
     verbose: bool = True,
     use_coords_as_tiles: bool = False,
+    use_inferred_grid_tiles: bool = False,
+    inferred_grid_mode: str = 'direct',
+    inferred_grid_pitch: Optional[float] = None,
+    inferred_grid_neighbor_radius: int = 1,
+    inferred_grid_min_neighbors: int = 3,
+    inferred_grid_closing_radius: int = 0,
+    inferred_grid_fill_holes: bool = False,
     coords_max_gap_factor: Optional[float] = 10.0,
     coords_compaction: str = 'cap',
     coords_tight_step: float = 1.0,
@@ -273,6 +280,32 @@ def generate_embeddings(
         origin=1). If ``tensor_resolution`` != 1, the coordinates are reduced
         using ``reduce_tensor_resolution`` before writing. Coordinates are then
         compacted to avoid excessively large gaps (see ``coords_max_gap_factor``).
+    use_inferred_grid_tiles : bool, optional (default=False)
+        If True, infer a post-QC regular lattice from the surviving coordinates
+        and use one of the inferred-grid tile builders controlled by
+        ``inferred_grid_mode``.
+    inferred_grid_mode : {'direct','boundary_voronoi'}, optional (default='direct')
+        Inferred-grid tiling mode.
+        - 'direct': keep observed spots at their original coordinates and add
+          only local synthetic support cells.
+        - 'boundary_voronoi': infer a support boundary on the post-QC lattice,
+          fill its interior, and assign every support cell to the nearest
+          surviving barcode.
+    inferred_grid_pitch : float or None, optional (default=None)
+        Override the inferred lattice pitch. When None, X/Y pitches are inferred
+        separately from the surviving coordinates.
+    inferred_grid_neighbor_radius : int, optional (default=1)
+        Radius of the local support neighborhood used to propose synthetic grid
+        cells near observed ones.
+    inferred_grid_min_neighbors : int, optional (default=3)
+        Minimum number of observed neighbors within the support neighborhood for
+        an empty inferred grid cell to be synthesized.
+    inferred_grid_closing_radius : int, optional (default=0)
+        Optional additional binary-closing radius on the inferred occupancy grid.
+        Keep at 0 for the most conservative behavior.
+    inferred_grid_fill_holes : bool, optional (default=False)
+        If True, fill enclosed holes in the inferred occupancy grid before
+        nearest-spot assignment. This is more aggressive and more artificial.
     coords_max_gap_factor : float or None, optional (default=10.0)
         When using coordinates-as-tiles, limit 1D gaps along X/Y to at most
         this factor times the median gap on that axis. Set to ``None`` or
@@ -351,6 +384,13 @@ def generate_embeddings(
             force=force,
             n_jobs=n_jobs,
             use_coords_as_tiles=use_coords_as_tiles,
+            use_inferred_grid_tiles=use_inferred_grid_tiles,
+            inferred_grid_mode=inferred_grid_mode,
+            inferred_grid_pitch=inferred_grid_pitch,
+            inferred_grid_neighbor_radius=inferred_grid_neighbor_radius,
+            inferred_grid_min_neighbors=inferred_grid_min_neighbors,
+            inferred_grid_closing_radius=inferred_grid_closing_radius,
+            inferred_grid_fill_holes=inferred_grid_fill_holes,
             coords_max_gap_factor=coords_max_gap_factor,
             coords_compaction=coords_compaction,
             coords_tight_step=coords_tight_step,

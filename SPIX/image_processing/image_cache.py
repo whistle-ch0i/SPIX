@@ -273,7 +273,17 @@ def cache_embedding_image(
 
     # Align tiles to obs index. Keep raster duplicates when origin=False.
     tiles_df = adata.uns["tiles"]
-    tiles = tiles_df[tiles_df.get("origin", 1) == 1] if origin else tiles_df
+    inferred_info = adata.uns.get("tiles_inferred_grid_info", {})
+    inferred_mode = str(inferred_info.get("mode", "")).lower()
+    if origin:
+        tiles = tiles_df[tiles_df.get("origin", 1) == 1]
+    else:
+        if inferred_mode == "boundary_voronoi" and ("origin" in tiles_df.columns):
+            tiles = tiles_df[tiles_df["origin"] == 0]
+            if verbose:
+                print("[cache_embedding_image] Using inferred boundary support-grid tiles only for origin=False caching.")
+        else:
+            tiles = tiles_df
     if "barcode" not in tiles.columns:
         raise ValueError("adata.uns['tiles'] must contain a 'barcode' column.")
     if "x" not in tiles.columns or "y" not in tiles.columns:
@@ -318,7 +328,7 @@ def cache_embedding_image(
     if coord_mode not in {"spatial", "array", "visium", "visiumhd", "auto"}:
         coord_mode = "spatial"
     if coord_mode == "auto":
-        if (array_row_key in adata.obs.columns) and (array_col_key in adata.obs.columns) and int(adata.n_obs) >= 200_000:
+        if origin and (array_row_key in adata.obs.columns) and (array_col_key in adata.obs.columns) and int(adata.n_obs) >= 200_000:
             coord_mode = "visiumhd"
         else:
             coord_mode = "spatial"
@@ -396,16 +406,9 @@ def cache_embedding_image(
         segment_available = False
         seg_col = None
 
-    # Geometry and pixel scaling
-    # Match image_plot behavior for origin=False raster-expanded tiles:
-    # use one point per barcode for density-based tile-size capping, otherwise
-    # the cap can become too small and produce visible holes.
+    # Geometry and pixel scaling. Use the full raster tile count for origin=False
+    # so auto-sizing preserves all raster tiles instead of collapsing to spot count.
     n_points_eff = int(spatial_coords.shape[0])
-    try:
-        if (not origin) and np.asarray(origin_flags).size > 0 and (np.asarray(origin_flags) != 1).any():
-            n_points_eff = int(pd.Index(np.asarray(barcodes, dtype=str)).nunique())
-    except Exception:
-        n_points_eff = int(spatial_coords.shape[0])
 
     x_min, x_max = spatial_coords[:, 0].min(), spatial_coords[:, 0].max()
     y_min, y_max = spatial_coords[:, 1].min(), spatial_coords[:, 1].max()
@@ -822,7 +825,31 @@ def _cache_embedding_image_legacy(
         raise ValueError(f"Embedding '{embedding}' not found in adata.obsm.")
 
     tiles_df = adata.uns["tiles"]
-    tiles = tiles_df[tiles_df.get("origin", 1) == 1] if origin else tiles_df
+    inferred_info = adata.uns.get("tiles_inferred_grid_info", {})
+    inferred_mode = str(inferred_info.get("mode", "")).lower()
+    use_direct_origin_spatial = False
+    if origin:
+        spatial_direct = None
+        try:
+            spatial_direct = np.asarray(adata.obsm["spatial"])
+        except Exception:
+            spatial_direct = None
+        if (
+            spatial_direct is not None
+            and spatial_direct.ndim == 2
+            and spatial_direct.shape[0] == adata.n_obs
+            and spatial_direct.shape[1] >= 2
+        ):
+            use_direct_origin_spatial = True
+        else:
+            tiles = tiles_df[tiles_df.get("origin", 1) == 1]
+    else:
+        if inferred_mode == "boundary_voronoi" and ("origin" in tiles_df.columns):
+            tiles = tiles_df[tiles_df["origin"] == 0]
+            if verbose:
+                print("[cache_embedding_image] Using inferred boundary support-grid tiles only for origin=False caching (legacy).")
+        else:
+            tiles = tiles_df
 
     E_full = np.asarray(adata.obsm[embedding])
     if E_full.shape[1] == len(dimensions):
@@ -831,21 +858,30 @@ def _cache_embedding_image_legacy(
         emb = E_full[:, dimensions]
 
     dim_cols = [f"dim{i}" for i in range(emb.shape[1])]
-    tile_colors = pd.DataFrame(emb, columns=dim_cols)
-    tile_colors["barcode"] = adata.obs.index.astype(str)
-    coordinates_df = (
-        pd.merge(tiles, tile_colors, on="barcode", how="right")
-        .dropna()
-        .reset_index(drop=True)
-    )
-    if len(coordinates_df) == 0:
-        raise ValueError("No coordinates found after merging tiles with embeddings.")
+    if use_direct_origin_spatial:
+        coordinates_df = pd.DataFrame({
+            "x": np.asarray(spatial_direct[:, 0], dtype=float),
+            "y": np.asarray(spatial_direct[:, 1], dtype=float),
+            "barcode": adata.obs.index.astype(str),
+            "origin": np.ones(int(adata.n_obs), dtype=np.int8),
+        })
+        coordinates_df.loc[:, dim_cols] = emb
+    else:
+        tile_colors = pd.DataFrame(emb, columns=dim_cols)
+        tile_colors["barcode"] = adata.obs.index.astype(str)
+        coordinates_df = (
+            pd.merge(tiles, tile_colors, on="barcode", how="right")
+            .dropna()
+            .reset_index(drop=True)
+        )
+        if len(coordinates_df) == 0:
+            raise ValueError("No coordinates found after merging tiles with embeddings.")
 
     coord_mode = str(coordinate_mode or "spatial").lower()
     if coord_mode not in {"spatial", "array", "visium", "visiumhd", "auto"}:
         coord_mode = "spatial"
     if coord_mode == "auto":
-        if (array_row_key in adata.obs.columns) and (array_col_key in adata.obs.columns) and int(adata.n_obs) >= 200_000:
+        if origin and (array_row_key in adata.obs.columns) and (array_col_key in adata.obs.columns) and int(adata.n_obs) >= 200_000:
             coord_mode = "visiumhd"
         else:
             coord_mode = "spatial"
@@ -909,14 +945,9 @@ def _cache_embedding_image_legacy(
     embeddings = coordinates_df[dim_cols].to_numpy(dtype=float)
 
     # Geometry and pixel scaling
+    # Geometry and pixel scaling. Use the full raster tile count for origin=False
+    # so auto-sizing preserves raster detail.
     n_points_eff = int(spatial_coords.shape[0])
-    try:
-        if (not origin) and ("origin" in coordinates_df.columns):
-            origin_vals = pd.to_numeric(coordinates_df["origin"], errors="coerce").fillna(1).to_numpy()
-            if (origin_vals != 1).any():
-                n_points_eff = int(coordinates_df["barcode"].astype(str).nunique())
-    except Exception:
-        n_points_eff = int(spatial_coords.shape[0])
 
     x_min, x_max = spatial_coords[:, 0].min(), spatial_coords[:, 0].max()
     y_min, y_max = spatial_coords[:, 1].min(), spatial_coords[:, 1].max()

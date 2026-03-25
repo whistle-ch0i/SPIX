@@ -34,6 +34,7 @@ def image_plot_slic_segmentation(
     spatial_coords: np.ndarray,
     n_segments: int = 100,
     compactness: float = 10.0,
+    n_points_eff: Optional[int] = None,
     figsize: tuple | None = None,
     fig_dpi: Optional[int] = None,
     imshow_tile_size: Optional[float] = None,
@@ -96,7 +97,7 @@ def image_plot_slic_segmentation(
         imshow_tile_size_rounding=imshow_tile_size_rounding,
         imshow_tile_size_shrink=imshow_tile_size_shrink,
         pixel_perfect=bool(pixel_perfect),
-        n_points=int(spatial_coords.shape[0]),
+        n_points=int(n_points_eff) if n_points_eff is not None else int(spatial_coords.shape[0]),
         logger=log,
         context="image_plot_slic_segmentation",
     )

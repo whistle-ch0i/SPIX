@@ -74,22 +74,61 @@ def _aggregate_labels_majority_by_obs_index(
     labels: np.ndarray,
     origin_flags: np.ndarray | pd.Series | list | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Aggregate tile-level labels to one label per observation index."""
-    df = pd.DataFrame({
-        "obs_index": np.asarray(obs_indices, dtype=np.int64),
-        "Segment": np.asarray(labels),
-    })
-    if origin_flags is not None:
-        df["_origin"] = np.asarray(origin_flags).astype(int)
-    else:
-        df["_origin"] = 0
+    """Aggregate tile-level labels to one label per observation index.
 
-    out_idx: list[int] = []
-    out_labels: list = []
-    for obs_idx, sub in df.groupby("obs_index", sort=False):
-        out_idx.append(int(obs_idx))
-        out_labels.append(_choose_majority_label(sub))
-    return np.asarray(out_idx, dtype=np.int64), np.asarray(out_labels)
+    Fast path for numeric labels using NumPy sorting/run-length encoding. Falls
+    back to the older pandas implementation for non-numeric labels.
+    """
+    obs_idx = np.asarray(obs_indices, dtype=np.int64)
+    lab = np.asarray(labels)
+    if obs_idx.ndim != 1 or lab.ndim != 1 or obs_idx.size != lab.size:
+        raise ValueError("obs_indices and labels must be 1D arrays of the same length")
+    if obs_idx.size == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=lab.dtype)
+
+    if origin_flags is None:
+        origin = np.zeros(obs_idx.size, dtype=np.int8)
+    else:
+        origin = np.asarray(origin_flags).astype(np.int8, copy=False)
+        if origin.ndim != 1 or origin.size != obs_idx.size:
+            raise ValueError("origin_flags must be None or a 1D array matching obs_indices length")
+
+    if not np.issubdtype(lab.dtype, np.number):
+        df = pd.DataFrame({
+            "obs_index": obs_idx,
+            "Segment": lab,
+            "_origin": origin.astype(int, copy=False),
+        })
+        out_idx: list[int] = []
+        out_labels: list = []
+        for obs_i, sub in df.groupby("obs_index", sort=False):
+            out_idx.append(int(obs_i))
+            out_labels.append(_choose_majority_label(sub))
+        return np.asarray(out_idx, dtype=np.int64), np.asarray(out_labels, dtype=object)
+
+    lab_int = np.asarray(lab, dtype=np.int64)
+    perm = np.lexsort((lab_int, obs_idx))
+    obs_s = obs_idx[perm]
+    lab_s = lab_int[perm]
+    org_s = origin[perm].astype(np.int64, copy=False)
+
+    pair_start = np.empty(obs_s.size, dtype=bool)
+    pair_start[0] = True
+    pair_start[1:] = (obs_s[1:] != obs_s[:-1]) | (lab_s[1:] != lab_s[:-1])
+    starts = np.flatnonzero(pair_start)
+    pair_obs = obs_s[starts]
+    pair_lab = lab_s[starts]
+    pair_counts = np.diff(np.append(starts, obs_s.size)).astype(np.int64, copy=False)
+    pair_origin = np.add.reduceat(org_s, starts).astype(np.int64, copy=False)
+
+    # Sort by obs asc, count desc, origin-count desc, label asc; first row per obs wins.
+    choose_perm = np.lexsort((pair_lab, -pair_origin, -pair_counts, pair_obs))
+    best_obs = pair_obs[choose_perm]
+    best_lab = pair_lab[choose_perm]
+    keep = np.empty(best_obs.size, dtype=bool)
+    keep[0] = True
+    keep[1:] = best_obs[1:] != best_obs[:-1]
+    return best_obs[keep].astype(np.int64, copy=False), best_lab[keep]
 
 
 def _aggregate_matrix_by_barcode(
@@ -562,10 +601,17 @@ def segment_image(
 
     # Retrieve tiles from adata.uns
     tiles_all = adata.uns["tiles"]
+    inferred_info = adata.uns.get("tiles_inferred_grid_info", {})
+    inferred_mode = str(inferred_info.get("mode", "")).lower()
     if origin:
         tiles = tiles_all[tiles_all.get("origin", 1) == 1]
     else:
-        tiles = tiles_all
+        if inferred_mode == "boundary_voronoi" and ("origin" in tiles_all.columns):
+            tiles = tiles_all[tiles_all["origin"] == 0]
+            if verbose:
+                print("[info] Using inferred boundary support-grid tiles only for origin=False segmentation.")
+        else:
+            tiles = tiles_all
     if "barcode" in tiles.columns:
         tiles = tiles.copy()
         tiles["barcode"] = tiles["barcode"].astype(str)
@@ -743,8 +789,10 @@ def segment_image(
     # Create a DataFrame from the selected embedding dimensions and add barcode from adata.obs index
     tile_colors = pd.DataFrame(np.array(adata.obsm[embedding])[:, dimensions])
     tile_colors["barcode"] = adata.obs.index.astype(str)
+    tile_colors["obs_index"] = np.arange(adata.n_obs, dtype=np.int64)
+    obs_barcodes_all = adata.obs.index.astype(str).to_numpy()
     # Base per-barcode embeddings for centroid computation (unique index)
-    base_embeddings_df = tile_colors.drop(columns=["barcode"]).copy()
+    base_embeddings_df = tile_colors.drop(columns=["barcode", "obs_index"]).copy()
     base_embeddings_df.index = tile_colors["barcode"].astype(str)
 
     # Merge tiles with embeddings based on 'barcode'
@@ -768,7 +816,7 @@ def segment_image(
     if coord_mode not in {"spatial", "array", "visium", "visiumhd", "auto"}:
         coord_mode = "spatial"
     if coord_mode == "auto":
-        if (array_row_key in adata.obs.columns) and (array_col_key in adata.obs.columns) and int(adata.n_obs) >= 200_000:
+        if origin and (array_row_key in adata.obs.columns) and (array_col_key in adata.obs.columns) and int(adata.n_obs) >= 200_000:
             coord_mode = "visiumhd"
         else:
             coord_mode = "spatial"
@@ -802,7 +850,7 @@ def segment_image(
             # Extract spatial coordinates
             spatial_coords_group = group[["x", "y"]].values
             # Drop columns that are not part of the embedding
-            drop_cols = ["barcode", "x", "y", "origin", library_id]
+            drop_cols = ["barcode", "obs_index", "x", "y", "origin", library_id]
             drop_cols = [col for col in drop_cols if col in group.columns]
             embeddings_group = group.drop(columns=drop_cols).values
             embeddings_df_group = group.drop(columns=drop_cols)
@@ -819,6 +867,7 @@ def segment_image(
                     spatial_coords_group,
                     n_segments=int(resolution),
                     compactness=compactness,
+                    n_points_eff=int(spatial_coords_group.shape[0]),
                     figsize=figsize,
                     fig_dpi=fig_dpi,
                     imshow_tile_size=imshow_tile_size,
@@ -830,12 +879,23 @@ def segment_image(
                     verbose=verbose,
                     n_jobs=n_jobs,
                 )
-                # Aggregate tile labels -> per-barcode labels (use origin flags for tie-break)
-                clusters_df_group = _aggregate_labels_majority(
-                    barcode_group,
-                    labels,
-                    origin_flags=group.get("origin", pd.Series(index=group.index, data=0)).values,
-                )
+                # Aggregate tile labels -> per-observation labels (use origin flags for tie-break)
+                group_obs_idx = group["obs_index"].to_numpy(dtype=np.int64, copy=False)
+                if np.unique(group_obs_idx).size == group_obs_idx.size:
+                    clusters_df_group = pd.DataFrame({
+                        "barcode": obs_barcodes_all[group_obs_idx],
+                        "Segment": np.asarray(labels),
+                    })
+                else:
+                    agg_idx, agg_labels = _aggregate_labels_majority_by_obs_index(
+                        group_obs_idx,
+                        labels,
+                        origin_flags=group.get("origin", pd.Series(index=group.index, data=0)).values,
+                    )
+                    clusters_df_group = pd.DataFrame({
+                        "barcode": obs_barcodes_all[agg_idx],
+                        "Segment": agg_labels,
+                    })
                 # Use per-barcode embeddings to compute pseudo-centroids
                 emb_base_group = base_embeddings_df.loc[clusters_df_group["barcode"].astype(str)].copy()
                 pseudo_centroids_group = create_pseudo_centroids(
@@ -930,9 +990,9 @@ def segment_image(
         # No library_id specified, process all data together
         spatial_coords = coordinates_df.loc[:, ["x", "y"]].values
         embeddings = coordinates_df.drop(
-            columns=["barcode", "x", "y", "origin"]
+            columns=["barcode", "obs_index", "x", "y", "origin"]
         ).values  # Convert to NumPy array
-        embeddings_df = coordinates_df.drop(columns=["barcode", "x", "y", "origin"])
+        embeddings_df = coordinates_df.drop(columns=["barcode", "obs_index", "x", "y", "origin"])
         embeddings_df.index = coordinates_df["barcode"]
         barcode = coordinates_df["barcode"]
 
@@ -1046,6 +1106,7 @@ def segment_image(
                         spatial_coords,
                         n_segments=int(resolution),
                         compactness=compactness,
+                        n_points_eff=int(spatial_coords.shape[0]),
                         figsize=figsize,
                         fig_dpi=fig_dpi,
                         imshow_tile_size=imshow_tile_size,
@@ -1058,11 +1119,22 @@ def segment_image(
                         n_jobs=n_jobs,
                     )
                     t1 = time.perf_counter()
-                    clusters_df = _aggregate_labels_majority(
-                        barcode,
-                        labels,
-                        origin_flags=coordinates_df.get("origin", pd.Series(index=coordinates_df.index, data=0)).values,
-                    )
+                    tile_obs_idx = coordinates_df["obs_index"].to_numpy(dtype=np.int64, copy=False)
+                    if np.unique(tile_obs_idx).size == tile_obs_idx.size:
+                        clusters_df = pd.DataFrame({
+                            "barcode": obs_barcodes_all[tile_obs_idx],
+                            "Segment": np.asarray(labels),
+                        })
+                    else:
+                        agg_idx, agg_labels = _aggregate_labels_majority_by_obs_index(
+                            tile_obs_idx,
+                            labels,
+                            origin_flags=coordinates_df.get("origin", pd.Series(index=coordinates_df.index, data=0)).values,
+                        )
+                        clusters_df = pd.DataFrame({
+                            "barcode": obs_barcodes_all[agg_idx],
+                            "Segment": agg_labels,
+                        })
                     t2 = time.perf_counter()
                     pseudo_centroids = _pseudo_centroids_from_clusters_df(
                         adata,
@@ -1081,6 +1153,7 @@ def segment_image(
                     spatial_coords,
                     n_segments=int(resolution),
                     compactness=compactness,
+                    n_points_eff=int(spatial_coords.shape[0]),
                     figsize=figsize,
                     fig_dpi=fig_dpi,
                     imshow_tile_size=imshow_tile_size,
@@ -1093,17 +1166,22 @@ def segment_image(
                     n_jobs=n_jobs,
                 )
                 t1 = time.perf_counter()
-                if not barcode.duplicated().any():
+                tile_obs_idx = coordinates_df["obs_index"].to_numpy(dtype=np.int64, copy=False)
+                if np.unique(tile_obs_idx).size == tile_obs_idx.size:
                     clusters_df = pd.DataFrame({
-                        "barcode": barcode.astype(str).values,
-                        "Segment": labels,
+                        "barcode": obs_barcodes_all[tile_obs_idx],
+                        "Segment": np.asarray(labels),
                     })
                 else:
-                    clusters_df = _aggregate_labels_majority(
-                        barcode,
+                    agg_idx, agg_labels = _aggregate_labels_majority_by_obs_index(
+                        tile_obs_idx,
                         labels,
                         origin_flags=coordinates_df.get("origin", pd.Series(index=coordinates_df.index, data=0)).values,
                     )
+                    clusters_df = pd.DataFrame({
+                        "barcode": obs_barcodes_all[agg_idx],
+                        "Segment": agg_labels,
+                    })
                 t2 = time.perf_counter()
                 pseudo_centroids = _pseudo_centroids_from_clusters_df(
                     adata,

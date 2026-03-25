@@ -105,6 +105,100 @@ def _coords_to_grid_indices(x, y, *, step: int):
     return xi, yi, w0, h0, x0, y0
 
 
+def _apply_axis_crop(ax, *, xlim=None, ylim=None):
+    if xlim is not None:
+        x = np.asarray(xlim, dtype=float).reshape(-1)
+        if x.size >= 2 and np.isfinite(x[:2]).all():
+            cur = ax.get_xlim()
+            descending = bool(cur[1] < cur[0])
+            x0, x1 = float(x[0]), float(x[1])
+            ax.set_xlim(x1, x0) if descending else ax.set_xlim(x0, x1)
+    if ylim is not None:
+        y = np.asarray(ylim, dtype=float).reshape(-1)
+        if y.size >= 2 and np.isfinite(y[:2]).all():
+            cur = ax.get_ylim()
+            descending = bool(cur[1] < cur[0])
+            y0, y1 = float(y[0]), float(y[1])
+            ax.set_ylim(y1, y0) if descending else ax.set_ylim(y0, y1)
+
+
+def _string_index_no_copy(values):
+    idx = pd.Index(values, copy=False)
+    inferred = getattr(idx, "inferred_type", None)
+    if inferred in {"string", "unicode"}:
+        return idx
+    try:
+        return idx.astype(str)
+    except Exception:
+        return pd.Index(np.asarray(idx, dtype=str))
+
+
+def _string_array_no_copy(values):
+    arr = values.to_numpy(copy=False) if hasattr(values, "to_numpy") else np.asarray(values)
+    dtype = getattr(arr, "dtype", None)
+    if dtype is not None and (dtype.kind in {"U", "S"} or dtype == object):
+        return arr
+    return np.asarray(arr, dtype=str)
+
+
+def _float_array_fast(values):
+    if hasattr(values, "dtype") and is_numeric_dtype(values.dtype):
+        return values.to_numpy(dtype=float, copy=False)
+    arr = values.to_numpy(copy=False) if hasattr(values, "to_numpy") else np.asarray(values)
+    if np.issubdtype(arr.dtype, np.number):
+        return arr.astype(float, copy=False)
+    return pd.to_numeric(values, errors="coerce").to_numpy(dtype=float, copy=False)
+
+
+def _rebalance_color_array(values, *, method="minmax", vmin=None, vmax=None):
+    arr = np.asarray(values, dtype=float)
+    squeeze = False
+    if arr.ndim == 1:
+        arr = arr[:, np.newaxis]
+        squeeze = True
+
+    if (vmin is not None) or (vmax is not None):
+        if vmin is None:
+            vmin_arr = np.nanmin(arr, axis=0)
+        else:
+            vmin_arr = np.asarray(vmin, dtype=float)
+        if vmax is None:
+            vmax_arr = np.nanmax(arr, axis=0)
+        else:
+            vmax_arr = np.asarray(vmax, dtype=float)
+        scaled = (arr - vmin_arr) / ((vmax_arr - vmin_arr) + 1e-10)
+    elif method == "minmax":
+        scaled = (arr - np.min(arr, axis=0)) / ((np.max(arr, axis=0) - np.min(arr, axis=0)) + 1e-10)
+    else:
+        scaled = arr
+
+    scaled = np.clip(scaled, 0.0, 1.0)
+    if squeeze:
+        return scaled[:, 0]
+    return scaled
+
+
+def _grouped_obs_indexer(tile_barcodes, obs_index):
+    arr = np.asarray(tile_barcodes)
+    n = int(arr.shape[0])
+    if n == 0:
+        return np.empty(0, dtype=np.int64), 0
+    change = np.empty(n, dtype=bool)
+    change[0] = True
+    if n > 1:
+        change[1:] = arr[1:] != arr[:-1]
+    starts = np.flatnonzero(change)
+    grouped_barcodes = arr[starts]
+    grouped_index = pd.Index(grouped_barcodes)
+    if grouped_index.has_duplicates:
+        pos = obs_index.get_indexer(arr)
+        return pos.astype(np.int64, copy=False), int(pd.Index(arr).nunique())
+    grouped_pos = obs_index.get_indexer(grouped_barcodes)
+    lengths = np.diff(np.append(starts, n))
+    pos = np.repeat(grouped_pos, lengths)
+    return pos.astype(np.int64, copy=False), int(grouped_barcodes.shape[0])
+
+
 def _compute_alpha_from_values(values, alpha_range=(0.1, 1.0), clip=None, invert=False):
     """Map raw numeric values -> alphas in [alpha_range[0], alpha_range[1]].
     - clip: (vmin, vmax) or None -> None uses [1, 99] percentiles.
@@ -410,6 +504,8 @@ def image_plot(
     array_col_key: str = "array_col",
     # Raster-expanded rendering controls (origin=False)
     gapless: bool = False,  # If True, render raster-expanded tiles as a packed grid (no holes, faster)
+    xlim=None,
+    ylim=None,
 ):
     """Visualize embeddings as a raster image with optional boundaries and per-spot alpha.
 
@@ -444,69 +540,380 @@ def image_plot(
     if embedding not in adata.obsm:
         raise ValueError(f"'{embedding}' embedding does not exist in adata.obsm.")
 
-    # Extract spatial coordinates
-    tiles_all = adata.uns["tiles"]
-    if origin and ("origin" in tiles_all.columns):
-        origin_mask = pd.to_numeric(tiles_all["origin"], errors="coerce").fillna(0) == 1
-        tiles = tiles_all[origin_mask]
-    else:
-        tiles = tiles_all
-    # Guard against duplicated barcodes in adata.uns['tiles'].
-    # NOTE: When `origin=False`, duplicates are often expected because each barcode can
-    # expand to multiple raster points (origin==0 + origin==1). In that case, we must
-    # keep duplicates; otherwise `origin` appears to have no effect.
-    if "barcode" in tiles.columns:
-        tiles = tiles.copy()
-        tiles["barcode"] = tiles["barcode"].astype(str)
-        if tiles["barcode"].duplicated().any():
-            origin_vals = pd.to_numeric(tiles.get("origin", 1), errors="coerce").fillna(1)
-            has_non_origin = (origin_vals != 1).any()
-            keep_dups = (not origin) and has_non_origin
-            if keep_dups:
-                if verbose:
-                    logger.info(
-                        "adata.uns['tiles'] contains duplicated barcodes (expected for origin=False raster tiles); keeping duplicates."
-                    )
+    # Extract spatial coordinates.
+    use_direct_origin_spatial = False
+    tiles = None
+    origin_vals = None
+    if origin:
+        spatial_direct = None
+        try:
+            spatial_direct = np.asarray(adata.obsm["spatial"])
+        except Exception:
+            spatial_direct = None
+        if (
+            spatial_direct is not None
+            and spatial_direct.ndim == 2
+            and spatial_direct.shape[0] == adata.n_obs
+            and spatial_direct.shape[1] >= 2
+        ):
+            use_direct_origin_spatial = True
+            tile_barcodes = _string_array_no_copy(adata.obs.index)
+            x_vals = np.asarray(spatial_direct[:, 0], dtype=float)
+            y_vals = np.asarray(spatial_direct[:, 1], dtype=float)
+            if verbose:
+                logger.info("Using adata.obsm['spatial'] directly for origin=True plotting.")
+        else:
+            tiles_all = adata.uns["tiles"]
+            tile_cols = [c for c in ("x", "y", "barcode", "origin") if c in tiles_all.columns]
+            if "origin" in tiles_all.columns:
+                origin_mask = _float_array_fast(tiles_all["origin"]) == 1
+                tiles = tiles_all.loc[origin_mask, tile_cols]
             else:
+                tiles = tiles_all.loc[:, tile_cols]
+    else:
+        tiles_all = adata.uns["tiles"]
+        tile_cols = [c for c in ("x", "y", "barcode", "origin") if c in tiles_all.columns]
+        tiles = tiles_all.loc[:, tile_cols]
+        inferred_info = adata.uns.get("tiles_inferred_grid_info", {})
+        inferred_mode = str(inferred_info.get("mode", "")).lower()
+        if inferred_mode == "boundary_voronoi" and ("origin" in tiles.columns):
+            support_mask = _float_array_fast(tiles["origin"]) == 0
+            if bool(np.any(support_mask)):
+                tiles = tiles.loc[support_mask, tile_cols]
+                if verbose:
+                    logger.info("Using inferred boundary support-grid tiles only for origin=False plotting.")
+
+    if not use_direct_origin_spatial:
+        if "barcode" not in tiles.columns:
+            raise ValueError("adata.uns['tiles'] must contain a 'barcode' column.")
+        if "x" not in tiles.columns or "y" not in tiles.columns:
+            raise ValueError("adata.uns['tiles'] must contain 'x' and 'y' columns.")
+        tile_barcodes = _string_array_no_copy(tiles["barcode"])
+        x_vals = _float_array_fast(tiles["x"])
+        y_vals = _float_array_fast(tiles["y"])
+        if "origin" in tiles.columns:
+            origin_vals = _float_array_fast(tiles["origin"])
+
+    # Prepare tile colors and align to tile rows (avoid large pandas merge for origin=False).
+    t0 = perf_counter()
+    obs_index = _string_index_no_copy(adata.obs.index)
+
+    grouped_barcode_count = None
+    if use_direct_origin_spatial:
+        pos = np.arange(int(adata.n_obs), dtype=np.int64)
+    else:
+        if origin:
+            barcode_index = pd.Index(tile_barcodes)
+            if barcode_index.has_duplicates:
                 if verbose:
                     logger.warning(
                         "adata.uns['tiles'] contains duplicated barcodes; keeping first occurrence for plotting."
                     )
-                tiles = tiles.drop_duplicates("barcode", keep="first")
+                keep_mask = ~barcode_index.duplicated(keep="first")
+                tiles = tiles.loc[keep_mask]
+                tile_barcodes = tile_barcodes[keep_mask]
+                x_vals = x_vals[keep_mask]
+                y_vals = y_vals[keep_mask]
+                if origin_vals is not None:
+                    origin_vals = origin_vals[keep_mask]
+            pos = obs_index.get_indexer(tile_barcodes)
+        else:
+            has_non_origin = False
+            if origin_vals is not None:
+                try:
+                    has_non_origin = np.isfinite(origin_vals).any() and (origin_vals != 1).any()
+                except Exception:
+                    has_non_origin = False
+            if verbose and has_non_origin:
+                logger.info(
+                    "adata.uns['tiles'] contains duplicated barcodes (expected for origin=False raster tiles); keeping duplicates."
+                )
+            if has_non_origin:
+                pos, grouped_barcode_count = _grouped_obs_indexer(tile_barcodes, obs_index)
+            else:
+                pos = obs_index.get_indexer(tile_barcodes)
 
-    # Prepare tile colors and align to tile rows (avoid large pandas merge for origin=False).
-    t0 = perf_counter()
-    obs_index = pd.Index(adata.obs.index.astype(str))
-    tiles = tiles.copy()
-    tiles["barcode"] = tiles["barcode"].astype(str)
-    tile_barcodes = tiles["barcode"].to_numpy()
-    pos = obs_index.get_indexer(tile_barcodes)
-    valid = pos >= 0
+    valid = (pos >= 0) & np.isfinite(x_vals) & np.isfinite(y_vals)
     if not np.any(valid):
         raise ValueError("No tile barcodes match adata.obs index.")
     embedding_full = np.asarray(adata.obsm[embedding])
     embedding_dims = embedding_full[:, dimensions]
     dim_names = ["dim0", "dim1", "dim2"] if len(dimensions) == 3 else ["dim0"]
-    coordinates_df = tiles.loc[valid].copy()
+    coord_mode = str(coordinate_mode or "spatial").lower()
+    if coord_mode not in {"spatial", "array", "visium", "visiumhd", "auto"}:
+        coord_mode = "spatial"
+    if coord_mode == "auto":
+        if origin and (array_row_key in adata.obs.columns) and (array_col_key in adata.obs.columns) and int(adata.n_obs) >= 200_000:
+            coord_mode = "visiumhd"
+        else:
+            coord_mode = "spatial"
+
+    fast_continuous_rgb = bool(
+        use_imshow
+        and (color_by is None)
+        and (alpha_by is None)
+        and (len(dimensions) == 3)
+        and (not plot_boundaries)
+        and (not fill_boundaries)
+        and (not segment_show_pie)
+        and (not segment_color_by_major)
+        and (not highlight_segments)
+        and (not prioritize_high_values)
+    )
+    if fast_continuous_rgb:
+        pos_valid = pos[valid].astype(np.int64, copy=False)
+        x_plot = np.asarray(x_vals[valid], dtype=float)
+        y_plot = np.asarray(y_vals[valid], dtype=float)
+        cols = _rebalance_color_array(
+            embedding_dims[pos_valid],
+            method=rebalance_method,
+            vmin=rebalance_vmin,
+            vmax=rebalance_vmax,
+        )
+        origin_plot = origin_vals[valid] if origin_vals is not None else None
+
+        if coord_mode in {"array", "visium", "visiumhd"}:
+            if (array_row_key not in adata.obs.columns) or (array_col_key not in adata.obs.columns):
+                raise ValueError(
+                    f"coordinate_mode='array' requires adata.obs['{array_row_key}'] and adata.obs['{array_col_key}']."
+                )
+            col_all = _float_array_fast(adata.obs[array_col_key])
+            row_all = _float_array_fast(adata.obs[array_row_key])
+            col = col_all[pos_valid]
+            row = row_all[pos_valid]
+            coord_valid = np.isfinite(col) & np.isfinite(row)
+            if coord_mode == "visium":
+                row_use = row[coord_valid].astype(float, copy=False)
+                parity = (np.rint(row_use).astype(np.int64, copy=False) % 2).astype(float)
+                x_plot = col[coord_valid].astype(float, copy=False) + 0.5 * parity
+                y_plot = row_use * (np.sqrt(3.0) / 2.0)
+            else:
+                x_plot = col[coord_valid].astype(float, copy=False)
+                y_plot = row[coord_valid].astype(float, copy=False)
+            cols = cols[coord_valid]
+            pos_valid = pos_valid[coord_valid]
+            if origin_plot is not None:
+                origin_plot = origin_plot[coord_valid]
+
+        coord_valid = np.isfinite(x_plot) & np.isfinite(y_plot)
+        if not np.any(coord_valid):
+            raise ValueError("No finite coordinates available for plotting.")
+        x_plot = x_plot[coord_valid]
+        y_plot = y_plot[coord_valid]
+        cols = cols[coord_valid]
+        if origin_plot is not None:
+            origin_plot = origin_plot[coord_valid]
+
+        if brighten_continuous:
+            max_per_pixel = cols.max(axis=1, keepdims=True)
+            scale_cols = np.where(max_per_pixel > 0, 1.0 / max_per_pixel, 0.0)
+            cols = np.clip(cols * scale_cols, 0.0, 1.0)
+            try:
+                gamma = float(continuous_gamma)
+                if gamma > 0 and gamma != 1.0:
+                    cols = np.clip(np.power(cols, gamma), 0.0, 1.0)
+            except Exception:
+                pass
+
+        x_min, x_max = float(np.min(x_plot)), float(np.max(x_plot))
+        y_min, y_max = float(np.min(y_plot)), float(np.max(y_plot))
+        pts = np.column_stack((x_plot, y_plot))
+        raster_canvas_for_imshow = None
+        n_points_eff = int(pts.shape[0])
+        imshow_tile_size_eff = imshow_tile_size
+        if coord_mode == "visiumhd" and imshow_tile_size_eff is None:
+            imshow_tile_size_eff = 1.0
+        raster_canvas_for_imshow = _raster.resolve_raster_canvas(
+            pts=pts,
+            x_min=float(x_min),
+            x_max=float(x_max),
+            y_min=float(y_min),
+            y_max=float(y_max),
+            figsize=figsize,
+            fig_dpi=fig_dpi,
+            imshow_tile_size=imshow_tile_size_eff,
+            imshow_scale_factor=imshow_scale_factor,
+            imshow_tile_size_mode=imshow_tile_size_mode,
+            imshow_tile_size_quantile=imshow_tile_size_quantile,
+            imshow_tile_size_rounding=imshow_tile_size_rounding,
+            imshow_tile_size_shrink=imshow_tile_size_shrink,
+            pixel_perfect=bool(pixel_perfect),
+            n_points=int(n_points_eff),
+            logger=logger,
+            context="image_plot(auto-size)",
+        )
+        s_data_units_for_imshow = float(raster_canvas_for_imshow["s_data_units"])
+        figsize = raster_canvas_for_imshow["figsize"]
+        fig_dpi = raster_canvas_for_imshow["fig_dpi"]
+
+        if figsize is None:
+            figsize = (10, 10)
+        if fig_dpi is None:
+            fig, ax = plt.subplots(figsize=figsize)
+        else:
+            fig, ax = plt.subplots(figsize=figsize, dpi=fig_dpi)
+        if verbose:
+            logger.info(
+                "Fast RGB path rows=%d; n_eff=%d; final figsize=%s, fig_dpi=%s",
+                int(pts.shape[0]),
+                int(n_points_eff),
+                tuple(figsize),
+                fig.get_dpi(),
+            )
+
+        if gapless and (not origin) and (origin_plot is not None):
+            try:
+                has_non_origin = np.isfinite(origin_plot).any() and (origin_plot != 1).any()
+            except Exception:
+                has_non_origin = False
+            if has_non_origin:
+                step_x = _infer_regular_grid_step(x_plot)
+                step_y = _infer_regular_grid_step(y_plot)
+                step = None
+                if step_x is not None and step_y is not None:
+                    step = int(max(1, min(int(step_x), int(step_y))))
+                elif step_x is not None:
+                    step = int(max(1, int(step_x)))
+                elif step_y is not None:
+                    step = int(max(1, int(step_y)))
+                if step is not None:
+                    t_grid = perf_counter()
+                    xi0, yi0, w0, h0, x0_int, y0_int = _coords_to_grid_indices(x_plot, y_plot, step=step)
+                    max_raster_px = int(os.environ.get("SPIX_PLOT_MAX_RASTER_PIXELS", "25000000"))
+                    max_raster_px = max(1, max_raster_px)
+                    total0 = int(w0) * int(h0)
+                    ds = int(max(1, int(np.ceil(np.sqrt(float(total0) / float(max_raster_px))))))
+                    xi = (xi0 // ds).astype(np.int64, copy=False)
+                    yi = (yi0 // ds).astype(np.int64, copy=False)
+                    w = int(xi.max(initial=0)) + 1
+                    h = int(yi.max(initial=0)) + 1
+                    img = np.zeros((h, w, 4), dtype=np.float32)
+                    img[yi, xi, :3] = cols
+                    img[yi, xi, 3] = 1.0
+                    step_eff = float(step) * float(ds)
+                    x_min_eff = float(x0_int) - 0.5 * step_eff
+                    x_max_eff = float(x0_int) + (float(w) - 0.5) * step_eff
+                    y_min_eff = float(y0_int) - 0.5 * step_eff
+                    y_max_eff = float(y0_int) + (float(h) - 0.5) * step_eff
+                    if verbose:
+                        logger.info(
+                            "gapless grid render: step=%d, ds=%d, buffer=(%d,%d) from (%d,%d) in %.3fs",
+                            int(step),
+                            int(ds),
+                            int(w),
+                            int(h),
+                            int(w0),
+                            int(h0),
+                            perf_counter() - t_grid,
+                        )
+                    ax.imshow(
+                        img,
+                        origin="lower",
+                        extent=[x_min_eff, x_max_eff, y_min_eff, y_max_eff],
+                        interpolation="nearest",
+                    )
+                    ax.set_xlim(x_min_eff, x_max_eff)
+                    ax.set_ylim(y_min_eff, y_max_eff)
+                    _apply_axis_crop(ax, xlim=xlim, ylim=ylim)
+                    ax.set_aspect("equal")
+                    ax.axis("off")
+                    title_text = (
+                        f"{embedding} - Dims = {', '.join(map(str, dimensions))}"
+                        if title is None
+                        else title
+                    )
+                    ax.set_title(title_text, fontsize=figsize[0] * 1.5)
+                    if verbose:
+                        logger.info("image_plot total time: %.3fs", perf_counter() - t_all)
+                    plt.show()
+                    return
+
+        raster_canvas = raster_canvas_for_imshow
+        s_data_units = float(raster_canvas["s_data_units"])
+        x_min_eff = float(raster_canvas["x_min_eff"])
+        x_max_eff = float(raster_canvas["x_max_eff"])
+        y_min_eff = float(raster_canvas["y_min_eff"])
+        y_max_eff = float(raster_canvas["y_max_eff"])
+        scale = float(raster_canvas["scale"])
+        s = int(raster_canvas["tile_px"])
+        w = int(raster_canvas["w"])
+        h = int(raster_canvas["h"])
+        if verbose and not (coord_mode == "visiumhd" and pixel_perfect):
+            logger.info("Rendering to an image buffer of size (w, h): (%d, %d)", int(w), int(h))
+        cx, cy = _raster.scale_points_to_canvas(
+            pts,
+            x_min_eff=float(x_min_eff),
+            y_min_eff=float(y_min_eff),
+            scale=float(scale),
+            pixel_perfect=bool(pixel_perfect),
+        )
+        if coord_mode == "visiumhd" and pixel_perfect:
+            x_i = np.floor(x_plot + 0.5).astype(np.int64, copy=False)
+            y_i = np.floor(y_plot + 0.5).astype(np.int64, copy=False)
+            x0, x1 = int(x_i.min()), int(x_i.max())
+            y0, y1 = int(y_i.min()), int(y_i.max())
+            w = max(1, int(x1 - x0 + 1))
+            h = max(1, int(y1 - y0 + 1))
+            cx = (x_i - x0).astype(np.int32, copy=False)
+            cy = (y_i - y0).astype(np.int32, copy=False)
+            if verbose:
+                logger.info("VisiumHD grid raster: buffer (w, h)=(%d, %d)", int(w), int(h))
+            s = 1
+            x_min_eff, x_max_eff = float(x0) - 0.5, float(x1) + 0.5
+            y_min_eff, y_max_eff = float(y0) - 0.5, float(y1) + 0.5
+        if verbose:
+            logger.info("Scaled tile size (in pixels): %d", int(s))
+
+        img = np.zeros((h, w, 4), dtype=np.float32)
+        ox, oy = _raster.tile_pixel_offsets(int(s), pixel_shape=pixel_shape)
+        pixels_per_tile = int(ox.size)
+        target_pixels = int(os.environ.get("SPIX_PLOT_RASTER_TARGET_PIXELS", "10000000"))
+        chunk_n = int(max(1, min(int(chunk_size), int(max(1, target_pixels // max(1, pixels_per_tile))))))
+        for i in range(0, len(cx), chunk_n):
+            end = min(i + chunk_n, len(cx))
+            all_x = np.clip((cx[i:end, None] + ox[None, :]).ravel(), 0, w - 1)
+            all_y = np.clip((cy[i:end, None] + oy[None, :]).ravel(), 0, h - 1)
+            cols_rep = np.repeat(cols[i:end], pixels_per_tile, axis=0)
+            img[all_y, all_x, :3] = cols_rep
+            img[all_y, all_x, 3] = 1.0
+
+        ax.imshow(
+            img,
+            origin="lower",
+            extent=[x_min_eff, x_max_eff, y_min_eff, y_max_eff],
+            interpolation="nearest",
+        )
+        _apply_axis_crop(ax, xlim=xlim, ylim=ylim)
+        ax.set_aspect("equal")
+        ax.axis("off")
+        title_text = (
+            f"{embedding} - Dims = {', '.join(map(str, dimensions))}"
+            if title is None
+            else title
+        )
+        ax.set_title(title_text, fontsize=figsize[0] * 1.5)
+        if verbose:
+            logger.info("image_plot total time: %.3fs", perf_counter() - t_all)
+        plt.show()
+        return
+    coord_dict = {
+        "x": x_vals[valid],
+        "y": y_vals[valid],
+        "barcode": tile_barcodes[valid],
+    }
+    if origin_vals is not None:
+        coord_dict["origin"] = origin_vals[valid]
+    elif use_direct_origin_spatial:
+        coord_dict["origin"] = np.ones(int(np.count_nonzero(valid)), dtype=np.float32)
+    coordinates_df = pd.DataFrame(coord_dict)
     coordinates_df.loc[:, dim_names] = embedding_dims[pos[valid]]
-    coordinates_df = coordinates_df.dropna(subset=["x", "y"]).reset_index(drop=True)
+    coordinates_df = coordinates_df.reset_index(drop=True)
     if verbose:
         logger.info(
             "Prepared coordinates_df rows=%d in %.3fs",
             int(coordinates_df.shape[0]),
             perf_counter() - t0,
         )
-
-    coord_mode = str(coordinate_mode or "spatial").lower()
-    if coord_mode not in {"spatial", "array", "visium", "visiumhd", "auto"}:
-        coord_mode = "spatial"
-    if coord_mode == "auto":
-        # Only auto-switch for very large datasets where array grid is almost certainly
-        # a VisiumHD-style dense lattice; otherwise leave as spatial to avoid distortion.
-        if (array_row_key in adata.obs.columns) and (array_col_key in adata.obs.columns) and int(adata.n_obs) >= 200_000:
-            coord_mode = "visiumhd"
-        else:
-            coord_mode = "spatial"
 
     if coord_mode in {"array", "visium", "visiumhd"}:
         if (array_row_key not in adata.obs.columns) or (array_col_key not in adata.obs.columns):
@@ -532,7 +939,10 @@ def image_plot(
 
     seg_col = None
     has_segments = False
-    if segment_key is not None:
+    need_segments = bool(
+        plot_boundaries or segment_show_pie or segment_color_by_major or bool(highlight_segments)
+    )
+    if need_segments and segment_key is not None:
         candidate = segment_key
         if candidate in adata.obs.columns:
             seg_col = candidate
@@ -802,21 +1212,11 @@ def image_plot(
     auto_sized = (not user_figsize_given) or (not user_dpi_given)
     pts_for_imshow = None
     s_data_units_for_imshow = None
+    raster_canvas_for_imshow = None
 
     if use_imshow:
-        # For raster-expanded tiles (origin=False with non-origin points present),
-        # the number of points can be orders of magnitude larger than the number of
-        # underlying barcodes. Use the barcode count for density-based tile-size
-        # capping and auto canvas sizing, otherwise the pitch gets capped too small
-        # and leaves "holes" in the filled tiles.
+        # Use the full raster tile count for origin=False auto canvas sizing.
         n_points_eff = int(coordinates.shape[0])
-        try:
-            if (not origin) and ("origin" in coordinates.columns) and ("barcode" in coordinates.columns):
-                origin_vals_eff = pd.to_numeric(coordinates["origin"], errors="coerce").fillna(1)
-                if (origin_vals_eff != 1).any():
-                    n_points_eff = int(coordinates["barcode"].nunique())
-        except Exception:
-            pass
 
         pts = coordinates[["x", "y"]].values
         pts_for_imshow = pts
@@ -825,7 +1225,7 @@ def image_plot(
             # VisiumHD uses a dense square lattice in array_row/array_col space.
             # Force pitch=1 (in array units) unless the user overrides it.
             imshow_tile_size_eff = 1.0
-        raster_canvas = _raster.resolve_raster_canvas(
+        raster_canvas_for_imshow = _raster.resolve_raster_canvas(
             pts=pts,
             x_min=float(x_min),
             x_max=float(x_max),
@@ -844,9 +1244,9 @@ def image_plot(
             logger=logger,
             context="image_plot(auto-size)",
         )
-        s_data_units_for_imshow = float(raster_canvas["s_data_units"])
-        figsize = raster_canvas["figsize"]
-        fig_dpi = raster_canvas["fig_dpi"]
+        s_data_units_for_imshow = float(raster_canvas_for_imshow["s_data_units"])
+        figsize = raster_canvas_for_imshow["figsize"]
+        fig_dpi = raster_canvas_for_imshow["fig_dpi"]
 
     if figsize is None:
         figsize = (10, 10)
@@ -965,6 +1365,7 @@ def image_plot(
                     )
                     ax.set_xlim(x_min_eff, x_max_eff)
                     ax.set_ylim(y_min_eff, y_max_eff)
+                    _apply_axis_crop(ax, xlim=xlim, ylim=ylim)
                     if verbose:
                         logger.info("image_plot total time: %.3fs", perf_counter() - t_all)
                     plt.show()
@@ -976,25 +1377,27 @@ def image_plot(
         imshow_tile_size_eff = imshow_tile_size
         if coord_mode == "visiumhd" and imshow_tile_size_eff is None:
             imshow_tile_size_eff = 1.0
-        raster_canvas = _raster.resolve_raster_canvas(
-            pts=pts,
-            x_min=float(x_min),
-            x_max=float(x_max),
-            y_min=float(y_min),
-            y_max=float(y_max),
-            figsize=figsize,
-            fig_dpi=fig.get_dpi(),
-            imshow_tile_size=imshow_tile_size_eff,
-            imshow_scale_factor=imshow_scale_factor,
-            imshow_tile_size_mode=imshow_tile_size_mode,
-            imshow_tile_size_quantile=imshow_tile_size_quantile,
-            imshow_tile_size_rounding=imshow_tile_size_rounding,
-            imshow_tile_size_shrink=imshow_tile_size_shrink,
-            pixel_perfect=bool(pixel_perfect),
-            n_points=int(n_points_eff),
-            logger=logger,
-            context="image_plot",
-        )
+        raster_canvas = raster_canvas_for_imshow
+        if raster_canvas is None:
+            raster_canvas = _raster.resolve_raster_canvas(
+                pts=pts,
+                x_min=float(x_min),
+                x_max=float(x_max),
+                y_min=float(y_min),
+                y_max=float(y_max),
+                figsize=figsize,
+                fig_dpi=fig.get_dpi(),
+                imshow_tile_size=imshow_tile_size_eff,
+                imshow_scale_factor=imshow_scale_factor,
+                imshow_tile_size_mode=imshow_tile_size_mode,
+                imshow_tile_size_quantile=imshow_tile_size_quantile,
+                imshow_tile_size_rounding=imshow_tile_size_rounding,
+                imshow_tile_size_shrink=imshow_tile_size_shrink,
+                pixel_perfect=bool(pixel_perfect),
+                n_points=int(n_points_eff),
+                logger=logger,
+                context="image_plot",
+            )
         s_data_units = float(raster_canvas["s_data_units"])
         x_min_eff = float(raster_canvas["x_min_eff"])
         x_max_eff = float(raster_canvas["x_max_eff"])
@@ -1811,6 +2214,7 @@ def image_plot(
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(y_min, y_max)
 
+    _apply_axis_crop(ax, xlim=xlim, ylim=ylim)
     plt.show()
     # Do not return plot object to avoid auto display
 
@@ -1844,6 +2248,8 @@ def image_plot_with_spatial_image(
     img_key=None,
     library_id=None,
     crop=True,
+    xlim=None,
+    ylim=None,
     alpha_img=1.0,
     bw=False,
     jitter=1e-6,
@@ -1961,51 +2367,116 @@ def image_plot_with_spatial_image(
     )
 
     # Extract spatial coordinates
-    tiles_all = adata.uns["tiles"]
-    if origin and ("origin" in tiles_all.columns):
-        origin_mask = pd.to_numeric(tiles_all["origin"], errors="coerce").fillna(0) == 1
-        tiles = tiles_all[origin_mask]
-    else:
-        tiles = tiles_all
-    # Guard against duplicated barcodes in adata.uns['tiles'].
-    # NOTE: When `origin=False`, duplicates are often expected because each barcode can
-    # expand to multiple raster points (origin==0 + origin==1). In that case, we must
-    # keep duplicates; otherwise `origin` appears to have no effect.
-    if "barcode" in tiles.columns:
-        tiles = tiles.copy()
-        tiles["barcode"] = tiles["barcode"].astype(str)
-        if tiles["barcode"].duplicated().any():
-            origin_vals = pd.to_numeric(tiles.get("origin", 1), errors="coerce").fillna(1)
-            has_non_origin = (origin_vals != 1).any()
-            keep_dups = (not origin) and has_non_origin
-            if keep_dups:
-                if verbose:
-                    logger.info(
-                        "adata.uns['tiles'] contains duplicated barcodes (expected for origin=False raster tiles); keeping duplicates."
-                    )
+    use_direct_origin_spatial = False
+    tiles = None
+    origin_vals = None
+    if origin:
+        spatial_direct = None
+        try:
+            spatial_direct = np.asarray(adata.obsm["spatial"])
+        except Exception:
+            spatial_direct = None
+        if (
+            spatial_direct is not None
+            and spatial_direct.ndim == 2
+            and spatial_direct.shape[0] == adata.n_obs
+            and spatial_direct.shape[1] >= 2
+        ):
+            use_direct_origin_spatial = True
+            tile_barcodes = _string_array_no_copy(adata.obs.index)
+            x_vals = np.asarray(spatial_direct[:, 0], dtype=float)
+            y_vals = np.asarray(spatial_direct[:, 1], dtype=float)
+            if verbose:
+                logger.info("Using adata.obsm['spatial'] directly for origin=True plotting.")
+        else:
+            tiles_all = adata.uns["tiles"]
+            tile_cols = [c for c in ("x", "y", "barcode", "origin") if c in tiles_all.columns]
+            if "origin" in tiles_all.columns:
+                origin_mask = pd.to_numeric(tiles_all["origin"], errors="coerce").fillna(0).to_numpy() == 1
+                tiles = tiles_all.loc[origin_mask, tile_cols]
             else:
+                tiles = tiles_all.loc[:, tile_cols]
+    else:
+        tiles_all = adata.uns["tiles"]
+        tile_cols = [c for c in ("x", "y", "barcode", "origin") if c in tiles_all.columns]
+        tiles = tiles_all.loc[:, tile_cols]
+        inferred_info = adata.uns.get("tiles_inferred_grid_info", {})
+        inferred_mode = str(inferred_info.get("mode", "")).lower()
+        if inferred_mode == "boundary_voronoi" and ("origin" in tiles.columns):
+            support_mask = _float_array_fast(tiles["origin"]) == 0
+            if bool(np.any(support_mask)):
+                tiles = tiles.loc[support_mask, tile_cols]
+                if verbose:
+                    logger.info("Using inferred boundary support-grid tiles only for origin=False plotting.")
+
+    if not use_direct_origin_spatial:
+        if "barcode" not in tiles.columns:
+            raise ValueError("adata.uns['tiles'] must contain a 'barcode' column.")
+        if "x" not in tiles.columns or "y" not in tiles.columns:
+            raise ValueError("adata.uns['tiles'] must contain 'x' and 'y' columns.")
+        tile_barcodes = _string_array_no_copy(tiles["barcode"])
+        x_vals = _float_array_fast(tiles["x"])
+        y_vals = _float_array_fast(tiles["y"])
+        if "origin" in tiles.columns:
+            origin_vals = _float_array_fast(tiles["origin"])
+
+    # Prepare tile colors and align to tile rows (avoid large pandas merge for origin=False).
+    t0 = perf_counter()
+    obs_index = _string_index_no_copy(adata.obs.index)
+
+    grouped_barcode_count = None
+    if use_direct_origin_spatial:
+        pos = np.arange(int(adata.n_obs), dtype=np.int64)
+    else:
+        if origin:
+            barcode_index = pd.Index(tile_barcodes)
+            if barcode_index.has_duplicates:
                 if verbose:
                     logger.warning(
                         "adata.uns['tiles'] contains duplicated barcodes; keeping first occurrence for plotting."
                     )
-                tiles = tiles.drop_duplicates("barcode", keep="first")
+                keep_mask = ~barcode_index.duplicated(keep="first")
+                tiles = tiles.loc[keep_mask]
+                tile_barcodes = tile_barcodes[keep_mask]
+                x_vals = x_vals[keep_mask]
+                y_vals = y_vals[keep_mask]
+                if origin_vals is not None:
+                    origin_vals = origin_vals[keep_mask]
+            pos = obs_index.get_indexer(tile_barcodes)
+        else:
+            has_non_origin = False
+            if origin_vals is not None:
+                try:
+                    has_non_origin = np.isfinite(origin_vals).any() and (origin_vals != 1).any()
+                except Exception:
+                    has_non_origin = False
+            if verbose and has_non_origin:
+                logger.info(
+                    "adata.uns['tiles'] contains duplicated barcodes (expected for origin=False raster tiles); keeping duplicates."
+                )
+            if has_non_origin:
+                pos, grouped_barcode_count = _grouped_obs_indexer(tile_barcodes, obs_index)
+            else:
+                pos = obs_index.get_indexer(tile_barcodes)
 
-    # Prepare tile colors and align to tile rows (avoid large pandas merge for origin=False).
-    t0 = perf_counter()
-    obs_index = pd.Index(adata.obs.index.astype(str))
-    tiles = tiles.copy()
-    tiles["barcode"] = tiles["barcode"].astype(str)
-    tile_barcodes = tiles["barcode"].to_numpy()
-    pos = obs_index.get_indexer(tile_barcodes)
-    valid = pos >= 0
+    valid = (pos >= 0) & np.isfinite(x_vals) & np.isfinite(y_vals)
     if not np.any(valid):
         raise ValueError("No tile barcodes match adata.obs index.")
     embedding_full = np.asarray(adata.obsm[embedding])
     embedding_dims = embedding_full[:, dimensions]
     dim_names = ["dim0", "dim1", "dim2"] if len(dimensions) == 3 else ["dim0"]
-    coordinates_df = tiles.loc[valid].copy()
+    coord_dict = {
+        "x": x_vals[valid],
+        "y": y_vals[valid],
+        "barcode": tile_barcodes[valid],
+    }
+    if origin_vals is not None:
+        coord_dict["origin"] = origin_vals[valid]
+    elif use_direct_origin_spatial:
+        coord_dict["origin"] = np.ones(int(np.count_nonzero(valid)), dtype=np.float32)
+    coordinates_df = pd.DataFrame(coord_dict)
     coordinates_df.loc[:, dim_names] = embedding_dims[pos[valid]]
-    coordinates_df = coordinates_df.dropna(subset=["x", "y"]).reset_index(drop=True)
+    coordinates_df = coordinates_df.reset_index(drop=True)
     if verbose:
         logger.info(
             "Prepared coordinates_df rows=%d in %.3fs",
@@ -2017,7 +2488,7 @@ def image_plot_with_spatial_image(
     if coord_mode not in {"spatial", "array", "visium", "visiumhd", "auto"}:
         coord_mode = "spatial"
     if coord_mode == "auto":
-        if (array_row_key in adata.obs.columns) and (array_col_key in adata.obs.columns) and int(adata.n_obs) >= 200_000:
+        if origin and (array_row_key in adata.obs.columns) and (array_col_key in adata.obs.columns) and int(adata.n_obs) >= 200_000:
             coord_mode = "visiumhd"
         else:
             coord_mode = "spatial"
@@ -2042,7 +2513,10 @@ def image_plot_with_spatial_image(
 
     seg_col = None
     has_segments = False
-    if segment_key is not None:
+    need_segments = bool(
+        plot_boundaries or segment_show_pie or segment_color_by_major or bool(highlight_segments)
+    )
+    if need_segments and segment_key is not None:
         candidate = segment_key
         if candidate in adata.obs.columns:
             seg_col = candidate
@@ -2263,24 +2737,18 @@ def image_plot_with_spatial_image(
     auto_sized = (not user_figsize_given) or (not user_dpi_given)
     pts_for_imshow = None
     s_data_units_for_imshow = None
+    raster_canvas_for_imshow = None
 
     if use_imshow:
-        # Same logic as image_plot(): use barcode count for raster-expanded tiles.
+        # Use the full raster tile count for origin=False auto canvas sizing.
         n_points_eff = int(coordinates.shape[0])
-        try:
-            if (not origin) and ("origin" in coordinates.columns) and ("barcode" in coordinates.columns):
-                origin_vals_eff = pd.to_numeric(coordinates["origin"], errors="coerce").fillna(1)
-                if (origin_vals_eff != 1).any():
-                    n_points_eff = int(coordinates["barcode"].nunique())
-        except Exception:
-            pass
 
         pts = coordinates[["x", "y"]].values
         pts_for_imshow = pts
         imshow_tile_size_eff = imshow_tile_size
         if coord_mode == "visiumhd" and imshow_tile_size_eff is None:
             imshow_tile_size_eff = 1.0
-        raster_canvas = _raster.resolve_raster_canvas(
+        raster_canvas_for_imshow = _raster.resolve_raster_canvas(
             pts=pts,
             x_min=float(x_min),
             x_max=float(x_max),
@@ -2299,9 +2767,9 @@ def image_plot_with_spatial_image(
             logger=logger,
             context="image_plot_with_spatial_image(auto-size)",
         )
-        s_data_units_for_imshow = float(raster_canvas["s_data_units"])
-        figsize = raster_canvas["figsize"]
-        fig_dpi = raster_canvas["fig_dpi"]
+        s_data_units_for_imshow = float(raster_canvas_for_imshow["s_data_units"])
+        figsize = raster_canvas_for_imshow["figsize"]
+        fig_dpi = raster_canvas_for_imshow["fig_dpi"]
 
     if figsize is None:
         figsize = (10, 10)
@@ -2378,6 +2846,8 @@ def image_plot_with_spatial_image(
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(y_max, y_min)
 
+    _apply_axis_crop(ax, xlim=xlim, ylim=ylim)
+
     if use_imshow:
         # Optional gapless packed-grid rendering for raster-expanded tiles (origin=False).
         if gapless and (not origin) and (not plot_boundaries) and ("origin" in coordinates.columns):
@@ -2444,6 +2914,7 @@ def image_plot_with_spatial_image(
                     )
                     ax.set_xlim(x_min_eff, x_max_eff)
                     ax.set_ylim(y_min_eff, y_max_eff)
+                    _apply_axis_crop(ax, xlim=xlim, ylim=ylim)
                     if verbose:
                         logger.info("image_plot_with_spatial_image total time: %.3fs", perf_counter() - t_all)
                     plt.show()
@@ -2454,25 +2925,27 @@ def image_plot_with_spatial_image(
         imshow_tile_size_eff = imshow_tile_size
         if coord_mode == "visiumhd" and imshow_tile_size_eff is None:
             imshow_tile_size_eff = 1.0
-        raster_canvas = _raster.resolve_raster_canvas(
-            pts=pts,
-            x_min=float(x_min),
-            x_max=float(x_max),
-            y_min=float(y_min),
-            y_max=float(y_max),
-            figsize=figsize,
-            fig_dpi=fig.get_dpi(),
-            imshow_tile_size=imshow_tile_size_eff,
-            imshow_scale_factor=imshow_scale_factor,
-            imshow_tile_size_mode=imshow_tile_size_mode,
-            imshow_tile_size_quantile=imshow_tile_size_quantile,
-            imshow_tile_size_rounding=imshow_tile_size_rounding,
-            imshow_tile_size_shrink=imshow_tile_size_shrink,
-            pixel_perfect=bool(pixel_perfect),
-            n_points=int(n_points_eff),
-            logger=logger,
-            context="image_plot_with_spatial_image",
-        )
+        raster_canvas = raster_canvas_for_imshow
+        if raster_canvas is None:
+            raster_canvas = _raster.resolve_raster_canvas(
+                pts=pts,
+                x_min=float(x_min),
+                x_max=float(x_max),
+                y_min=float(y_min),
+                y_max=float(y_max),
+                figsize=figsize,
+                fig_dpi=fig.get_dpi(),
+                imshow_tile_size=imshow_tile_size_eff,
+                imshow_scale_factor=imshow_scale_factor,
+                imshow_tile_size_mode=imshow_tile_size_mode,
+                imshow_tile_size_quantile=imshow_tile_size_quantile,
+                imshow_tile_size_rounding=imshow_tile_size_rounding,
+                imshow_tile_size_shrink=imshow_tile_size_shrink,
+                pixel_perfect=bool(pixel_perfect),
+                n_points=int(n_points_eff),
+                logger=logger,
+                context="image_plot_with_spatial_image",
+            )
         s_data_units = float(raster_canvas["s_data_units"])
         x_min_eff = float(raster_canvas["x_min_eff"])
         x_max_eff = float(raster_canvas["x_max_eff"])
