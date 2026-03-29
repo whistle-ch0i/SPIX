@@ -666,10 +666,12 @@ def rebalance_colors(coordinates, dimensions, method="minmax", vmin=None, vmax=N
     """
     def _fixed_scale(arr: np.ndarray, vmin_, vmax_) -> np.ndarray:
         arr = arr.astype(float, copy=False)
+        arr_stats = arr.copy()
+        arr_stats[~np.isfinite(arr_stats)] = np.nan
         if vmin_ is None:
-            vmin_ = np.nanmin(arr, axis=0)
+            vmin_ = np.nanmin(arr_stats, axis=0)
         if vmax_ is None:
-            vmax_ = np.nanmax(arr, axis=0)
+            vmax_ = np.nanmax(arr_stats, axis=0)
         vmin_arr = np.asarray(vmin_, dtype=float)
         vmax_arr = np.asarray(vmax_, dtype=float)
         denom = (vmax_arr - vmin_arr) + 1e-10
@@ -678,7 +680,10 @@ def rebalance_colors(coordinates, dimensions, method="minmax", vmin=None, vmax=N
 
     if len(dimensions) == 3:
         template = coordinates.loc[:, ["barcode", "x", "y", "origin"]].copy()
-        colors = coordinates.iloc[:, [4, 5, 6]].values
+        if all(col in coordinates.columns for col in ["dim0", "dim1", "dim2"]):
+            colors = coordinates.loc[:, ["dim0", "dim1", "dim2"]].to_numpy(dtype=float, copy=False)
+        else:
+            colors = coordinates.iloc[:, [4, 5, 6]].values
 
         if (vmin is not None) or (vmax is not None):
             colors = _fixed_scale(colors, vmin, vmax)
@@ -687,11 +692,17 @@ def rebalance_colors(coordinates, dimensions, method="minmax", vmin=None, vmax=N
         else:
             colors = np.clip(colors, 0, 1)
 
-        template = pd.concat([template, pd.DataFrame(colors, columns=["R", "G", "B"])], axis=1)
+        template = pd.concat(
+            [template, pd.DataFrame(colors, columns=["R", "G", "B"], index=template.index)],
+            axis=1,
+        )
 
     else:
         template = coordinates.loc[:, ["barcode", "x", "y", "origin"]].copy()
-        colors = coordinates.iloc[:, 4].values
+        if "dim0" in coordinates.columns:
+            colors = coordinates.loc[:, "dim0"].to_numpy(dtype=float, copy=False)
+        else:
+            colors = coordinates.iloc[:, 4].values
 
         if (vmin is not None) or (vmax is not None):
             colors = _fixed_scale(np.asarray(colors), vmin, vmax).astype(float)
@@ -700,7 +711,10 @@ def rebalance_colors(coordinates, dimensions, method="minmax", vmin=None, vmax=N
         else:
             colors = np.clip(colors, 0, 1)
 
-        template = pd.concat([template, pd.Series(colors, name="Grey")], axis=1)
+        template = pd.concat(
+            [template, pd.Series(colors, name="Grey", index=template.index)],
+            axis=1,
+        )
 
     return template
 
@@ -988,7 +1002,12 @@ def min_max(values):
     np.ndarray
         Normalized array.
     """
-    return (values - np.min(values)) / (np.max(values) - np.min(values) + 1e-10)
+    arr = np.asarray(values, dtype=float)
+    arr_stats = arr.copy()
+    arr_stats[~np.isfinite(arr_stats)] = np.nan
+    vmin = np.nanmin(arr_stats)
+    vmax = np.nanmax(arr_stats)
+    return (arr - vmin) / (vmax - vmin + 1e-10)
 
 
 def equalize_piecewise(data: np.ndarray, N: int = 1, smax: float = 1.0) -> np.ndarray:

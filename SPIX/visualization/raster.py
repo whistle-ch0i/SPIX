@@ -44,6 +44,19 @@ def estimate_tile_size_units(
     logger=None,
 ) -> float:
     """Estimate tile pitch in data units (image_plot-compatible)."""
+    pts = np.asarray(pts, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] < 2:
+        raise ValueError("pts must be a 2D array with at least two columns.")
+    pts = pts[:, :2]
+    finite_mask = np.isfinite(pts).all(axis=1)
+    if not np.all(finite_mask):
+        if logger is not None:
+            logger.warning(
+                "Dropping %d non-finite coordinate rows before tile-size estimation.",
+                int(np.size(finite_mask) - np.count_nonzero(finite_mask)),
+            )
+        pts = pts[finite_mask]
+
     s_data_units = 1.0
     mode = str(imshow_tile_size_mode or "nn").lower()
     if mode not in {"nn", "axis", "auto"}:
@@ -97,6 +110,11 @@ def estimate_tile_size_units(
 
             if logger is not None:
                 logger.info("Auto-calculated tile size (data units): %.2f", float(s_data_units))
+        elif logger is not None:
+            logger.warning(
+                "Tile-size estimation received fewer than two finite points; using fallback size %.2f.",
+                float(s_data_units),
+            )
     else:
         s_data_units = float(imshow_tile_size)
 

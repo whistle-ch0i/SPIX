@@ -157,18 +157,23 @@ def _rebalance_color_array(values, *, method="minmax", vmin=None, vmax=None):
         arr = arr[:, np.newaxis]
         squeeze = True
 
+    arr_stats = arr.copy()
+    arr_stats[~np.isfinite(arr_stats)] = np.nan
+
     if (vmin is not None) or (vmax is not None):
         if vmin is None:
-            vmin_arr = np.nanmin(arr, axis=0)
+            vmin_arr = np.nanmin(arr_stats, axis=0)
         else:
             vmin_arr = np.asarray(vmin, dtype=float)
         if vmax is None:
-            vmax_arr = np.nanmax(arr, axis=0)
+            vmax_arr = np.nanmax(arr_stats, axis=0)
         else:
             vmax_arr = np.asarray(vmax, dtype=float)
         scaled = (arr - vmin_arr) / ((vmax_arr - vmin_arr) + 1e-10)
     elif method == "minmax":
-        scaled = (arr - np.min(arr, axis=0)) / ((np.max(arr, axis=0) - np.min(arr, axis=0)) + 1e-10)
+        vmin_arr = np.nanmin(arr_stats, axis=0)
+        vmax_arr = np.nanmax(arr_stats, axis=0)
+        scaled = (arr - vmin_arr) / ((vmax_arr - vmin_arr) + 1e-10)
     else:
         scaled = arr
 
@@ -695,9 +700,9 @@ def image_plot(
             if origin_plot is not None:
                 origin_plot = origin_plot[coord_valid]
 
-        coord_valid = np.isfinite(x_plot) & np.isfinite(y_plot)
+        coord_valid = np.isfinite(x_plot) & np.isfinite(y_plot) & np.isfinite(cols).all(axis=1)
         if not np.any(coord_valid):
-            raise ValueError("No finite coordinates available for plotting.")
+            raise ValueError("No finite coordinates/colors available for plotting.")
         x_plot = x_plot[coord_valid]
         y_plot = y_plot[coord_valid]
         cols = cols[coord_valid]
@@ -977,11 +982,15 @@ def image_plot(
     coordinates_df["x"] = pd.to_numeric(coordinates_df["x"], errors="coerce")
     coordinates_df["y"] = pd.to_numeric(coordinates_df["y"], errors="coerce")
 
-    if coordinates_df[["x", "y"]].isnull().any().any():
+    coord_xy = coordinates_df[["x", "y"]].to_numpy(dtype=float, copy=False)
+    finite_coord_mask = np.isfinite(coord_xy).all(axis=1)
+    if not np.all(finite_coord_mask):
+        dropped = int(finite_coord_mask.size - np.count_nonzero(finite_coord_mask))
         logger.warning(
-            "Found NaN values in 'x' or 'y' after conversion. Dropping these rows."
+            "Found %d non-finite values in 'x' or 'y' after conversion. Dropping these rows.",
+            dropped,
         )
-        coordinates_df = coordinates_df.dropna(subset=["x", "y"])
+        coordinates_df = coordinates_df.loc[finite_coord_mask].reset_index(drop=True)
 
     # Values for depth buffering (initial default)
     if len(dimensions) == 1:
@@ -2250,6 +2259,7 @@ def image_plot_with_spatial_image(
     crop=True,
     xlim=None,
     ylim=None,
+    display_orientation: str = "cartesian",  # 'cartesian' (default) or 'image'
     alpha_img=1.0,
     bw=False,
     jitter=1e-6,
@@ -2365,6 +2375,18 @@ def image_plot_with_spatial_image(
     img_scaling_factor_adjusted = (
         img_scaling_factor / tensor_resolution if img_scaling_factor else 1.0
     )
+    img_origin_x = 0.0
+    img_origin_y = 0.0
+    if spatial_data is not None and img_key is not None:
+        try:
+            image_origins_um = spatial_data.get("metadata", {}).get("image_origins_um", {})
+            img_origin_um = image_origins_um.get(img_key)
+            if img_origin_um is not None and len(img_origin_um) >= 2:
+                img_origin_x = float(img_origin_um[0]) * float(img_scaling_factor_adjusted)
+                img_origin_y = float(img_origin_um[1]) * float(img_scaling_factor_adjusted)
+        except Exception:
+            img_origin_x = 0.0
+            img_origin_y = 0.0
 
     # Extract spatial coordinates
     use_direct_origin_spatial = False
@@ -2550,11 +2572,15 @@ def image_plot_with_spatial_image(
     coordinates_df["x"] = pd.to_numeric(coordinates_df["x"], errors="coerce")
     coordinates_df["y"] = pd.to_numeric(coordinates_df["y"], errors="coerce")
 
-    if coordinates_df[["x", "y"]].isnull().any().any():
+    coord_xy = coordinates_df[["x", "y"]].to_numpy(dtype=float, copy=False)
+    finite_coord_mask = np.isfinite(coord_xy).all(axis=1)
+    if not np.all(finite_coord_mask):
+        dropped = int(finite_coord_mask.size - np.count_nonzero(finite_coord_mask))
         logger.warning(
-            "Found NaN values in 'x' or 'y' after conversion. Dropping these rows."
+            "Found %d non-finite values in 'x' or 'y' after conversion. Dropping these rows.",
+            dropped,
         )
-        coordinates_df = coordinates_df.dropna(subset=["x", "y"])
+        coordinates_df = coordinates_df.loc[finite_coord_mask].reset_index(drop=True)
 
     # Apply adjusted scaling factor to coordinates
     coordinates_df["x"] *= img_scaling_factor_adjusted
@@ -2818,10 +2844,22 @@ def image_plot_with_spatial_image(
         if highlight_linewidth is None:
             highlight_linewidth = boundary_linewidth * 2
 
+    orientation = str(display_orientation or "image").lower()
+    if orientation not in {"image", "cartesian"}:
+        orientation = "image"
+
     if img is not None:
         y_max_img, x_max_img = img.shape[:2]
-        extent = [0, x_max_img, y_max_img, 0]  # Left, Right, Bottom, Top
-        ax.imshow(img, extent=extent, alpha=alpha_img)
+        img_x_min = float(img_origin_x)
+        img_x_max = float(img_origin_x) + float(x_max_img)
+        img_y_min = float(img_origin_y)
+        img_y_max = float(img_origin_y) + float(y_max_img)
+        if orientation == "cartesian":
+            extent = [img_x_min, img_x_max, img_y_min, img_y_max]
+            ax.imshow(img, extent=extent, origin="lower", alpha=alpha_img)
+        else:
+            extent = [img_x_min, img_x_max, img_y_max, img_y_min]  # Left, Right, Bottom, Top
+            ax.imshow(img, extent=extent, alpha=alpha_img)
 
         if crop:
             x_range_spots = x_max - x_min
@@ -2833,18 +2871,27 @@ def image_plot_with_spatial_image(
             view_x_max = x_max + x_padding
             view_y_min_data = y_min - y_padding
             view_y_max_data = y_max + y_padding
-            final_x_min = max(0, view_x_min)
-            final_x_max = min(x_max_img, view_x_max)
-            final_y_bottom_limit = min(y_max_img, view_y_max_data)
-            final_y_top_limit = max(0, view_y_min_data)
+            final_x_min = max(img_x_min, view_x_min)
+            final_x_max = min(img_x_max, view_x_max)
+            final_y_bottom_limit = min(img_y_max, view_y_max_data)
+            final_y_top_limit = max(img_y_min, view_y_min_data)
             ax.set_xlim(final_x_min, final_x_max)
-            ax.set_ylim(final_y_bottom_limit, final_y_top_limit)
+            if orientation == "cartesian":
+                ax.set_ylim(final_y_top_limit, final_y_bottom_limit)
+            else:
+                ax.set_ylim(final_y_bottom_limit, final_y_top_limit)
         else:
-            ax.set_xlim(0, x_max_img)
-            ax.set_ylim(y_max_img, 0)
+            ax.set_xlim(img_x_min, img_x_max)
+            if orientation == "cartesian":
+                ax.set_ylim(img_y_min, img_y_max)
+            else:
+                ax.set_ylim(img_y_max, img_y_min)
     else:
         ax.set_xlim(x_min, x_max)
-        ax.set_ylim(y_max, y_min)
+        if orientation == "cartesian":
+            ax.set_ylim(y_min, y_max)
+        else:
+            ax.set_ylim(y_max, y_min)
 
     _apply_axis_crop(ax, xlim=xlim, ylim=ylim)
 

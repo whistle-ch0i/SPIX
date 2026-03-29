@@ -8,11 +8,16 @@ SPIX.egg-info/requires.txt
 SPIX.egg-info/top_level.txt
 SPIX/analysis/__init__.py
 SPIX/analysis/calculate_original_moranI.py
+SPIX/analysis/celltype_enrichment.py
 SPIX/analysis/enrichment_analysis.py
+SPIX/analysis/geary_supplementary_figure.py
 SPIX/analysis/gene_expression_embedding.py
+SPIX/analysis/moran_geary_comparison.py
 SPIX/analysis/multiscale_moran_ranks.py
 SPIX/analysis/perform_pseudo_bulk_analysis.py
 SPIX/analysis/segment_svg_enrichment.py
+SPIX/analysis/svg_gain_explanation.py
+SPIX/analysis/svg_specificity.py
 SPIX/image_processing/__init__.py
 SPIX/image_processing/equalization.py
 SPIX/image_processing/image_cache.py

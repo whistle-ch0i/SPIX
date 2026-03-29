@@ -162,6 +162,65 @@ def _sanitize_segment_name(name: str) -> str:
     return sanitized
 
 
+def fixed_grid_segmentation(
+    spatial_coords: np.ndarray,
+    side_um: float,
+    origin_x: float | None = None,
+    origin_y: float | None = None,
+) -> tuple[np.ndarray, dict]:
+    """Assign each coordinate to an exact square grid cell.
+
+    This is the exact analytic grid used in the figure4 helper scripts:
+    labels are defined by ``floor((x - x0) / side_um)`` and
+    ``floor((y - y0) / side_um)`` with ``x0/y0`` taken from either the
+    provided origin or the minimum observed coordinates.
+    """
+    coords = np.asarray(spatial_coords, dtype=float)
+    if coords.ndim != 2 or coords.shape[1] < 2:
+        raise ValueError("spatial_coords must be a 2D array with at least two columns.")
+
+    side_um = float(max(side_um, 1e-9))
+    labels = np.full(coords.shape[0], np.nan, dtype=object)
+    valid = np.isfinite(coords[:, :2]).all(axis=1)
+    if not np.any(valid):
+        return labels, {
+            "grid_mode": "fixed_grid",
+            "grid_side_um": side_um,
+            "grid_origin_x": float(origin_x) if origin_x is not None else np.nan,
+            "grid_origin_y": float(origin_y) if origin_y is not None else np.nan,
+            "grid_nx": 0,
+            "grid_ny": 0,
+            "grid_total_cells": 0,
+            "grid_occupied_segments": 0,
+        }
+
+    xy = coords[valid, :2]
+    x = xy[:, 0]
+    y = xy[:, 1]
+    x0 = float(np.nanmin(x) if origin_x is None else origin_x)
+    y0 = float(np.nanmin(y) if origin_y is None else origin_y)
+    gx = np.floor((x - x0) / side_um).astype(np.int64)
+    gy = np.floor((y - y0) / side_um).astype(np.int64)
+    labels_valid = gx.astype(str) + "_" + gy.astype(str)
+    labels[valid] = labels_valid
+
+    x1 = float(np.nanmax(x))
+    y1 = float(np.nanmax(y))
+    nx = max(int(np.floor((x1 - x0) / side_um)) + 1, 1)
+    ny = max(int(np.floor((y1 - y0) / side_um)) + 1, 1)
+    meta = {
+        "grid_mode": "fixed_grid",
+        "grid_side_um": side_um,
+        "grid_origin_x": x0,
+        "grid_origin_y": y0,
+        "grid_nx": nx,
+        "grid_ny": ny,
+        "grid_total_cells": int(nx * ny),
+        "grid_occupied_segments": int(pd.Index(labels_valid).nunique()),
+    }
+    return labels, meta
+
+
 def _pseudo_centroids_from_segment_labels(
     embeddings: np.ndarray, segment_labels: np.ndarray
 ) -> np.ndarray:
@@ -513,6 +572,8 @@ def segment_image(
     coordinate_mode: str = "spatial",  # 'spatial'|'array'|'visium'|'visiumhd'|'auto'
     array_row_key: str = "array_row",
     array_col_key: str = "array_col",
+    grid_origin_x: float | None = None,
+    grid_origin_y: float | None = None,
 ):
     """
     Segment embeddings to find initial territories.
@@ -527,7 +588,7 @@ def segment_image(
         Key in adata.obsm where the embeddings are stored.
     method : str, optional (default='slic')
         Segmentation method: 'kmeans', 'louvain', 'leiden', 'slic', 'som',
-        'leiden_slic', 'louvain_slic', 'image_plot_slic'.
+        'leiden_slic', 'louvain_slic', 'image_plot_slic', 'fixed_grid'.
     resolution : float, optional (default=10.0)
         Resolution parameter for clustering methods.
     compactness : float, optional (default=1.0)
@@ -581,6 +642,8 @@ def segment_image(
     target_segment_um : float or None, optional (default=None)
         Desired segment size in micrometers. If provided, ``resolution``
         is ignored and the number of segments is calculated automatically.
+        For ``method='fixed_grid'``, this is interpreted as the exact square
+        grid side length in micrometers.
     pitch_um : float, optional (default=2.0)
         Distance between neighbouring spots in micrometers used when
         ``target_segment_um`` is specified.
@@ -590,6 +653,9 @@ def segment_image(
         (uses ``adata.obs[array_row_key/array_col_key]``).
     array_row_key / array_col_key : str
         Column names in ``adata.obs`` used when ``coordinate_mode='array'``.
+    grid_origin_x / grid_origin_y : float or None, optional
+        Optional explicit grid origin for ``method='fixed_grid'``.
+        When omitted, the minimum observed x/y coordinates are used.
 
     Returns
     -------
@@ -642,12 +708,23 @@ def segment_image(
     except Exception:
         pass
 
-    if target_segment_um is not None:
+    if target_segment_um is not None and method != "fixed_grid":
         resolution = n_segments_from_size(
             tiles_for_n, target_um=target_segment_um, pitch_um=pitch_um
         )
         if verbose:
             print(f"→ SLIC  n_segments = {resolution}")
+    elif target_segment_um is not None and method == "fixed_grid":
+        resolution = float(target_segment_um)
+        if verbose:
+            print(f"→ Fixed grid side_um = {resolution}")
+
+    if method == "fixed_grid" and verbose:
+        print(
+            "[info] fixed_grid assigns exact square cells from coordinates only; "
+            "embedding/dimensions are used only for pseudo-centroids. "
+            "pitch_um, compactness, enforce_connectivity, show_image, and use_cached_image are ignored."
+        )
 
     # Fast path: cached image SLIC without building coordinates_df/embeddings_df
     if (
@@ -785,6 +862,118 @@ def segment_image(
             print(
                 f"[warning] Cached image origin={bool(cached_origin)} differs from requested origin={bool(origin)}; regenerating image."
             )
+
+    # Fast path: exact fixed-grid labels do not require merge-heavy DataFrame construction.
+    if method == "fixed_grid" and library_id is None:
+        coord_mode = str(coordinate_mode or "spatial").lower()
+        if coord_mode not in {"spatial", "array", "visium", "visiumhd", "auto"}:
+            coord_mode = "spatial"
+        if coord_mode == "auto":
+            if origin and (array_row_key in adata.obs.columns) and (array_col_key in adata.obs.columns) and int(adata.n_obs) >= 200_000:
+                coord_mode = "visiumhd"
+            else:
+                coord_mode = "spatial"
+
+        tile_barcodes = pd.Series(tiles.get("barcode", []), dtype=str).to_numpy()
+        if tile_barcodes.size == 0:
+            raise ValueError("adata.uns['tiles'] must contain a non-empty 'barcode' column for fixed_grid segmentation.")
+
+        obs_barcodes = pd.Index(adata.obs.index.astype(str))
+        tile_obs_idx = obs_barcodes.get_indexer(pd.Index(tile_barcodes))
+        obs_ok = tile_obs_idx >= 0
+
+        x = np.full(tile_barcodes.size, np.nan, dtype=float)
+        y = np.full(tile_barcodes.size, np.nan, dtype=float)
+        if coord_mode in {"array", "visium", "visiumhd"}:
+            if (array_row_key not in adata.obs.columns) or (array_col_key not in adata.obs.columns):
+                raise ValueError(
+                    f"coordinate_mode='array' requires adata.obs['{array_row_key}'] and adata.obs['{array_col_key}']."
+                )
+            obs_col = pd.to_numeric(adata.obs[array_col_key], errors="coerce").to_numpy(dtype=float, copy=False)
+            obs_row = pd.to_numeric(adata.obs[array_row_key], errors="coerce").to_numpy(dtype=float, copy=False)
+            valid_obs_idx = tile_obs_idx[obs_ok]
+            if coord_mode == "visium":
+                row_vals = obs_row[valid_obs_idx]
+                col_vals = obs_col[valid_obs_idx]
+                parity = np.mod(row_vals, 2.0)
+                x[obs_ok] = col_vals + 0.5 * parity
+                y[obs_ok] = row_vals * (np.sqrt(3.0) / 2.0)
+            else:
+                x[obs_ok] = obs_col[valid_obs_idx]
+                y[obs_ok] = obs_row[valid_obs_idx]
+        else:
+            if ("x" not in tiles.columns) or ("y" not in tiles.columns):
+                raise ValueError("adata.uns['tiles'] must contain numeric 'x' and 'y' columns for fixed_grid segmentation.")
+            x = pd.to_numeric(tiles["x"], errors="coerce").to_numpy(dtype=float, copy=False)
+            y = pd.to_numeric(tiles["y"], errors="coerce").to_numpy(dtype=float, copy=False)
+
+        E_full = np.asarray(adata.obsm[embedding])
+        if E_full.ndim != 2 or E_full.shape[0] != adata.n_obs:
+            raise ValueError(f"Embedding '{embedding}' must be a 2D array with n_obs rows.")
+        E_use = E_full if E_full.shape[1] == len(dimensions) else E_full[:, dimensions]
+
+        emb_ok = np.zeros(tile_barcodes.size, dtype=bool)
+        if np.any(obs_ok):
+            emb_ok[obs_ok] = np.isfinite(np.asarray(E_use[tile_obs_idx[obs_ok]], dtype=np.float32)).all(axis=1)
+
+        tile_valid = obs_ok & np.isfinite(x) & np.isfinite(y) & emb_ok
+        coords_valid = np.column_stack([x[tile_valid], y[tile_valid]])
+
+        t0 = time.perf_counter()
+        tile_labels, grid_meta = fixed_grid_segmentation(
+            coords_valid,
+            side_um=float(resolution),
+            origin_x=grid_origin_x,
+            origin_y=grid_origin_y,
+        )
+        t1 = time.perf_counter()
+
+        valid_obs_idx = tile_obs_idx[tile_valid].astype(np.int64, copy=False)
+        origin_flags = np.asarray(
+            tiles.get("origin", pd.Series(index=tiles.index, data=0)),
+            dtype=np.int8,
+        )[tile_valid]
+
+        seg_full = np.full(adata.n_obs, np.nan, dtype=object)
+        if valid_obs_idx.size:
+            if np.unique(valid_obs_idx).size == valid_obs_idx.size:
+                seg_full[valid_obs_idx] = np.asarray(tile_labels, dtype=object)
+            else:
+                label_codes, uniques = pd.factorize(np.asarray(tile_labels, dtype=object), sort=False)
+                agg_idx, agg_codes = _aggregate_labels_majority_by_obs_index(
+                    valid_obs_idx,
+                    label_codes.astype(np.int64, copy=False),
+                    origin_flags=origin_flags,
+                )
+                seg_full[agg_idx] = uniques[np.asarray(agg_codes, dtype=np.int64)]
+        t2 = time.perf_counter()
+
+        adata.obs[Segment] = pd.Categorical(seg_full)
+
+        segment_suffix = _sanitize_segment_name(Segment)
+        if compute_pseudo_centroids:
+            pseudo_centroids = _pseudo_centroids_from_segment_labels(
+                np.asarray(E_use, dtype=np.float32),
+                seg_full,
+            )
+            adata.obsm["X_embedding_segment"] = pseudo_centroids
+            adata.obsm[f"X_embedding_{segment_suffix}"] = pseudo_centroids
+        t3 = time.perf_counter()
+
+        for key in ("X_embedding_scaled_for_segment", f"X_embedding_scaled_for_{segment_suffix}"):
+            if key in adata.obsm:
+                del adata.obsm[key]
+
+        fixed_grid_uns = dict(grid_meta)
+        fixed_grid_uns["origin"] = bool(origin)
+        adata.uns[f"{segment_suffix}_fixed_grid"] = fixed_grid_uns
+
+        if verbose:
+            print(
+                f"[perf] fixed_grid fast path: assign {t1 - t0:.3f}s | "
+                f"aggregate {t2 - t1:.3f}s | pseudo {t3 - t2:.3f}s"
+            )
+        return
 
     # Create a DataFrame from the selected embedding dimensions and add barcode from adata.obs index
     tile_colors = pd.DataFrame(np.array(adata.obsm[embedding])[:, dimensions])
@@ -929,6 +1118,8 @@ def segment_image(
                     pixel_shape,
                     show_image,
                     fig_dpi=fig_dpi,
+                    grid_origin_x=grid_origin_x,
+                    grid_origin_y=grid_origin_y,
                 )
                 # If duplicates (origin=False), aggregate to one label per barcode and recompute centroids
                 if clusters_df_group["barcode"].duplicated().any():
@@ -1218,6 +1409,8 @@ def segment_image(
                 pixel_shape,
                 show_image,
                 fig_dpi=fig_dpi,
+                grid_origin_x=grid_origin_x,
+                grid_origin_y=grid_origin_y,
             )
             # If duplicates (origin=False), aggregate to one label per barcode and recompute centroids
             if clusters_df["barcode"].duplicated().any():
@@ -1253,6 +1446,25 @@ def segment_image(
     prefixed_obsm_key = f"X_embedding_{segment_suffix}"
     adata.obsm[base_obsm_key] = pseudo_centroids
     adata.obsm[prefixed_obsm_key] = pseudo_centroids
+    if method == "fixed_grid":
+        resolved_grid_origin_x = None
+        resolved_grid_origin_y = None
+        if len(coordinates_df):
+            if grid_origin_x is None:
+                resolved_grid_origin_x = float(pd.to_numeric(coordinates_df["x"], errors="coerce").min())
+            else:
+                resolved_grid_origin_x = float(grid_origin_x)
+            if grid_origin_y is None:
+                resolved_grid_origin_y = float(pd.to_numeric(coordinates_df["y"], errors="coerce").min())
+            else:
+                resolved_grid_origin_y = float(grid_origin_y)
+        adata.uns[f"{segment_suffix}_fixed_grid"] = {
+            "grid_mode": "fixed_grid",
+            "grid_side_um": float(resolution),
+            "grid_origin_x": resolved_grid_origin_x,
+            "grid_origin_y": resolved_grid_origin_y,
+            "origin": bool(origin),
+        }
     # Combined data (if available) — align to adata order
     if combined_data is not None:
         if isinstance(combined_data, pd.DataFrame):
@@ -1295,6 +1507,8 @@ def segment_image_inner(
     show_image: bool = False,
     fig_dpi: int | None = None,
     n_jobs: int | None = None,
+    grid_origin_x: float | None = None,
+    grid_origin_y: float | None = None,
 ):
     """
     Segment embeddings to find initial territories.
@@ -1313,7 +1527,7 @@ def segment_image_inner(
         List of dimensions to use for segmentation.
     method : str, optional
         Segmentation method: 'kmeans', 'louvain', 'leiden', 'slic', 'som',
-        'leiden_slic', 'louvain_slic', 'image_plot_slic'.
+        'leiden_slic', 'louvain_slic', 'image_plot_slic', 'fixed_grid'.
     resolution : float or int, optional
         Resolution parameter for clustering methods.
     compactness : float
@@ -1353,10 +1567,9 @@ def segment_image_inner(
     n_jobs : int or None, optional
         Number of worker threads for ``image_plot_slic`` rasterization. When
         ``None``, defers to ``SPIX_IMAGE_PLOT_SLIC_N_JOBS`` env var or 1.
-    target_segment_um : float or None, optional
-        Desired segment size in micrometers. Overrides ``resolution``.
-    pitch_um : float, optional
-        Spot spacing in micrometers when computing ``target_segment_um``.
+    grid_origin_x / grid_origin_y : float or None, optional
+        Optional explicit grid origin for ``method='fixed_grid'``.
+        When omitted, the minimum observed x/y coordinates are used.
 
     Returns
     -------
@@ -1410,6 +1623,14 @@ def segment_image_inner(
             show_image=show_image,
             verbose=verbose,
             n_jobs=n_jobs,
+        )
+        combined_data = None
+    elif method == "fixed_grid":
+        clusters, _ = fixed_grid_segmentation(
+            spatial_coords,
+            side_um=float(resolution),
+            origin_x=grid_origin_x,
+            origin_y=grid_origin_y,
         )
         combined_data = None
     elif method == "som":
