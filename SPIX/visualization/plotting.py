@@ -413,6 +413,275 @@ def _plot_boundaries_from_label_image(
     ax.add_collection(lc)
 
 
+def _resolve_plot_raster_state(
+    pts,
+    *,
+    x_min_eff,
+    x_max_eff,
+    y_min_eff,
+    y_max_eff,
+    scale,
+    s,
+    w,
+    h,
+    pixel_perfect: bool,
+    pixel_shape: str,
+    coord_mode: str = "spatial",
+    soft_rasterization: bool = False,
+    resolve_center_collisions: bool = False,
+    center_collision_radius: int = 2,
+    logger=None,
+    verbose: bool = False,
+    context: str = "image_plot",
+):
+    """Resolve raster centers plus optional soft/collision behavior for plot-like renderers."""
+    pts_arr = np.asarray(pts, dtype=float)
+    soft_enabled = bool(soft_rasterization)
+    if soft_enabled and (str(coord_mode).lower() == "visiumhd" and bool(pixel_perfect)):
+        if verbose and logger is not None:
+            logger.warning("soft_rasterization is ignored for pixel-perfect VisiumHD grid rendering.")
+        soft_enabled = False
+    if soft_enabled and (not bool(pixel_perfect) or int(s) != 1 or str(pixel_shape).lower() != "square"):
+        if verbose and logger is not None:
+            logger.warning(
+                "soft_rasterization requires pixel_perfect=True, tile_px==1, and pixel_shape='square'; falling back to hard rasterization."
+            )
+        soft_enabled = False
+
+    if soft_enabled:
+        cx, cy, soft_fx, soft_fy = _raster.scale_points_to_canvas_soft(
+            pts_arr,
+            x_min_eff=float(x_min_eff),
+            y_min_eff=float(y_min_eff),
+            scale=float(scale),
+            pixel_perfect=True,
+            w=int(w),
+            h=int(h),
+        )
+    else:
+        soft_fx = None
+        soft_fy = None
+        cx, cy = _raster.scale_points_to_canvas(
+            pts_arr,
+            x_min_eff=float(x_min_eff),
+            y_min_eff=float(y_min_eff),
+            scale=float(scale),
+            pixel_perfect=bool(pixel_perfect),
+            w=int(w),
+            h=int(h),
+        )
+
+    w_eff = int(w)
+    h_eff = int(h)
+    s_eff = int(s)
+    x_min_eff_out = float(x_min_eff)
+    x_max_eff_out = float(x_max_eff)
+    y_min_eff_out = float(y_min_eff)
+    y_max_eff_out = float(y_max_eff)
+
+    if str(coord_mode).lower() == "visiumhd" and bool(pixel_perfect):
+        x_i = np.floor(pts_arr[:, 0] + 0.5).astype(np.int64, copy=False)
+        y_i = np.floor(pts_arr[:, 1] + 0.5).astype(np.int64, copy=False)
+        x0, x1 = int(x_i.min()), int(x_i.max())
+        y0, y1 = int(y_i.min()), int(y_i.max())
+        w_eff = max(1, int(x1 - x0 + 1))
+        h_eff = max(1, int(y1 - y0 + 1))
+        cx = (x_i - x0).astype(np.int32, copy=False)
+        cy = (y_i - y0).astype(np.int32, copy=False)
+        s_eff = 1
+        x_min_eff_out, x_max_eff_out = float(x0) - 0.5, float(x1) + 0.5
+        y_min_eff_out, y_max_eff_out = float(y0) - 0.5, float(y1) + 0.5
+
+    if resolve_center_collisions and not soft_enabled:
+        cx, cy, collision_info = _raster.resolve_center_collisions(
+            cx,
+            cy,
+            w=int(w_eff),
+            h=int(h_eff),
+            max_radius=int(center_collision_radius),
+            logger=logger if verbose else None,
+            context=context,
+        )
+    elif resolve_center_collisions and soft_enabled:
+        collision_info = None
+        if verbose and logger is not None:
+            logger.info("%s: ignoring resolve_center_collisions because soft_rasterization=True.", context)
+    else:
+        collision_info = None
+
+    return {
+        "cx": np.asarray(cx, dtype=np.int32),
+        "cy": np.asarray(cy, dtype=np.int32),
+        "soft_fx": None if soft_fx is None else np.asarray(soft_fx, dtype=np.float32),
+        "soft_fy": None if soft_fy is None else np.asarray(soft_fy, dtype=np.float32),
+        "soft_enabled": bool(soft_enabled),
+        "collision_info": collision_info,
+        "w": int(w_eff),
+        "h": int(h_eff),
+        "s": int(s_eff),
+        "x_min_eff": float(x_min_eff_out),
+        "x_max_eff": float(x_max_eff_out),
+        "y_min_eff": float(y_min_eff_out),
+        "y_max_eff": float(y_max_eff_out),
+    }
+
+
+def _rasterize_rgba_and_label_buffer(
+    *,
+    cols,
+    cx,
+    cy,
+    w: int,
+    h: int,
+    s: int,
+    pixel_shape: str,
+    alpha_arr=None,
+    alpha_point: float = 1.0,
+    vals=None,
+    prioritize_high_values: bool = False,
+    soft_enabled: bool = False,
+    soft_fx=None,
+    soft_fy=None,
+    label_codes=None,
+    runtime_fill_from_boundary: bool = False,
+    runtime_fill_closing_radius: int = 1,
+    runtime_fill_holes: bool = True,
+    chunk_size: int = 50000,
+    logger=None,
+    verbose: bool = False,
+    context: str = "image_plot",
+):
+    """Rasterize RGBA tiles plus optional label image with shared soft/fill behavior."""
+    cols_arr = np.asarray(cols, dtype=np.float32)
+    cx_arr = np.asarray(cx, dtype=np.int32)
+    cy_arr = np.asarray(cy, dtype=np.int32)
+    if cols_arr.ndim != 2 or cols_arr.shape[0] != cx_arr.size:
+        raise ValueError("cols must have shape (N, 3) aligned to raster centers.")
+
+    img = np.zeros((int(h), int(w), 4), dtype=np.float32)
+    paint_mask = np.zeros((int(h), int(w)), dtype=bool)
+    label_img = None if label_codes is None else np.full((int(h), int(w)), -1, dtype=int)
+    label_codes_arr = None if label_codes is None else np.asarray(label_codes, dtype=np.int32)
+    alpha_chunk = None if alpha_arr is None else np.asarray(alpha_arr, dtype=np.float32)
+    value_buf = np.full((int(h), int(w)), -np.inf, dtype=np.float32)
+
+    ox, oy = _raster.tile_pixel_offsets(int(s), pixel_shape=pixel_shape)
+    pixels_per_tile = int(ox.size)
+    target_pixels = int(os.environ.get("SPIX_PLOT_RASTER_TARGET_PIXELS", "10000000"))
+    chunk_n = int(max(1, min(int(chunk_size), int(max(1, target_pixels // max(1, pixels_per_tile))))))
+
+    if soft_enabled:
+        if prioritize_high_values and verbose and logger is not None:
+            logger.warning("soft_rasterization does not support prioritize_high_values; using weighted blending instead.")
+        seed_rgba = np.empty((cols_arr.shape[0], 4), dtype=np.float32)
+        seed_rgba[:, :3] = cols_arr
+        if alpha_chunk is not None:
+            seed_rgba[:, 3] = alpha_chunk
+        else:
+            seed_rgba[:, 3] = float(alpha_point)
+        _raster.rasterize_soft_bilinear(
+            img=img,
+            occupancy_mask=paint_mask,
+            seed_values=seed_rgba,
+            cx=cx_arr,
+            cy=cy_arr,
+            fx=np.asarray(soft_fx, dtype=np.float32),
+            fy=np.asarray(soft_fy, dtype=np.float32),
+            chunk_size=int(chunk_n),
+            background_value=None,
+        )
+        if label_img is not None:
+            for i in range(0, cx_arr.size, chunk_n):
+                end = min(i + chunk_n, cx_arr.size)
+                x0, y0, x1, y1, w00, w10, w01, w11 = _raster.bilinear_support_from_centers(
+                    cx_arr[i:end],
+                    cy_arr[i:end],
+                    np.asarray(soft_fx[i:end], dtype=np.float32),
+                    np.asarray(soft_fy[i:end], dtype=np.float32),
+                    w=int(w),
+                    h=int(h),
+                )
+                seg_chunk = label_codes_arr[i:end]
+                for px, py, pw in ((x0, y0, w00), (x1, y0, w10), (x0, y1, w01), (x1, y1, w11)):
+                    mask_upd = pw > value_buf[py, px]
+                    if np.any(mask_upd):
+                        label_img[py[mask_upd], px[mask_upd]] = seg_chunk[mask_upd]
+                        value_buf[py[mask_upd], px[mask_upd]] = pw[mask_upd]
+    else:
+        vals_arr = None if vals is None else np.asarray(vals, dtype=np.float32)
+        for i in range(0, cx_arr.size, chunk_n):
+            end = min(i + chunk_n, cx_arr.size)
+            chunk_cx = cx_arr[i:end]
+            chunk_cy = cy_arr[i:end]
+            chunk_cols = cols_arr[i:end]
+            chunk_alpha = None if alpha_chunk is None else alpha_chunk[i:end]
+            chunk_vals = None if vals_arr is None else vals_arr[i:end]
+
+            if not prioritize_high_values:
+                all_x = np.clip((chunk_cx[:, None] + ox[None, :]).ravel(), 0, int(w) - 1)
+                all_y = np.clip((chunk_cy[:, None] + oy[None, :]).ravel(), 0, int(h) - 1)
+                cols_rep = np.repeat(chunk_cols, pixels_per_tile, axis=0)
+                img[all_y, all_x, :3] = cols_rep
+                if chunk_alpha is not None:
+                    img[all_y, all_x, 3] = np.repeat(chunk_alpha, pixels_per_tile, axis=0)
+                else:
+                    img[all_y, all_x, 3] = float(alpha_point)
+                paint_mask[all_y, all_x] = True
+                if label_img is not None:
+                    label_img[all_y, all_x] = np.repeat(label_codes_arr[i:end], pixels_per_tile, axis=0)
+            else:
+                if chunk_vals is None:
+                    chunk_vals = np.arange(i, end, dtype=np.float32)
+                for dx, dy in zip(ox, oy):
+                    px = np.clip(chunk_cx + dx, 0, int(w) - 1)
+                    py = np.clip(chunk_cy + dy, 0, int(h) - 1)
+                    mask_upd = chunk_vals > value_buf[py, px]
+                    if np.any(mask_upd):
+                        img[py[mask_upd], px[mask_upd], :3] = chunk_cols[mask_upd]
+                        img[py[mask_upd], px[mask_upd], 3] = (
+                            chunk_alpha[mask_upd] if chunk_alpha is not None else float(alpha_point)
+                        )
+                        value_buf[py[mask_upd], px[mask_upd]] = chunk_vals[mask_upd]
+                        paint_mask[py[mask_upd], px[mask_upd]] = True
+                        if label_img is not None:
+                            label_img[py[mask_upd], px[mask_upd]] = label_codes_arr[i:end][mask_upd]
+
+    if runtime_fill_from_boundary:
+        seed_rgba = np.empty((cols_arr.shape[0], 4), dtype=np.float32)
+        seed_rgba[:, :3] = cols_arr
+        if alpha_chunk is not None:
+            seed_rgba[:, 3] = alpha_chunk
+        else:
+            seed_rgba[:, 3] = float(alpha_point)
+        _raster.fill_raster_from_boundary(
+            img=img,
+            occupancy_mask=paint_mask,
+            seed_x=cx_arr,
+            seed_y=cy_arr,
+            seed_values=seed_rgba,
+            closing_radius=int(runtime_fill_closing_radius),
+            fill_holes=bool(runtime_fill_holes),
+            logger=logger if verbose else None,
+            context=context,
+        )
+        if label_img is not None:
+            label_img_fill = label_img.astype(np.float32, copy=True)[..., None]
+            _raster.fill_raster_from_boundary(
+                img=label_img_fill,
+                occupancy_mask=paint_mask.copy(),
+                seed_x=cx_arr,
+                seed_y=cy_arr,
+                seed_values=label_codes_arr.astype(np.float32, copy=False)[:, None],
+                closing_radius=int(runtime_fill_closing_radius),
+                fill_holes=bool(runtime_fill_holes),
+                logger=logger if verbose else None,
+                context=f"{context}(label_img)",
+            )
+            label_img = np.rint(label_img_fill[..., 0]).astype(int, copy=False)
+
+    return img, label_img, paint_mask
+
+
 def image_plot(
     adata,
     dimensions=[0, 1, 2],
@@ -509,6 +778,12 @@ def image_plot(
     array_col_key: str = "array_col",
     # Raster-expanded rendering controls (origin=False)
     gapless: bool = False,  # If True, render raster-expanded tiles as a packed grid (no holes, faster)
+    runtime_fill_from_boundary: bool = False,
+    runtime_fill_closing_radius: int = 1,
+    runtime_fill_holes: bool = True,
+    soft_rasterization: bool = False,
+    resolve_center_collisions: bool = False,
+    center_collision_radius: int = 2,
     xlim=None,
     ylim=None,
 ):
@@ -523,6 +798,14 @@ def image_plot(
         If True, snap the internal raster scale so the estimated tile pitch becomes an
         integer number of pixels, and use rounded pixel centers. This makes tiles look
         "packed" (no visible seams/gaps) across different ``figsize``/DPI settings.
+    resolve_center_collisions : bool, optional (default ``False``)
+        If True, locally reassign duplicate raster centers onto nearby empty
+        pixels before painting/filling.
+    soft_rasterization : bool, optional (default ``False``)
+        If True, use bilinear splatting for the image raster instead of hard
+        one-pixel assignment. Currently supported only for
+        ``pixel_perfect=True``, ``tile_px==1``, ``pixel_shape='square'``, and
+        the standard imshow raster path.
     """
     # Create a local logger
     logger = logging.getLogger("image_plot")
@@ -549,6 +832,7 @@ def image_plot(
     use_direct_origin_spatial = False
     tiles = None
     origin_vals = None
+    inferred_mode = ""
     if origin:
         spatial_direct = None
         try:
@@ -845,13 +1129,37 @@ def image_plot(
         h = int(raster_canvas["h"])
         if verbose and not (coord_mode == "visiumhd" and pixel_perfect):
             logger.info("Rendering to an image buffer of size (w, h): (%d, %d)", int(w), int(h))
-        cx, cy = _raster.scale_points_to_canvas(
-            pts,
-            x_min_eff=float(x_min_eff),
-            y_min_eff=float(y_min_eff),
-            scale=float(scale),
-            pixel_perfect=bool(pixel_perfect),
-        )
+        soft_enabled = bool(soft_rasterization)
+        if soft_enabled and (coord_mode == "visiumhd" and pixel_perfect):
+            if verbose:
+                logger.warning("soft_rasterization is ignored for pixel-perfect VisiumHD grid rendering.")
+            soft_enabled = False
+        if soft_enabled and (not bool(pixel_perfect) or int(s) != 1 or str(pixel_shape).lower() != "square"):
+            if verbose:
+                logger.warning(
+                    "soft_rasterization requires pixel_perfect=True, tile_px==1, and pixel_shape='square'; falling back to hard rasterization."
+                )
+            soft_enabled = False
+        if soft_enabled:
+            cx, cy, soft_fx, soft_fy = _raster.scale_points_to_canvas_soft(
+                pts,
+                x_min_eff=float(x_min_eff),
+                y_min_eff=float(y_min_eff),
+                scale=float(scale),
+                pixel_perfect=True,
+                w=int(w),
+                h=int(h),
+            )
+        else:
+            soft_fx = None
+            soft_fy = None
+            cx, cy = _raster.scale_points_to_canvas(
+                pts,
+                x_min_eff=float(x_min_eff),
+                y_min_eff=float(y_min_eff),
+                scale=float(scale),
+                pixel_perfect=bool(pixel_perfect),
+            )
         if coord_mode == "visiumhd" and pixel_perfect:
             x_i = np.floor(x_plot + 0.5).astype(np.int64, copy=False)
             y_i = np.floor(y_plot + 0.5).astype(np.int64, copy=False)
@@ -868,19 +1176,75 @@ def image_plot(
             y_min_eff, y_max_eff = float(y0) - 0.5, float(y1) + 0.5
         if verbose:
             logger.info("Scaled tile size (in pixels): %d", int(s))
+        if resolve_center_collisions and not soft_enabled:
+            cx, cy, collision_info = _raster.resolve_center_collisions(
+                cx,
+                cy,
+                w=int(w),
+                h=int(h),
+                max_radius=int(center_collision_radius),
+                logger=logger if verbose else None,
+                context="image_plot",
+            )
+        elif resolve_center_collisions and soft_enabled:
+            collision_info = None
+            if verbose:
+                logger.info("image_plot: ignoring resolve_center_collisions because soft_rasterization=True.")
+        else:
+            collision_info = None
 
         img = np.zeros((h, w, 4), dtype=np.float32)
+        paint_mask = np.zeros((h, w), dtype=bool)
         ox, oy = _raster.tile_pixel_offsets(int(s), pixel_shape=pixel_shape)
         pixels_per_tile = int(ox.size)
         target_pixels = int(os.environ.get("SPIX_PLOT_RASTER_TARGET_PIXELS", "10000000"))
         chunk_n = int(max(1, min(int(chunk_size), int(max(1, target_pixels // max(1, pixels_per_tile))))))
-        for i in range(0, len(cx), chunk_n):
-            end = min(i + chunk_n, len(cx))
-            all_x = np.clip((cx[i:end, None] + ox[None, :]).ravel(), 0, w - 1)
-            all_y = np.clip((cy[i:end, None] + oy[None, :]).ravel(), 0, h - 1)
-            cols_rep = np.repeat(cols[i:end], pixels_per_tile, axis=0)
-            img[all_y, all_x, :3] = cols_rep
-            img[all_y, all_x, 3] = 1.0
+        if soft_enabled:
+            seed_rgba = np.empty((cols.shape[0], 4), dtype=np.float32)
+            seed_rgba[:, :3] = cols.astype(np.float32, copy=False)
+            seed_rgba[:, 3] = 1.0
+            _raster.rasterize_soft_bilinear(
+                img=img,
+                occupancy_mask=paint_mask,
+                seed_values=seed_rgba,
+                cx=cx,
+                cy=cy,
+                fx=soft_fx,
+                fy=soft_fy,
+                chunk_size=int(chunk_n),
+                background_value=None,
+            )
+        else:
+            for i in range(0, len(cx), chunk_n):
+                end = min(i + chunk_n, len(cx))
+                all_x = np.clip((cx[i:end, None] + ox[None, :]).ravel(), 0, w - 1)
+                all_y = np.clip((cy[i:end, None] + oy[None, :]).ravel(), 0, h - 1)
+                cols_rep = np.repeat(cols[i:end], pixels_per_tile, axis=0)
+                img[all_y, all_x, :3] = cols_rep
+                img[all_y, all_x, 3] = 1.0
+                paint_mask[all_y, all_x] = True
+
+        if runtime_fill_from_boundary:
+            seed_rgba = np.empty((cols.shape[0], 4), dtype=np.float32)
+            seed_rgba[:, :3] = cols.astype(np.float32, copy=False)
+            seed_rgba[:, 3] = 1.0
+            _raster.fill_raster_from_boundary(
+                img=img,
+                occupancy_mask=paint_mask,
+                seed_x=cx,
+                seed_y=cy,
+                seed_values=seed_rgba,
+                closing_radius=int(runtime_fill_closing_radius),
+                fill_holes=bool(runtime_fill_holes),
+                logger=logger if verbose else None,
+                context="image_plot",
+            )
+        if verbose and collision_info is not None:
+            logger.info(
+                "image_plot: center collision fraction %.4f -> %.4f.",
+                float(collision_info["collision_fraction_before"]),
+                float(collision_info["collision_fraction_after"]),
+            )
 
         ax.imshow(
             img,
@@ -1421,13 +1785,37 @@ def image_plot(
 
         # 3) Scale coordinates and tile size to buffer
         # Avoid banker's rounding ties (e.g., *.5) on regular grids when pixel_perfect=True.
-        cx, cy = _raster.scale_points_to_canvas(
-            coordinates[["x", "y"]].to_numpy(dtype=float, copy=False),
-            x_min_eff=float(x_min_eff),
-            y_min_eff=float(y_min_eff),
-            scale=float(scale),
-            pixel_perfect=bool(pixel_perfect),
-        )
+        soft_enabled = bool(soft_rasterization)
+        if soft_enabled and (coord_mode == "visiumhd" and pixel_perfect):
+            if verbose:
+                logger.warning("soft_rasterization is ignored for pixel-perfect VisiumHD grid rendering.")
+            soft_enabled = False
+        if soft_enabled and (not bool(pixel_perfect) or int(s) != 1 or str(pixel_shape).lower() != "square"):
+            if verbose:
+                logger.warning(
+                    "soft_rasterization requires pixel_perfect=True, tile_px==1, and pixel_shape='square'; falling back to hard rasterization."
+                )
+            soft_enabled = False
+        if soft_enabled:
+            cx, cy, soft_fx, soft_fy = _raster.scale_points_to_canvas_soft(
+                coordinates[["x", "y"]].to_numpy(dtype=float, copy=False),
+                x_min_eff=float(x_min_eff),
+                y_min_eff=float(y_min_eff),
+                scale=float(scale),
+                pixel_perfect=True,
+                w=int(w),
+                h=int(h),
+            )
+        else:
+            soft_fx = None
+            soft_fy = None
+            cx, cy = _raster.scale_points_to_canvas(
+                coordinates[["x", "y"]].to_numpy(dtype=float, copy=False),
+                x_min_eff=float(x_min_eff),
+                y_min_eff=float(y_min_eff),
+                scale=float(scale),
+                pixel_perfect=bool(pixel_perfect),
+            )
         if coord_mode == "visiumhd" and pixel_perfect:
             # VisiumHD: rasterize directly on the (array_row/array_col) grid.
             # This removes any dependence on fig pixel scaling and eliminates overlap/gap artifacts.
@@ -1458,9 +1846,26 @@ def image_plot(
             y_min_eff, y_max_eff = float(y0) - 0.5, float(y1) + 0.5
         if verbose:
             logger.info("Scaled tile size (in pixels): %d", int(s))
+        if resolve_center_collisions and not soft_enabled:
+            cx, cy, collision_info = _raster.resolve_center_collisions(
+                cx,
+                cy,
+                w=int(w),
+                h=int(h),
+                max_radius=int(center_collision_radius),
+                logger=logger if verbose else None,
+                context="image_plot",
+            )
+        elif resolve_center_collisions and soft_enabled:
+            collision_info = None
+            if verbose:
+                logger.info("image_plot: ignoring resolve_center_collisions because soft_rasterization=True.")
+        else:
+            collision_info = None
 
         # 4) RGBA buffer + depth buffer
         img = np.zeros((h, w, 4), dtype=np.float32)  # start fully transparent
+        paint_mask = np.zeros((h, w), dtype=bool)
         value_buf = np.full((h, w), -np.inf, dtype=float)
         label_img = None
         if plot_boundaries and boundary_method == "pixel" and segment_available:
@@ -1475,39 +1880,118 @@ def image_plot(
         target_pixels = int(os.environ.get("SPIX_PLOT_RASTER_TARGET_PIXELS", "10000000"))
         chunk_n = int(max(1, min(int(chunk_size), int(max(1, target_pixels // max(1, pixels_per_tile))))))
 
-        for i in range(0, len(cx), chunk_n):
-            end = min(i + chunk_n, len(cx))
-            chunk_cx, chunk_cy = cx[i:end], cy[i:end]
-            chunk_cols = cols[i:end]
-            chunk_vals = vals[i:end]  # depth metric; with alpha_arr set, this is alpha
-            chunk_alpha = alpha_arr[i:end] if alpha_arr is not None else None
-
-            if not prioritize_high_values:
-                # Fast path: paint all pixels in one vectorized pass (order matters only for overlaps).
-                all_x = np.clip((chunk_cx[:, None] + ox[None, :]).ravel(), 0, w - 1)
-                all_y = np.clip((chunk_cy[:, None] + oy[None, :]).ravel(), 0, h - 1)
-                cols_rep = np.repeat(chunk_cols, pixels_per_tile, axis=0)
-                img[all_y, all_x, :3] = cols_rep
-                if chunk_alpha is not None:
-                    img[all_y, all_x, 3] = np.repeat(chunk_alpha, pixels_per_tile, axis=0)
-                else:
-                    img[all_y, all_x, 3] = 1.0
-                if label_img is not None:
-                    label_img[all_y, all_x] = np.repeat(seg_codes[i:end], pixels_per_tile, axis=0)
+        if soft_enabled:
+            if prioritize_high_values and verbose:
+                logger.warning("soft_rasterization does not support prioritize_high_values; using weighted blending instead.")
+            seed_rgba = np.empty((cols.shape[0], 4), dtype=np.float32)
+            seed_rgba[:, :3] = cols.astype(np.float32, copy=False)
+            if alpha_arr is not None:
+                seed_rgba[:, 3] = np.asarray(alpha_arr, dtype=np.float32)
             else:
-                # Slow path: depth buffer / draw priority.
-                for dx, dy in zip(ox, oy):
-                    px = np.clip(chunk_cx + dx, 0, w - 1)
-                    py = np.clip(chunk_cy + dy, 0, h - 1)
-                    mask_upd = chunk_vals > value_buf[py, px]
-                    if np.any(mask_upd):
-                        img[py[mask_upd], px[mask_upd], :3] = chunk_cols[mask_upd]
-                        img[py[mask_upd], px[mask_upd], 3] = (
-                            chunk_alpha[mask_upd] if chunk_alpha is not None else 1.0
-                        )
-                        value_buf[py[mask_upd], px[mask_upd]] = chunk_vals[mask_upd]
-                        if label_img is not None:
-                            label_img[py[mask_upd], px[mask_upd]] = seg_codes[i:end][mask_upd]
+                seed_rgba[:, 3] = 1.0
+            _raster.rasterize_soft_bilinear(
+                img=img,
+                occupancy_mask=paint_mask,
+                seed_values=seed_rgba,
+                cx=cx,
+                cy=cy,
+                fx=soft_fx,
+                fy=soft_fy,
+                chunk_size=int(chunk_n),
+                background_value=None,
+            )
+            if label_img is not None:
+                for i in range(0, len(cx), chunk_n):
+                    end = min(i + chunk_n, len(cx))
+                    x0, y0, x1, y1, w00, w10, w01, w11 = _raster.bilinear_support_from_centers(
+                        cx[i:end],
+                        cy[i:end],
+                        soft_fx[i:end],
+                        soft_fy[i:end],
+                        w=int(w),
+                        h=int(h),
+                    )
+                    seg_chunk = seg_codes[i:end]
+                    for px, py, pw in ((x0, y0, w00), (x1, y0, w10), (x0, y1, w01), (x1, y1, w11)):
+                        mask_upd = pw > value_buf[py, px]
+                        if np.any(mask_upd):
+                            label_img[py[mask_upd], px[mask_upd]] = seg_chunk[mask_upd]
+                            value_buf[py[mask_upd], px[mask_upd]] = pw[mask_upd]
+        else:
+            for i in range(0, len(cx), chunk_n):
+                end = min(i + chunk_n, len(cx))
+                chunk_cx, chunk_cy = cx[i:end], cy[i:end]
+                chunk_cols = cols[i:end]
+                chunk_vals = vals[i:end]  # depth metric; with alpha_arr set, this is alpha
+                chunk_alpha = alpha_arr[i:end] if alpha_arr is not None else None
+
+                if not prioritize_high_values:
+                    # Fast path: paint all pixels in one vectorized pass (order matters only for overlaps).
+                    all_x = np.clip((chunk_cx[:, None] + ox[None, :]).ravel(), 0, w - 1)
+                    all_y = np.clip((chunk_cy[:, None] + oy[None, :]).ravel(), 0, h - 1)
+                    cols_rep = np.repeat(chunk_cols, pixels_per_tile, axis=0)
+                    img[all_y, all_x, :3] = cols_rep
+                    if chunk_alpha is not None:
+                        img[all_y, all_x, 3] = np.repeat(chunk_alpha, pixels_per_tile, axis=0)
+                    else:
+                        img[all_y, all_x, 3] = 1.0
+                    paint_mask[all_y, all_x] = True
+                    if label_img is not None:
+                        label_img[all_y, all_x] = np.repeat(seg_codes[i:end], pixels_per_tile, axis=0)
+                else:
+                    # Slow path: depth buffer / draw priority.
+                    for dx, dy in zip(ox, oy):
+                        px = np.clip(chunk_cx + dx, 0, w - 1)
+                        py = np.clip(chunk_cy + dy, 0, h - 1)
+                        mask_upd = chunk_vals > value_buf[py, px]
+                        if np.any(mask_upd):
+                            img[py[mask_upd], px[mask_upd], :3] = chunk_cols[mask_upd]
+                            img[py[mask_upd], px[mask_upd], 3] = (
+                                chunk_alpha[mask_upd] if chunk_alpha is not None else 1.0
+                            )
+                            value_buf[py[mask_upd], px[mask_upd]] = chunk_vals[mask_upd]
+                            paint_mask[py[mask_upd], px[mask_upd]] = True
+                            if label_img is not None:
+                                label_img[py[mask_upd], px[mask_upd]] = seg_codes[i:end][mask_upd]
+
+        if runtime_fill_from_boundary:
+            seed_rgba = np.empty((cols.shape[0], 4), dtype=np.float32)
+            seed_rgba[:, :3] = cols.astype(np.float32, copy=False)
+            if alpha_arr is not None:
+                seed_rgba[:, 3] = np.asarray(alpha_arr, dtype=np.float32)
+            else:
+                seed_rgba[:, 3] = 1.0
+            _raster.fill_raster_from_boundary(
+                img=img,
+                occupancy_mask=paint_mask,
+                seed_x=cx,
+                seed_y=cy,
+                seed_values=seed_rgba,
+                closing_radius=int(runtime_fill_closing_radius),
+                fill_holes=bool(runtime_fill_holes),
+                logger=logger if verbose else None,
+                context="image_plot",
+            )
+            if label_img is not None:
+                label_img_fill = label_img.astype(np.float32, copy=True)[..., None]
+                _raster.fill_raster_from_boundary(
+                    img=label_img_fill,
+                    occupancy_mask=paint_mask.copy(),
+                    seed_x=cx,
+                    seed_y=cy,
+                    seed_values=seg_codes.astype(np.float32, copy=False)[:, None],
+                    closing_radius=int(runtime_fill_closing_radius),
+                    fill_holes=bool(runtime_fill_holes),
+                    logger=logger if verbose else None,
+                    context="image_plot(label_img)",
+                )
+                label_img = np.rint(label_img_fill[..., 0]).astype(int, copy=False)
+        if verbose and collision_info is not None:
+            logger.info(
+                "image_plot: center collision fraction %.4f -> %.4f.",
+                float(collision_info["collision_fraction_before"]),
+                float(collision_info["collision_fraction_after"]),
+            )
 
         ax.imshow(
             img,
@@ -2333,6 +2817,12 @@ def image_plot_with_spatial_image(
     array_col_key: str = "array_col",
     # Raster-expanded rendering controls (origin=False)
     gapless: bool = False,  # If True, render raster-expanded tiles as a packed grid (no holes, faster)
+    runtime_fill_from_boundary: bool = False,
+    runtime_fill_closing_radius: int = 1,
+    runtime_fill_holes: bool = True,
+    soft_rasterization: bool = False,
+    resolve_center_collisions: bool = False,
+    center_collision_radius: int = 2,
 ):
     """
     Visualize embeddings as an image with optional segment boundaries and background image overlay.
@@ -3005,60 +3495,71 @@ def image_plot_with_spatial_image(
         if verbose:
             logger.info("Rendering to an image buffer of size (w, h): (%d, %d)", int(w), int(h))
 
-        cx, cy = _raster.scale_points_to_canvas(
+        raster_state = _resolve_plot_raster_state(
             coordinates[["x", "y"]].to_numpy(dtype=float, copy=False),
             x_min_eff=float(x_min_eff),
+            x_max_eff=float(x_max_eff),
             y_min_eff=float(y_min_eff),
+            y_max_eff=float(y_max_eff),
             scale=float(scale),
+            s=int(s),
+            w=int(w),
+            h=int(h),
             pixel_perfect=bool(pixel_perfect),
+            pixel_shape=pixel_shape,
+            coord_mode=coord_mode,
+            soft_rasterization=soft_rasterization,
+            resolve_center_collisions=resolve_center_collisions,
+            center_collision_radius=center_collision_radius,
+            logger=logger,
+            verbose=verbose,
+            context="image_plot_with_spatial_image",
         )
+        x_min_eff = float(raster_state["x_min_eff"])
+        x_max_eff = float(raster_state["x_max_eff"])
+        y_min_eff = float(raster_state["y_min_eff"])
+        y_max_eff = float(raster_state["y_max_eff"])
+        s = int(raster_state["s"])
+        w = int(raster_state["w"])
+        h = int(raster_state["h"])
         if verbose:
             logger.info("Scaled tile size (in pixels): %d", int(s))
 
-        img_rgba = np.zeros((h, w, 4), dtype=np.float32)
-        value_buf = np.full((h, w), -np.inf, dtype=float)
-        label_img = None
+        seg_codes = None
         if plot_boundaries and boundary_method == "pixel" and segment_available:
-            label_img = np.full((h, w), -1, dtype=int)
-            seg_codes = pd.Categorical(coordinates_df["Segment"]).codes
+            seg_source = coordinates["Segment"] if "Segment" in coordinates.columns else coordinates_df["Segment"]
+            seg_codes = pd.Categorical(seg_source).codes
 
-        ox, oy = _raster.tile_pixel_offsets(int(s), pixel_shape=pixel_shape)
-        pixels_per_tile = int(ox.size)
-
-        target_pixels = int(os.environ.get("SPIX_PLOT_RASTER_TARGET_PIXELS", "10000000"))
-        chunk_n = int(max(1, min(int(chunk_size), int(max(1, target_pixels // max(1, pixels_per_tile))))))
-
-        for i in range(0, len(cx), chunk_n):
-            end = min(i + chunk_n, len(cx))
-            chunk_cx, chunk_cy = cx[i:end], cy[i:end]
-            chunk_cols = cols[i:end]
-            chunk_vals = vals[i:end]  # depth metric; with alpha_arr set, this is alpha
-            chunk_alpha = alpha_arr[i:end] if alpha_arr is not None else None
-
-            if not prioritize_high_values:
-                all_x = np.clip((chunk_cx[:, None] + ox[None, :]).ravel(), 0, w - 1)
-                all_y = np.clip((chunk_cy[:, None] + oy[None, :]).ravel(), 0, h - 1)
-                cols_rep = np.repeat(chunk_cols, pixels_per_tile, axis=0)
-                img_rgba[all_y, all_x, :3] = cols_rep
-                if chunk_alpha is not None:
-                    img_rgba[all_y, all_x, 3] = np.repeat(chunk_alpha, pixels_per_tile, axis=0)
-                else:
-                    img_rgba[all_y, all_x, 3] = float(alpha_point)
-                if label_img is not None:
-                    label_img[all_y, all_x] = np.repeat(seg_codes[i:end], pixels_per_tile, axis=0)
-            else:
-                for dx, dy in zip(ox, oy):
-                    px = np.clip(chunk_cx + dx, 0, w - 1)
-                    py = np.clip(chunk_cy + dy, 0, h - 1)
-                    mask_upd = chunk_vals > value_buf[py, px]
-                    if np.any(mask_upd):
-                        img_rgba[py[mask_upd], px[mask_upd], :3] = chunk_cols[mask_upd]
-                        img_rgba[py[mask_upd], px[mask_upd], 3] = (
-                            chunk_alpha[mask_upd] if chunk_alpha is not None else float(alpha_point)
-                        )
-                        value_buf[py[mask_upd], px[mask_upd]] = chunk_vals[mask_upd]
-                        if label_img is not None:
-                            label_img[py[mask_upd], px[mask_upd]] = seg_codes[i:end][mask_upd]
+        img_rgba, label_img, _ = _rasterize_rgba_and_label_buffer(
+            cols=cols,
+            cx=raster_state["cx"],
+            cy=raster_state["cy"],
+            w=int(w),
+            h=int(h),
+            s=int(s),
+            pixel_shape=pixel_shape,
+            alpha_arr=alpha_arr,
+            alpha_point=float(alpha_point),
+            vals=vals,
+            prioritize_high_values=bool(prioritize_high_values),
+            soft_enabled=bool(raster_state["soft_enabled"]),
+            soft_fx=raster_state["soft_fx"],
+            soft_fy=raster_state["soft_fy"],
+            label_codes=seg_codes,
+            runtime_fill_from_boundary=bool(runtime_fill_from_boundary),
+            runtime_fill_closing_radius=int(runtime_fill_closing_radius),
+            runtime_fill_holes=bool(runtime_fill_holes),
+            chunk_size=int(chunk_size),
+            logger=logger,
+            verbose=verbose,
+            context="image_plot_with_spatial_image",
+        )
+        if verbose and raster_state["collision_info"] is not None:
+            logger.info(
+                "image_plot_with_spatial_image: center collision fraction %.4f -> %.4f.",
+                float(raster_state["collision_info"]["collision_fraction_before"]),
+                float(raster_state["collision_info"]["collision_fraction_after"]),
+            )
 
         ax.imshow(
             img_rgba,
@@ -3160,72 +3661,82 @@ def image_plot_with_spatial_image(
 
         # Pixel boundary extraction for scatter
         if plot_boundaries and boundary_method == "pixel" and segment_available:
-            fig_dpi = fig.get_dpi()
-            w_pixels = int(np.ceil(figsize[0] * fig_dpi))
-            h_pixels = int(np.ceil(figsize[1] * fig_dpi))
-
-            x_range = x_max - x_min if x_max > x_min else 1
-            y_range = y_max - y_min if y_max > y_min else 1
-
-            scale = (
-                min(w_pixels / x_range, h_pixels / y_range)
-                if x_range > 0 and y_range > 0
-                else 1
-            )
-
-            w = int(np.ceil(x_range * scale))
-            h = int(np.ceil(y_range * scale))
-            w, h = max(w, 1), max(h, 1)
-
-            xi = ((coordinates["x"] - x_min) * scale).astype(int).values
-            yi = ((coordinates["y"] - y_min) * scale).astype(int).values
-
             pts = coordinates[["x", "y"]].values
-            s_data_units = _estimate_tile_size_units(
-                pts,
-                imshow_tile_size,
-                imshow_scale_factor,
-                imshow_tile_size_mode,
-                imshow_tile_size_quantile,
-                imshow_tile_size_shrink,
-                logger=None,
+            raster_canvas_scatter = _raster.resolve_raster_canvas(
+                pts=pts,
+                x_min=float(x_min),
+                x_max=float(x_max),
+                y_min=float(y_min),
+                y_max=float(y_max),
+                figsize=figsize,
+                fig_dpi=fig.get_dpi(),
+                imshow_tile_size=imshow_tile_size,
+                imshow_scale_factor=imshow_scale_factor,
+                imshow_tile_size_mode=imshow_tile_size_mode,
+                imshow_tile_size_quantile=imshow_tile_size_quantile,
+                imshow_tile_size_rounding=imshow_tile_size_rounding,
+                imshow_tile_size_shrink=imshow_tile_size_shrink,
+                pixel_perfect=bool(pixel_perfect),
+                n_points=int(len(pts)),
+                logger=logger if verbose else None,
+                context="image_plot_with_spatial_image(scatter-boundaries)",
             )
-            s = _round_tile_size_px(s_data_units, scale, imshow_tile_size_rounding)
-
-            label_img = np.full((h, w), -1, dtype=int)
-            seg_codes = pd.Categorical(coordinates_df["Segment"]).codes
-
-            if pixel_shape == "circle":
-                yy, xx = np.ogrid[:s, :s]
-                center = (s - 1) / 2
-                mask = (xx - center) ** 2 + (yy - center) ** 2 <= (s / 2) ** 2
-                circle_y_offsets, circle_x_offsets = np.nonzero(mask)
-            else:
-                tile_x_offsets, tile_y_offsets = np.meshgrid(np.arange(s), np.arange(s))
-
-            for i in range(0, len(xi), chunk_size):
-                end = min(i + chunk_size, len(xi))
-                chunk_xi, chunk_yi = xi[i:end], yi[i:end]
-
-                if pixel_shape == "circle":
-                    for dx, dy in zip(circle_x_offsets, circle_y_offsets):
-                        cx = np.clip(chunk_xi + dx, 0, w - 1)
-                        cy = np.clip(chunk_yi + dy, 0, h - 1)
-                        label_img[cy, cx] = seg_codes[i:end]
-                else:
-                    chunk_all_x = chunk_xi[:, None, None] + tile_x_offsets
-                    chunk_all_y = chunk_yi[:, None, None] + tile_y_offsets
-
-                    chunk_all_x = np.clip(chunk_all_x, 0, w - 1)
-                    chunk_all_y = np.clip(chunk_all_y, 0, h - 1)
-
-                    chunk_labels = seg_codes[i:end]
-                    label_img[chunk_all_y, chunk_all_x] = chunk_labels[:, None, None]
+            raster_state = _resolve_plot_raster_state(
+                pts,
+                x_min_eff=float(raster_canvas_scatter["x_min_eff"]),
+                x_max_eff=float(raster_canvas_scatter["x_max_eff"]),
+                y_min_eff=float(raster_canvas_scatter["y_min_eff"]),
+                y_max_eff=float(raster_canvas_scatter["y_max_eff"]),
+                scale=float(raster_canvas_scatter["scale"]),
+                s=int(raster_canvas_scatter["tile_px"]),
+                w=int(raster_canvas_scatter["w"]),
+                h=int(raster_canvas_scatter["h"]),
+                pixel_perfect=bool(pixel_perfect),
+                pixel_shape=pixel_shape,
+                coord_mode=coord_mode,
+                soft_rasterization=soft_rasterization,
+                resolve_center_collisions=resolve_center_collisions,
+                center_collision_radius=center_collision_radius,
+                logger=logger,
+                verbose=verbose,
+                context="image_plot_with_spatial_image(scatter-boundaries)",
+            )
+            seg_source = coordinates["Segment"] if "Segment" in coordinates.columns else coordinates_df["Segment"]
+            seg_codes = pd.Categorical(seg_source).codes
+            _, label_img, _ = _rasterize_rgba_and_label_buffer(
+                cols=np.zeros((len(pts), 3), dtype=np.float32),
+                cx=raster_state["cx"],
+                cy=raster_state["cy"],
+                w=int(raster_state["w"]),
+                h=int(raster_state["h"]),
+                s=int(raster_state["s"]),
+                pixel_shape=pixel_shape,
+                alpha_arr=None,
+                alpha_point=1.0,
+                vals=vals,
+                prioritize_high_values=bool(prioritize_high_values),
+                soft_enabled=bool(raster_state["soft_enabled"]),
+                soft_fx=raster_state["soft_fx"],
+                soft_fy=raster_state["soft_fy"],
+                label_codes=seg_codes,
+                runtime_fill_from_boundary=bool(runtime_fill_from_boundary),
+                runtime_fill_closing_radius=int(runtime_fill_closing_radius),
+                runtime_fill_holes=bool(runtime_fill_holes),
+                chunk_size=int(chunk_size),
+                logger=logger,
+                verbose=verbose,
+                context="image_plot_with_spatial_image(scatter-boundaries)",
+            )
 
             _plot_boundaries_from_label_image(
                 ax,
                 label_img,
-                [x_min, x_max, y_min, y_max],
+                [
+                    float(raster_state["x_min_eff"]),
+                    float(raster_state["x_max_eff"]),
+                    float(raster_state["y_min_eff"]),
+                    float(raster_state["y_max_eff"]),
+                ],
                 color_for_pixel,
                 boundary_linewidth,
                 alpha,

@@ -19,6 +19,12 @@ from ..utils.utils import (
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+_INFERRED_GRID_TARGET_OBSERVED_RATIO = 0.99
+_INFERRED_GRID_MIN_PITCH_SCALE = 0.65
+_INFERRED_GRID_SHRINK_FACTOR = 0.90
+_INFERRED_GRID_BINARY_STEPS = 4
+_INFERRED_GRID_MAX_DENSE_CELLS = 200_000_000
+
 
 def _infer_regular_grid_pitch(
     x_vals: np.ndarray,
@@ -79,6 +85,212 @@ def _infer_axis_origin(vals: np.ndarray, pitch: float) -> float:
     return float(best)
 
 
+def _measure_inferred_grid_assignment(
+    x_vals: np.ndarray,
+    y_vals: np.ndarray,
+    *,
+    pitch_x: float,
+    pitch_y: float,
+    return_keep_mask: bool = False,
+    return_disp: bool = False,
+) -> dict:
+    origin_x = _infer_axis_origin(x_vals, pitch_x)
+    origin_y = _infer_axis_origin(y_vals, pitch_y)
+
+    gx_all = np.rint((x_vals - origin_x) / pitch_x).astype(np.int64, copy=False)
+    gy_all = np.rint((y_vals - origin_y) / pitch_y).astype(np.int64, copy=False)
+    gx_min = int(gx_all.min())
+    gy_min = int(gy_all.min())
+    gx_all = gx_all - gx_min
+    gy_all = gy_all - gy_min
+    origin_x = float(origin_x + gx_min * pitch_x)
+    origin_y = float(origin_y + gy_min * pitch_y)
+
+    grid_w = int(gx_all.max()) + 1
+    grid_h = int(gy_all.max()) + 1
+    total_cells = int(grid_h) * int(grid_w)
+    grid_ids = gy_all.astype(np.int64, copy=False) * np.int64(grid_w) + gx_all.astype(np.int64, copy=False)
+
+    if return_keep_mask:
+        unique_ids, first_idx = np.unique(grid_ids, return_index=True)
+        keep_mask = np.zeros(grid_ids.size, dtype=bool)
+        keep_mask[np.asarray(first_idx, dtype=np.int64)] = True
+        observed_cells = int(unique_ids.size)
+    else:
+        keep_mask = None
+        observed_cells = int(np.unique(grid_ids).size)
+    dropped_duplicates = int(grid_ids.size - observed_cells)
+
+    result = {
+        'origin_x': float(origin_x),
+        'origin_y': float(origin_y),
+        'grid_shape': (int(grid_h), int(grid_w)),
+        'total_cells': int(total_cells),
+        'observed_cells': int(observed_cells),
+        'dropped_duplicates': int(dropped_duplicates),
+        'observed_ratio': float(observed_cells / max(1, grid_ids.size)),
+        'keep_mask': keep_mask,
+    }
+    if return_keep_mask or return_disp:
+        result['gx_all'] = gx_all
+        result['gy_all'] = gy_all
+    if return_disp:
+        obs_x_centers_all = origin_x + gx_all.astype(np.float64, copy=False) * float(pitch_x)
+        obs_y_centers_all = origin_y + gy_all.astype(np.float64, copy=False) * float(pitch_y)
+        disp = np.sqrt((x_vals - obs_x_centers_all) ** 2 + (y_vals - obs_y_centers_all) ** 2)
+        result['disp'] = disp
+    return result
+
+
+def _auto_tune_inferred_grid_pitch(
+    x_vals: np.ndarray,
+    y_vals: np.ndarray,
+    *,
+    pitch_x: float,
+    pitch_y: float,
+    target_observed_ratio: float = _INFERRED_GRID_TARGET_OBSERVED_RATIO,
+    min_scale: float = _INFERRED_GRID_MIN_PITCH_SCALE,
+    shrink_factor: float = _INFERRED_GRID_SHRINK_FACTOR,
+    binary_steps: int = _INFERRED_GRID_BINARY_STEPS,
+    max_dense_cells: int = _INFERRED_GRID_MAX_DENSE_CELLS,
+) -> tuple[float, float, dict]:
+    cache: dict[tuple[float, float], dict] = {}
+    candidate_count = 0
+
+    def _eval(px: float, py: float) -> dict:
+        nonlocal candidate_count
+        key = (float(px), float(py))
+        if key not in cache:
+            cache[key] = _measure_inferred_grid_assignment(
+                x_vals,
+                y_vals,
+                pitch_x=float(px),
+                pitch_y=float(py),
+                return_keep_mask=False,
+                return_disp=False,
+            )
+            candidate_count += 1
+        return cache[key]
+
+    base_metrics = _eval(pitch_x, pitch_y)
+    selected_pitch_x = float(pitch_x)
+    selected_pitch_y = float(pitch_y)
+    selected_metrics = base_metrics
+    status = 'retained'
+
+    if base_metrics['observed_ratio'] < float(target_observed_ratio):
+        floor_pitch_x = float(pitch_x) * float(min_scale)
+        floor_pitch_y = float(pitch_y) * float(min_scale)
+        safe_pitch_x = None
+        safe_pitch_y = None
+        safe_metrics = None
+        unsafe_pitch_x = float(pitch_x)
+        unsafe_pitch_y = float(pitch_y)
+        unsafe_metrics = base_metrics
+        best_pitch_x = float(pitch_x)
+        best_pitch_y = float(pitch_y)
+        best_metrics = base_metrics
+        curr_pitch_x = float(pitch_x)
+        curr_pitch_y = float(pitch_y)
+        dense_limit_hit = False
+
+        while (curr_pitch_x > floor_pitch_x) or (curr_pitch_y > floor_pitch_y):
+            next_pitch_x = max(floor_pitch_x, curr_pitch_x * float(shrink_factor))
+            next_pitch_y = max(floor_pitch_y, curr_pitch_y * float(shrink_factor))
+            if np.isclose(next_pitch_x, curr_pitch_x) and np.isclose(next_pitch_y, curr_pitch_y):
+                break
+            metrics = _eval(next_pitch_x, next_pitch_y)
+            if metrics['total_cells'] > int(max_dense_cells):
+                dense_limit_hit = True
+                break
+            if (
+                metrics['observed_ratio'] > best_metrics['observed_ratio']
+                or (
+                    np.isclose(metrics['observed_ratio'], best_metrics['observed_ratio'])
+                    and next_pitch_x > best_pitch_x
+                )
+            ):
+                best_pitch_x = float(next_pitch_x)
+                best_pitch_y = float(next_pitch_y)
+                best_metrics = metrics
+            if metrics['observed_ratio'] >= float(target_observed_ratio):
+                safe_pitch_x = float(next_pitch_x)
+                safe_pitch_y = float(next_pitch_y)
+                safe_metrics = metrics
+                break
+            unsafe_pitch_x = float(next_pitch_x)
+            unsafe_pitch_y = float(next_pitch_y)
+            unsafe_metrics = metrics
+            curr_pitch_x = float(next_pitch_x)
+            curr_pitch_y = float(next_pitch_y)
+
+        if safe_metrics is not None:
+            selected_pitch_x = safe_pitch_x
+            selected_pitch_y = safe_pitch_y
+            selected_metrics = safe_metrics
+            status = 'adjusted'
+            lo_x = float(safe_pitch_x)
+            lo_y = float(safe_pitch_y)
+            hi_x = float(unsafe_pitch_x)
+            hi_y = float(unsafe_pitch_y)
+            for _ in range(int(max(0, binary_steps))):
+                if (
+                    np.isclose(lo_x, hi_x)
+                    or np.isclose(lo_y, hi_y)
+                    or ((hi_x - lo_x) / max(lo_x, 1e-12) < 0.01)
+                ):
+                    break
+                mid_x = 0.5 * (lo_x + hi_x)
+                mid_y = 0.5 * (lo_y + hi_y)
+                metrics = _eval(mid_x, mid_y)
+                if metrics['total_cells'] > int(max_dense_cells):
+                    hi_x = float(mid_x)
+                    hi_y = float(mid_y)
+                    continue
+                if metrics['observed_ratio'] >= float(target_observed_ratio):
+                    lo_x = float(mid_x)
+                    lo_y = float(mid_y)
+                    selected_pitch_x = float(mid_x)
+                    selected_pitch_y = float(mid_y)
+                    selected_metrics = metrics
+                else:
+                    hi_x = float(mid_x)
+                    hi_y = float(mid_y)
+        else:
+            selected_pitch_x = best_pitch_x
+            selected_pitch_y = best_pitch_y
+            selected_metrics = best_metrics
+            if dense_limit_hit:
+                status = 'dense_limit'
+            elif (selected_pitch_x < float(pitch_x)) or (selected_pitch_y < float(pitch_y)):
+                status = 'min_scale_reached'
+
+    return selected_pitch_x, selected_pitch_y, {
+        'status': str(status),
+        'applied': bool(
+            (not np.isclose(selected_pitch_x, float(pitch_x)))
+            or (not np.isclose(selected_pitch_y, float(pitch_y)))
+        ),
+        'target_observed_ratio': float(target_observed_ratio),
+        'min_pitch_scale': float(min_scale),
+        'shrink_factor': float(shrink_factor),
+        'binary_steps': int(max(0, binary_steps)),
+        'candidate_count': int(candidate_count),
+        'initial_pitch_x': float(pitch_x),
+        'initial_pitch_y': float(pitch_y),
+        'selected_pitch_x': float(selected_pitch_x),
+        'selected_pitch_y': float(selected_pitch_y),
+        'initial_observed_ratio': float(base_metrics['observed_ratio']),
+        'selected_observed_ratio': float(selected_metrics['observed_ratio']),
+        'initial_observed_cells': int(base_metrics['observed_cells']),
+        'selected_observed_cells': int(selected_metrics['observed_cells']),
+        'initial_dropped_duplicates': int(base_metrics['dropped_duplicates']),
+        'selected_dropped_duplicates': int(selected_metrics['dropped_duplicates']),
+        'initial_total_cells': int(base_metrics['total_cells']),
+        'selected_total_cells': int(selected_metrics['total_cells']),
+    }
+
+
 def _binary_disk(radius: int) -> np.ndarray:
     radius = int(max(0, radius))
     if radius <= 0:
@@ -109,29 +321,35 @@ def _prepare_inferred_grid_state(
     y_vals = coords_used['y'].to_numpy(dtype=float, copy=False)
     barcode_vals = coords_used.index.astype(str).to_numpy(copy=False)
 
+    pitch_tuning = None
     if inferred_grid_pitch is None:
         pitch0 = _infer_regular_grid_pitch(x_vals, y_vals, n_jobs=n_jobs)
         pitch_x = float(pitch0)
         pitch_y = float(pitch0)
+        pitch_x, pitch_y, pitch_tuning = _auto_tune_inferred_grid_pitch(
+            x_vals,
+            y_vals,
+            pitch_x=pitch_x,
+            pitch_y=pitch_y,
+        )
     else:
         pitch_x = float(inferred_grid_pitch)
         pitch_y = float(inferred_grid_pitch)
 
-    origin_x = _infer_axis_origin(x_vals, pitch_x)
-    origin_y = _infer_axis_origin(y_vals, pitch_y)
-
-    gx_all = np.rint((x_vals - origin_x) / pitch_x).astype(np.int64, copy=False)
-    gy_all = np.rint((y_vals - origin_y) / pitch_y).astype(np.int64, copy=False)
-    gx_min = int(gx_all.min())
-    gy_min = int(gy_all.min())
-    gx_all = gx_all - gx_min
-    gy_all = gy_all - gy_min
-    origin_x = float(origin_x + gx_min * pitch_x)
-    origin_y = float(origin_y + gy_min * pitch_y)
-
-    grid_keys = pd.Index(gx_all.astype(str) + '_' + gy_all.astype(str))
-    keep_mask = ~grid_keys.duplicated(keep='first')
-    dropped_duplicates = int((~keep_mask).sum())
+    assignment = _measure_inferred_grid_assignment(
+        x_vals,
+        y_vals,
+        pitch_x=pitch_x,
+        pitch_y=pitch_y,
+        return_keep_mask=True,
+        return_disp=True,
+    )
+    origin_x = float(assignment['origin_x'])
+    origin_y = float(assignment['origin_y'])
+    gx_all = assignment['gx_all']
+    gy_all = assignment['gy_all']
+    keep_mask = assignment['keep_mask']
+    dropped_duplicates = int(assignment['dropped_duplicates'])
     if dropped_duplicates and verbose:
         logging.info(
             f"Inferred-grid mode collapsed {dropped_duplicates} duplicated barcodes sharing the same inferred grid cell for support-mask construction."
@@ -140,11 +358,9 @@ def _prepare_inferred_grid_state(
     gx_occ = gx_all[keep_mask]
     gy_occ = gy_all[keep_mask]
 
-    grid_w = int(gx_occ.max()) + 1
-    grid_h = int(gy_occ.max()) + 1
-    total_cells = int(grid_h) * int(grid_w)
-    max_dense_cells = 200_000_000
-    if total_cells > max_dense_cells:
+    grid_h, grid_w = assignment['grid_shape']
+    total_cells = int(assignment['total_cells'])
+    if total_cells > _INFERRED_GRID_MAX_DENSE_CELLS:
         raise MemoryError(
             f"Inferred-grid mask would require {grid_h}x{grid_w}={total_cells:,} cells. "
             f"Specify inferred_grid_pitch explicitly or increase tensor_resolution; "
@@ -155,6 +371,7 @@ def _prepare_inferred_grid_state(
     observed_mask[gy_occ, gx_occ] = True
     observed_cells = int(observed_mask.sum())
     observed_barcodes = int(barcode_vals.shape[0])
+    observed_ratio = float(observed_cells / max(1, observed_barcodes))
 
     support_radius = int(max(0, int(inferred_grid_neighbor_radius)))
     min_neighbors = int(max(0, int(inferred_grid_min_neighbors)))
@@ -172,11 +389,20 @@ def _prepare_inferred_grid_state(
         filled_mask = ndi.binary_fill_holes(filled_mask)
     filled_mask |= observed_mask
 
-    obs_x_centers_all = origin_x + gx_all.astype(np.float64, copy=False) * float(pitch_x)
-    obs_y_centers_all = origin_y + gy_all.astype(np.float64, copy=False) * float(pitch_y)
-    disp = np.sqrt((x_vals - obs_x_centers_all) ** 2 + (y_vals - obs_y_centers_all) ** 2)
+    disp = np.asarray(assignment['disp'], dtype=float)
 
-    return {
+    if pitch_tuning is not None and verbose and bool(pitch_tuning.get('applied', False)):
+        logging.info(
+            "Auto-tuned inferred-grid pitch from (%.4f, %.4f) to (%.4f, %.4f); observed ratio %.4f -> %.4f.",
+            pitch_tuning['initial_pitch_x'],
+            pitch_tuning['initial_pitch_y'],
+            pitch_tuning['selected_pitch_x'],
+            pitch_tuning['selected_pitch_y'],
+            pitch_tuning['initial_observed_ratio'],
+            pitch_tuning['selected_observed_ratio'],
+        )
+
+    state = {
         'x_all': x_vals,
         'y_all': y_vals,
         'barcode_all': barcode_vals,
@@ -191,6 +417,7 @@ def _prepare_inferred_grid_state(
         'filled_mask': filled_mask,
         'observed_cells': int(observed_cells),
         'observed_barcodes': int(observed_barcodes),
+        'observed_ratio': float(observed_ratio),
         'dropped_duplicate_cells': int(dropped_duplicates),
         'neighbor_radius': int(support_radius),
         'min_neighbors': int(min_neighbors),
@@ -200,6 +427,9 @@ def _prepare_inferred_grid_state(
         'snap_disp_p95': float(np.quantile(disp, 0.95)) if disp.size else 0.0,
         'snap_disp_max': float(np.max(disp)) if disp.size else 0.0,
     }
+    if pitch_tuning is not None:
+        state['pitch_tuning'] = pitch_tuning
+    return state
 
 
 def _build_inferred_grid_tiles(
@@ -307,25 +537,30 @@ def _build_inferred_boundary_voronoi_tiles(
     pitch_x = state['pitch_x']
     pitch_y = state['pitch_y']
     observed_barcodes = state['observed_barcodes']
+    observed_grid_cells = int(state['observed_cells'])
 
     support_mask = ndi.binary_fill_holes(filled_mask)
     support_mask |= filled_mask
     support_cells = int(support_mask.sum())
-    empty_support_cells = int(max(0, support_cells - int(observed_mask.sum())))
+    empty_support_mask = support_mask & ~observed_mask
+    empty_support_cells = int(empty_support_mask.sum())
 
-    support_gy, support_gx = np.nonzero(support_mask)
-    support_x = origin_x + support_gx.astype(np.float64, copy=False) * float(pitch_x)
-    support_y = origin_y + support_gy.astype(np.float64, copy=False) * float(pitch_y)
+    empty_support_gy, empty_support_gx = np.nonzero(empty_support_mask)
+    synthetic_support_x = origin_x + empty_support_gx.astype(np.float64, copy=False) * float(pitch_x)
+    synthetic_support_y = origin_y + empty_support_gy.astype(np.float64, copy=False) * float(pitch_y)
 
-    obs_pts = np.column_stack([x_all, y_all])
-    support_pts = np.column_stack([support_x, support_y])
-    tree = cKDTree(obs_pts)
-    workers = -1 if (n_jobs in (None, -1)) else int(n_jobs)
-    try:
-        _, nn_idx = tree.query(support_pts, k=1, workers=workers)
-    except TypeError:
-        _, nn_idx = tree.query(support_pts, k=1)
-    support_barcodes = barcode_all[np.asarray(nn_idx, dtype=np.int64)]
+    if empty_support_cells > 0:
+        obs_pts = np.column_stack([x_all, y_all])
+        support_pts = np.column_stack([synthetic_support_x, synthetic_support_y])
+        tree = cKDTree(obs_pts)
+        workers = -1 if (n_jobs in (None, -1)) else int(n_jobs)
+        try:
+            _, nn_idx = tree.query(support_pts, k=1, workers=workers)
+        except TypeError:
+            _, nn_idx = tree.query(support_pts, k=1)
+        synthetic_support_barcodes = barcode_all[np.asarray(nn_idx, dtype=np.int64)]
+    else:
+        synthetic_support_barcodes = np.empty(0, dtype=barcode_all.dtype)
 
     observed_tiles = pd.DataFrame({
         'x': x_all.astype(np.float64, copy=False),
@@ -333,22 +568,35 @@ def _build_inferred_boundary_voronoi_tiles(
         'barcode': barcode_all.astype(str, copy=False),
         'origin': np.ones(observed_barcodes, dtype=np.int8),
     })
-    support_tiles = pd.DataFrame({
-        'x': support_x,
-        'y': support_y,
-        'barcode': support_barcodes.astype(str, copy=False),
-        'origin': np.zeros(support_cells, dtype=np.int8),
+    observed_support_tiles = pd.DataFrame({
+        'x': x_all.astype(np.float64, copy=False),
+        'y': y_all.astype(np.float64, copy=False),
+        'barcode': barcode_all.astype(str, copy=False),
+        'origin': np.zeros(observed_barcodes, dtype=np.int8),
     })
-    tiles = pd.concat([observed_tiles, support_tiles], ignore_index=True)
+    support_tiles = pd.DataFrame({
+        'x': synthetic_support_x,
+        'y': synthetic_support_y,
+        'barcode': synthetic_support_barcodes.astype(str, copy=False),
+        'origin': np.zeros(empty_support_cells, dtype=np.int8),
+    })
+    tiles = pd.concat([observed_tiles, observed_support_tiles, support_tiles], ignore_index=True)
+    support_tile_rows = int(observed_barcodes + empty_support_cells)
 
     info = dict(state)
     info.update({
         'mode': 'boundary_voronoi',
+        'observed_grid_cells': int(observed_grid_cells),
+        'observed_grid_ratio': float(observed_grid_cells / max(1, observed_barcodes)),
+        'observed_cells': int(observed_barcodes),
+        'observed_ratio': 1.0,
         'filled_cells': int(filled_mask.sum()),
         'support_cells': int(support_cells),
-        'synthetic_cells': int(support_cells),
-        'generated_cells': int(support_cells),
+        'support_tile_rows': int(support_tile_rows),
+        'synthetic_cells': int(empty_support_cells),
+        'generated_cells': int(support_tile_rows),
         'empty_support_cells': int(empty_support_cells),
+        'support_represented_barcodes': int(observed_barcodes),
         'boundary_fill_holes_forced': True,
     })
     return tiles, info
@@ -371,7 +619,7 @@ def generate_tiles(
     inferred_grid_min_neighbors: int = 3,
     inferred_grid_closing_radius: int = 0,
     inferred_grid_fill_holes: bool = False,
-    coords_max_gap_factor: Optional[float] = 10.0,
+    coords_max_gap_factor: Optional[float] = None,
     coords_compaction: str = 'cap',
     coords_tight_step: float = 1.0,
     coords_rescale_to_nn: Optional[bool] = None,
@@ -410,9 +658,9 @@ def generate_tiles(
         If True, skip Voronoi/rasterise completely and build ``tiles`` directly
         from coordinates as one row per barcode with ``origin=1``. If
         ``tensor_resolution`` != 1, the coordinates are reduced using
-        ``reduce_tensor_resolution`` before writing. Additionally, coordinates
-        are compacted to avoid excessively large gaps between tiles (see
-        ``coords_max_gap_factor``).
+        ``reduce_tensor_resolution`` before writing. Optional coordinate
+        compaction can be enabled via ``coords_max_gap_factor`` /
+        ``coords_compaction``.
     use_inferred_grid_tiles : bool, optional (default=False)
         If True, infer a post-QC regular lattice from the surviving coordinates
         and use one of the inferred-grid tile builders controlled by
@@ -439,7 +687,7 @@ def generate_tiles(
     inferred_grid_fill_holes : bool, optional (default=False)
         If True, fill enclosed holes in the inferred occupancy grid before
         nearest-spot assignment. This is more aggressive and more artificial.
-    coords_max_gap_factor : float or None, optional (default=10.0)
+    coords_max_gap_factor : float or None, optional (default=None)
         When ``use_coords_as_tiles`` is True, limit one-dimensional gaps along
         X and Y to at most this factor times the median gap on that axis,
         preserving relative order while shrinking large empty spaces. Set to
@@ -827,15 +1075,16 @@ def generate_tiles(
         if verbose:
             if inferred_grid_mode_norm == 'boundary_voronoi':
                 logging.info(
-                    "Inferred-boundary Voronoi tiles: pitch=(%.4f, %.4f), grid=%dx%d, barcodes=%d, occupied=%d, support=%d, generated=%d",
+                    "Inferred-boundary Voronoi tiles: pitch=(%.4f, %.4f), grid=%dx%d, barcodes=%d, preserved=%d, grid-occupied=%d, support=%d, synthetic=%d",
                     inferred_info['pitch_x'],
                     inferred_info['pitch_y'],
                     inferred_info['grid_shape'][0],
                     inferred_info['grid_shape'][1],
                     inferred_info['observed_barcodes'],
                     inferred_info['observed_cells'],
+                    inferred_info.get('observed_grid_cells', inferred_info['observed_cells']),
                     inferred_info['support_cells'],
-                    inferred_info['generated_cells'],
+                    inferred_info['synthetic_cells'],
                 )
             else:
                 logging.info(

@@ -49,6 +49,12 @@ def image_plot_slic_segmentation(
     chunk_size: int = 50000,
     *,
     pixel_shape: str = "square",
+    runtime_fill_from_boundary: bool = False,
+    runtime_fill_closing_radius: int = 1,
+    runtime_fill_holes: bool = True,
+    soft_rasterization: bool = False,
+    resolve_center_collisions: bool = False,
+    center_collision_radius: int = 2,
     show_image: bool = False,
     verbose: bool = True,
     n_jobs: Optional[int] = None,
@@ -68,6 +74,28 @@ def image_plot_slic_segmentation(
         segmentation label image.
     n_jobs : int or None, optional (default ``None``)
         Reserved for potential parallel rasterization; currently unused (no-op).
+    runtime_fill_from_boundary : bool, optional (default ``False``)
+        If ``True``, preserve the original spot centers but morphologically fill
+        empty raster pixels inside the observed support before running SLIC.
+        This avoids coordinate snapping and does not require a user-provided pitch.
+    runtime_fill_closing_radius : int, optional (default ``1``)
+        Pixel-radius used for binary closing of the raster occupancy mask when
+        ``runtime_fill_from_boundary=True``.
+    runtime_fill_holes : bool, optional (default ``True``)
+        Whether to fill enclosed holes in the raster occupancy mask when
+        ``runtime_fill_from_boundary=True``.
+    soft_rasterization : bool, optional (default ``False``)
+        If ``True``, rasterize each spot with bilinear splatting and read SLIC
+        labels back with bilinear voting instead of hard one-pixel assignment.
+        Currently supported only for ``pixel_perfect=True``, ``tile_px==1`` and
+        ``pixel_shape='square'``.
+    resolve_center_collisions : bool, optional (default ``False``)
+        If ``True``, locally reassign duplicate raster centers onto nearby free
+        pixels before painting/fill/label lookup. Useful for dense origin-based
+        rasterization when many spots quantize onto the same pixel.
+    center_collision_radius : int, optional (default ``2``)
+        Search radius in raster pixels used when
+        ``resolve_center_collisions=True``.
     """
     logger.setLevel(logging.INFO if verbose else logging.WARNING)
 
@@ -120,26 +148,91 @@ def image_plot_slic_segmentation(
     if log is not None:
         log.info("Creating image with chunking (chunk size: %d)...", int(chunk_size))
     img = np.ones((h, w, dims), dtype=np.float32)
+    paint_mask = np.zeros((h, w), dtype=bool)
 
     dx, dy = _raster.tile_pixel_offsets(int(s), pixel_shape=pixel_shape)
 
-    for i in range(0, num_tiles, chunk_size):
-        chunk_end = min(i + chunk_size, num_tiles)
-        chunk_indices = np.arange(i, chunk_end)
-        chunk_cx, chunk_cy = _raster.scale_points_to_canvas(
-            spatial_coords[chunk_indices],
+    soft_enabled = bool(soft_rasterization)
+    if soft_enabled and (not bool(pixel_perfect) or int(s) != 1 or str(pixel_shape).lower() != "square"):
+        if log is not None:
+            log.warning(
+                "soft_rasterization requires pixel_perfect=True, tile_px==1, and pixel_shape='square'; falling back to hard rasterization."
+            )
+        soft_enabled = False
+    if soft_enabled:
+        cx_seed, cy_seed, soft_fx_seed, soft_fy_seed = _raster.scale_points_to_canvas_soft(
+            spatial_coords,
+            x_min_eff=float(x_min_eff),
+            y_min_eff=float(y_min_eff),
+            scale=float(scale),
+            pixel_perfect=True,
+            w=int(w),
+            h=int(h),
+        )
+    else:
+        soft_fx_seed = None
+        soft_fy_seed = None
+        cx_seed, cy_seed = _raster.scale_points_to_canvas(
+            spatial_coords,
             x_min_eff=float(x_min_eff),
             y_min_eff=float(y_min_eff),
             scale=float(scale),
             pixel_perfect=bool(pixel_perfect),
+            w=int(w),
+            h=int(h),
         )
-        chunk_all_x = np.clip((chunk_cx[:, None] + dx[None, :]).ravel(), 0, w - 1)
-        chunk_all_y = np.clip((chunk_cy[:, None] + dy[None, :]).ravel(), 0, h - 1)
-        chunk_tile_indices_map = np.repeat(chunk_indices, len(dx))
-        img[chunk_all_y, chunk_all_x] = cols[chunk_tile_indices_map]
+    collision_info = None
+    if resolve_center_collisions and not soft_enabled:
+        cx_seed, cy_seed, collision_info = _raster.resolve_center_collisions(
+            cx_seed,
+            cy_seed,
+            w=int(w),
+            h=int(h),
+            max_radius=int(center_collision_radius),
+            logger=log,
+            context="image_plot_slic_segmentation",
+        )
+    elif resolve_center_collisions and soft_enabled and log is not None:
+        log.info("image_plot_slic_segmentation: ignoring resolve_center_collisions because soft_rasterization=True.")
+
+    if soft_enabled:
+        _raster.rasterize_soft_bilinear(
+            img=img,
+            occupancy_mask=paint_mask,
+            seed_values=cols,
+            cx=cx_seed,
+            cy=cy_seed,
+            fx=soft_fx_seed,
+            fy=soft_fy_seed,
+            chunk_size=int(chunk_size),
+        )
+    else:
+        for i in range(0, num_tiles, chunk_size):
+            chunk_end = min(i + chunk_size, num_tiles)
+            chunk_indices = np.arange(i, chunk_end)
+            chunk_cx = cx_seed[chunk_indices]
+            chunk_cy = cy_seed[chunk_indices]
+            chunk_all_x = np.clip((chunk_cx[:, None] + dx[None, :]).ravel(), 0, w - 1)
+            chunk_all_y = np.clip((chunk_cy[:, None] + dy[None, :]).ravel(), 0, h - 1)
+            chunk_tile_indices_map = np.repeat(chunk_indices, len(dx))
+            img[chunk_all_y, chunk_all_x] = cols[chunk_tile_indices_map]
+            paint_mask[chunk_all_y, chunk_all_x] = True
 
     if log is not None:
         log.info("Image creation complete.")
+
+    if runtime_fill_from_boundary:
+        _raster.fill_raster_from_boundary(
+            img=img,
+            occupancy_mask=paint_mask,
+            seed_x=cx_seed,
+            seed_y=cy_seed,
+            seed_values=cols,
+            closing_radius=int(runtime_fill_closing_radius),
+            fill_holes=bool(runtime_fill_holes),
+            logger=log,
+            context="image_plot_slic_segmentation",
+        )
 
     if downsample_factor > 1.0:
         if log is not None:
@@ -148,8 +241,41 @@ def image_plot_slic_segmentation(
         img = resize(img, (new_h, new_w), anti_aliasing=True, preserve_range=True).astype(np.float32)
         scale /= downsample_factor
         w, h = new_w, new_h
+        if soft_enabled:
+            cx, cy, soft_fx, soft_fy = _raster.scale_points_to_canvas_soft(
+                spatial_coords,
+                x_min_eff=float(x_min_eff),
+                y_min_eff=float(y_min_eff),
+                scale=float(scale),
+                pixel_perfect=True,
+                w=int(w),
+                h=int(h),
+            )
+        elif resolve_center_collisions:
+            factor = int(max(1, round(float(downsample_factor))))
+            cx = np.clip((cx_seed // factor).astype(np.int32, copy=False), 0, max(0, w - 1))
+            cy = np.clip((cy_seed // factor).astype(np.int32, copy=False), 0, max(0, h - 1))
+        else:
+            cx, cy = _raster.scale_points_to_canvas(
+                spatial_coords,
+                x_min_eff=float(x_min_eff),
+                y_min_eff=float(y_min_eff),
+                scale=float(scale),
+                pixel_perfect=bool(pixel_perfect),
+                w=int(w),
+                h=int(h),
+            )
         if log is not None:
             log.info("Downsampling complete.")
+            if collision_info is not None:
+                log.info(
+                    "image_plot_slic_segmentation: center collision fraction %.4f -> %.4f.",
+                    float(collision_info["collision_fraction_before"]),
+                    float(collision_info["collision_fraction_after"]),
+                )
+    else:
+        cx, cy = cx_seed, cy_seed
+        soft_fx, soft_fy = soft_fx_seed, soft_fy_seed
 
     if log is not None:
         log.info("Running SLIC on CPU...")
@@ -165,16 +291,17 @@ def image_plot_slic_segmentation(
     if log is not None:
         log.info("CPU SLIC complete.")
 
-    cx, cy = _raster.scale_points_to_canvas(
-        spatial_coords,
-        x_min_eff=float(x_min_eff),
-        y_min_eff=float(y_min_eff),
-        scale=float(scale),
-        pixel_perfect=bool(pixel_perfect),
-        w=int(w),
-        h=int(h),
-    )
-    labels = label_img[cy, cx].astype(int)
+    if soft_enabled:
+        labels = _raster.sample_labels_soft_bilinear(
+            label_img,
+            cx,
+            cy,
+            soft_fx,
+            soft_fy,
+            chunk_size=max(100_000, int(chunk_size)),
+        ).astype(int, copy=False)
+    else:
+        labels = label_img[cy, cx].astype(int)
     if show_image:
         import matplotlib.pyplot as plt
 
@@ -245,7 +372,20 @@ def slic_segmentation_from_cached_image(
     cy = np.asarray(cache.get("cy"), dtype=int)
     if cx.size == 0 or cy.size == 0:
         raise ValueError("Cached image missing per-tile sampling indices 'cx','cy'.")
-    labels = label_img[cy, cx].astype(int)
+    if bool(cache.get("soft_rasterization", False)):
+        soft_fx = cache.get("soft_fx", None)
+        soft_fy = cache.get("soft_fy", None)
+        if soft_fx is None or soft_fy is None:
+            raise ValueError("Cached soft-raster image is missing 'soft_fx'/'soft_fy' metadata.")
+        labels = _raster.sample_labels_soft_bilinear(
+            label_img,
+            cx,
+            cy,
+            np.asarray(soft_fx, dtype=np.float32),
+            np.asarray(soft_fy, dtype=np.float32),
+        ).astype(int, copy=False)
+    else:
+        labels = label_img[cy, cx].astype(int)
 
     if show_image:
         import matplotlib.pyplot as plt

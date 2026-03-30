@@ -561,6 +561,12 @@ def segment_image(
     pixel_perfect: bool = True,
     enforce_connectivity: bool = False,
     pixel_shape: str = "square",
+    runtime_fill_from_boundary: bool = False,
+    runtime_fill_closing_radius: int = 1,
+    runtime_fill_holes: bool = True,
+    soft_rasterization: bool = False,
+    resolve_center_collisions: bool = False,
+    center_collision_radius: int = 2,
     show_image: bool = False,
     target_segment_um: float | None = None,
     pitch_um: float = 2.0,
@@ -628,6 +634,27 @@ def segment_image(
         Whether to enforce connectivity in ``image_plot_slic``.
     pixel_shape : str, optional (default ``"square"``)
         Shape used for rasterizing spots in ``image_plot_slic``.
+    runtime_fill_from_boundary : bool, optional (default ``False``)
+        If True, keep the original spot tiles but morphologically fill the
+        raster support before ``image_plot_slic`` segmentation.
+    runtime_fill_closing_radius : int, optional (default ``1``)
+        Pixel-radius used for binary closing of the observed raster support
+        when ``runtime_fill_from_boundary=True``.
+    runtime_fill_holes : bool, optional (default ``True``)
+        Whether to fill enclosed holes in the raster support when
+        ``runtime_fill_from_boundary=True``.
+    soft_rasterization : bool, optional (default ``False``)
+        If True, use bilinear splatting and bilinear label readback for
+        ``image_plot_slic`` instead of hard one-pixel assignment. This is
+        intended for dense ``origin=True`` rasterization where many spots snap
+        to the same pixel.
+    resolve_center_collisions : bool, optional (default ``False``)
+        If True, locally reassign duplicate raster centers onto nearby empty
+        pixels before ``image_plot_slic`` runs. This is mainly useful for dense
+        ``origin=True`` workflows where many spots quantize to the same pixel.
+    center_collision_radius : int, optional (default ``2``)
+        Search radius in raster pixels used when
+        ``resolve_center_collisions=True``.
     show_image : bool, optional (default ``False``)
         If ``True`` display the intermediate images produced by
         ``image_plot_slic_segmentation``.
@@ -1064,6 +1091,12 @@ def segment_image(
                     pixel_perfect=pixel_perfect,
                     enforce_connectivity=enforce_connectivity,
                     pixel_shape=pixel_shape,
+                    runtime_fill_from_boundary=runtime_fill_from_boundary,
+                    runtime_fill_closing_radius=runtime_fill_closing_radius,
+                    runtime_fill_holes=runtime_fill_holes,
+                    soft_rasterization=soft_rasterization,
+                    resolve_center_collisions=resolve_center_collisions,
+                    center_collision_radius=center_collision_radius,
                     show_image=show_image,
                     verbose=verbose,
                     n_jobs=n_jobs,
@@ -1305,6 +1338,12 @@ def segment_image(
                         pixel_perfect=pixel_perfect,
                         enforce_connectivity=enforce_connectivity,
                         pixel_shape=pixel_shape,
+                        runtime_fill_from_boundary=runtime_fill_from_boundary,
+                        runtime_fill_closing_radius=runtime_fill_closing_radius,
+                        runtime_fill_holes=runtime_fill_holes,
+                        soft_rasterization=soft_rasterization,
+                        resolve_center_collisions=resolve_center_collisions,
+                        center_collision_radius=center_collision_radius,
                         show_image=show_image,
                         verbose=verbose,
                         n_jobs=n_jobs,
@@ -1352,6 +1391,12 @@ def segment_image(
                     pixel_perfect=pixel_perfect,
                     enforce_connectivity=enforce_connectivity,
                     pixel_shape=pixel_shape,
+                    runtime_fill_from_boundary=runtime_fill_from_boundary,
+                    runtime_fill_closing_radius=runtime_fill_closing_radius,
+                    runtime_fill_holes=runtime_fill_holes,
+                    soft_rasterization=soft_rasterization,
+                    resolve_center_collisions=resolve_center_collisions,
+                    center_collision_radius=center_collision_radius,
                     show_image=show_image,
                     verbose=verbose,
                     n_jobs=n_jobs,
@@ -1407,7 +1452,13 @@ def segment_image(
                 pixel_perfect,
                 enforce_connectivity,
                 pixel_shape,
-                show_image,
+                runtime_fill_from_boundary=runtime_fill_from_boundary,
+                runtime_fill_closing_radius=runtime_fill_closing_radius,
+                runtime_fill_holes=runtime_fill_holes,
+                soft_rasterization=soft_rasterization,
+                resolve_center_collisions=resolve_center_collisions,
+                center_collision_radius=center_collision_radius,
+                show_image=show_image,
                 fig_dpi=fig_dpi,
                 grid_origin_x=grid_origin_x,
                 grid_origin_y=grid_origin_y,
@@ -1504,6 +1555,12 @@ def segment_image_inner(
     pixel_perfect: bool = True,
     enforce_connectivity: bool = False,
     pixel_shape: str = "square",
+    runtime_fill_from_boundary: bool = False,
+    runtime_fill_closing_radius: int = 1,
+    runtime_fill_holes: bool = True,
+    soft_rasterization: bool = False,
+    resolve_center_collisions: bool = False,
+    center_collision_radius: int = 2,
     show_image: bool = False,
     fig_dpi: int | None = None,
     n_jobs: int | None = None,
@@ -1561,6 +1618,24 @@ def segment_image_inner(
         Shape used when rendering the temporary image in ``image_plot_slic``.
         ``"circle"`` mimics Visium style spots while ``"square"`` draws
         traditional tiles.
+    runtime_fill_from_boundary : bool, optional
+        If True, keep the original spot tiles but morphologically fill the
+        raster support before ``image_plot_slic`` segmentation.
+    runtime_fill_closing_radius : int, optional
+        Pixel-radius used for binary closing of the observed raster support
+        when ``runtime_fill_from_boundary=True``.
+    runtime_fill_holes : bool, optional
+        Whether to fill enclosed holes in the raster support when
+        ``runtime_fill_from_boundary=True``.
+    soft_rasterization : bool, optional
+        If True, use bilinear splatting and bilinear label readback for
+        ``image_plot_slic``.
+    resolve_center_collisions : bool, optional
+        If True, locally reassign duplicate raster centers onto nearby empty
+        pixels before ``image_plot_slic`` runs.
+    center_collision_radius : int, optional
+        Search radius in raster pixels used when
+        ``resolve_center_collisions=True``.
     show_image : bool, optional
         If ``True`` display the constructed image and label image during
         ``image_plot_slic`` segmentation.
@@ -1620,6 +1695,12 @@ def segment_image_inner(
             pixel_perfect=pixel_perfect,
             enforce_connectivity=enforce_connectivity,
             pixel_shape=pixel_shape,
+            runtime_fill_from_boundary=runtime_fill_from_boundary,
+            runtime_fill_closing_radius=runtime_fill_closing_radius,
+            runtime_fill_holes=runtime_fill_holes,
+            soft_rasterization=soft_rasterization,
+            resolve_center_collisions=resolve_center_collisions,
+            center_collision_radius=center_collision_radius,
             show_image=show_image,
             verbose=verbose,
             n_jobs=n_jobs,

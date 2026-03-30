@@ -209,7 +209,7 @@ def generate_embeddings(
     inferred_grid_min_neighbors: int = 3,
     inferred_grid_closing_radius: int = 0,
     inferred_grid_fill_holes: bool = False,
-    coords_max_gap_factor: Optional[float] = 10.0,
+    coords_max_gap_factor: Optional[float] = None,
     coords_compaction: str = 'cap',
     coords_tight_step: float = 1.0,
     coords_rescale_to_nn: Optional[bool] = None,
@@ -235,6 +235,7 @@ def generate_embeddings(
     nmf_use_minibatch: bool = False,
     nmf_batch_size: Optional[int] = None,
     nmf_threads: Optional[int] = None,         # control BLAS/OpenMP threads
+    pca_blas_threads: Optional[int] = None,    # optional BLAS/OpenMP threads during PCA
 ) -> AnnData:
     """
     Generate embeddings for the given AnnData object using specified parameters.
@@ -278,8 +279,8 @@ def generate_embeddings(
         If True, skip Voronoi and rasterisation during tile generation and
         directly write coordinates to ``adata.uns['tiles']`` (one row per barcode,
         origin=1). If ``tensor_resolution`` != 1, the coordinates are reduced
-        using ``reduce_tensor_resolution`` before writing. Coordinates are then
-        compacted to avoid excessively large gaps (see ``coords_max_gap_factor``).
+        using ``reduce_tensor_resolution`` before writing. Optional coordinate
+        compaction can be enabled via ``coords_max_gap_factor`` / ``coords_compaction``.
     use_inferred_grid_tiles : bool, optional (default=False)
         If True, infer a post-QC regular lattice from the surviving coordinates
         and use one of the inferred-grid tile builders controlled by
@@ -306,7 +307,7 @@ def generate_embeddings(
     inferred_grid_fill_holes : bool, optional (default=False)
         If True, fill enclosed holes in the inferred occupancy grid before
         nearest-spot assignment. This is more aggressive and more artificial.
-    coords_max_gap_factor : float or None, optional (default=10.0)
+    coords_max_gap_factor : float or None, optional (default=None)
         When using coordinates-as-tiles, limit 1D gaps along X/Y to at most
         this factor times the median gap on that axis. Set to ``None`` or
         ``<= 0`` to disable compaction.
@@ -363,6 +364,9 @@ def generate_embeddings(
         - `nmf_batch_size`: mini-batch size when using MiniBatchNMF.
         - `nmf_threads`: limit BLAS/OpenMP threads during NMF to avoid oversubscription
           and utilize cores efficiently.
+    pca_blas_threads : int or None, optional (default=None)
+        Optional BLAS/OpenMP thread cap applied only during PCA. `None` preserves
+        previous behavior; set to `1` if you need the most conservative/stable PCA path.
 
     """
     _coerce_string_indices_inplace(adata)
@@ -466,11 +470,11 @@ def generate_embeddings(
     # Embed latent space using specified dimensionality reduction
     if verbose:
         logging.info("Embedding latent space...")
-    embeds = embed_latent_space(
-        adata_proc,
-        dim_reduction=dim_reduction,
-        library_id=library_id,
-        dimensions=dimensions,
+        embeds = embed_latent_space(
+            adata_proc,
+            dim_reduction=dim_reduction,
+            library_id=library_id,
+            dimensions=dimensions,
         features=features,
         remove_lsi_1=remove_lsi_1,
         verbose=verbose,
@@ -483,11 +487,12 @@ def generate_embeddings(
         nmf_max_iter=nmf_max_iter,
         nmf_alpha_W=nmf_alpha_W,
         nmf_alpha_H=nmf_alpha_H,
-        nmf_l1_ratio=nmf_l1_ratio,
-        nmf_use_minibatch=nmf_use_minibatch,
-        nmf_batch_size=nmf_batch_size,
-        nmf_threads=nmf_threads,
-    )
+            nmf_l1_ratio=nmf_l1_ratio,
+            nmf_use_minibatch=nmf_use_minibatch,
+            nmf_batch_size=nmf_batch_size,
+            nmf_threads=nmf_threads,
+            pca_blas_threads=pca_blas_threads,
+        )
 
     # Store embeddings in AnnData object
     adata.obsm['X_embedding'] = embeds
@@ -640,6 +645,7 @@ def embed_latent_space(
     nmf_use_minibatch: bool = False,
     nmf_batch_size: Optional[int] = None,
     nmf_threads: Optional[int] = None,
+    pca_blas_threads: Optional[int] = None,
 ) -> np.ndarray:
     """
     Embed the processed data into a latent space using specified dimensionality reduction.
@@ -669,6 +675,8 @@ def embed_latent_space(
         value from generate_embeddings.nfeatures when provided).
     nmf_* : optional
         See generate_embeddings docstring for details.
+    pca_blas_threads : int or None
+        Optional BLAS/OpenMP thread cap applied only during PCA.
     
     Returns
     -------
@@ -691,7 +699,16 @@ def embed_latent_space(
             if hv_mask.any():
                 # Force an explicit copy to avoid lazy view materialization variance.
                 adata_proc = adata_proc[:, hv_mask].copy()
-        with _limit_blas_openmp(pca_threads):
+        effective_pca_threads = pca_blas_threads if pca_blas_threads is not None else pca_threads
+        if scipy.sparse.issparse(adata_proc.X):
+            if verbose:
+                logging.info(
+                    "Sparse PCA path selected (shape=%s x %s, scanpy defaults preserved, blas_threads=%s).",
+                    adata_proc.n_obs,
+                    adata_proc.n_vars,
+                    effective_pca_threads,
+                )
+        with _limit_blas_openmp(effective_pca_threads):
             sc.tl.pca(adata_proc, n_comps=dimensions)
         embeds = adata_proc.obsm['X_pca']
         embeds = MinMaxScaler().fit_transform(embeds)

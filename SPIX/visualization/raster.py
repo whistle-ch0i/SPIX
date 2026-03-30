@@ -2,6 +2,7 @@ import os
 from typing import Optional, Tuple
 
 import numpy as np
+from scipy import ndimage as ndi
 from scipy.spatial import KDTree
 
 
@@ -472,6 +473,290 @@ def tile_pixel_offsets(tile_px: int, pixel_shape: str = "square") -> Tuple[np.nd
     return dx, dy
 
 
+def _binary_disk(radius: int) -> np.ndarray:
+    radius = int(max(0, radius))
+    if radius <= 0:
+        return np.ones((1, 1), dtype=bool)
+    yy, xx = np.ogrid[-radius:radius + 1, -radius:radius + 1]
+    return ((xx * xx + yy * yy) <= (radius * radius)).astype(bool)
+
+
+def fill_raster_from_boundary(
+    *,
+    img: np.ndarray,
+    occupancy_mask: np.ndarray,
+    seed_x: np.ndarray,
+    seed_y: np.ndarray,
+    seed_values: np.ndarray,
+    closing_radius: int = 1,
+    fill_holes: bool = True,
+    logger=None,
+    context: str = "",
+) -> dict:
+    """Morphologically fill raster support from observed tiles without resnapping points.
+
+    The image is updated in-place by assigning each newly filled pixel the value
+    of its nearest observed tile center in raster space.
+    """
+    occ = np.asarray(occupancy_mask, dtype=bool)
+    if occ.ndim != 2:
+        raise ValueError("occupancy_mask must be a 2D boolean array.")
+    if not np.any(occ):
+        return {
+            "applied": False,
+            "filled_pixels": 0,
+            "support_pixels": 0,
+            "closing_radius": int(max(0, closing_radius)),
+            "fill_holes": bool(fill_holes),
+        }
+
+    support_mask = occ.copy()
+    radius = int(max(0, closing_radius))
+    if radius > 0:
+        support_mask = ndi.binary_closing(support_mask, structure=_binary_disk(radius))
+    if fill_holes:
+        support_mask = ndi.binary_fill_holes(support_mask)
+    support_mask |= occ
+
+    fill_mask = support_mask & ~occ
+    filled_pixels = int(fill_mask.sum())
+    if filled_pixels > 0:
+        sx = np.asarray(seed_x, dtype=np.int32).ravel()
+        sy = np.asarray(seed_y, dtype=np.int32).ravel()
+        vals = np.asarray(seed_values)
+        valid = (
+            np.isfinite(sx)
+            & np.isfinite(sy)
+            & (sx >= 0)
+            & (sy >= 0)
+            & (sx < occ.shape[1])
+            & (sy < occ.shape[0])
+        )
+        if np.any(valid):
+            seed_xy = np.column_stack([sx[valid], sy[valid]])
+            fy, fx = np.nonzero(fill_mask)
+            fill_xy = np.column_stack([fx, fy])
+            tree = KDTree(seed_xy.astype(np.float32, copy=False))
+            _, nn_idx = tree.query(fill_xy.astype(np.float32, copy=False), k=1)
+            img[fy, fx] = vals[np.asarray(valid).nonzero()[0][np.asarray(nn_idx, dtype=np.int64)]]
+        else:
+            filled_pixels = 0
+
+    if logger is not None and filled_pixels > 0:
+        msg = f"{context}: " if context else ""
+        logger.info(
+            "%sApplied raster boundary fill with closing_radius=%d, fill_holes=%s; filled %d pixels.",
+            msg,
+            int(radius),
+            bool(fill_holes),
+            int(filled_pixels),
+        )
+
+    return {
+        "applied": bool(filled_pixels > 0),
+        "filled_pixels": int(filled_pixels),
+        "support_pixels": int(support_mask.sum()),
+        "closing_radius": int(radius),
+        "fill_holes": bool(fill_holes),
+    }
+
+
+def _collision_search_offsets(max_radius: int) -> list[tuple[int, int]]:
+    radius = int(max(0, max_radius))
+    if radius <= 0:
+        return []
+    offsets: list[tuple[int, int]] = []
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            if dx == 0 and dy == 0:
+                continue
+            offsets.append((int(dx), int(dy)))
+    offsets.sort(key=lambda xy: (xy[0] * xy[0] + xy[1] * xy[1], abs(xy[1]), abs(xy[0]), xy[1], xy[0]))
+    return offsets
+
+
+def resolve_center_collisions(
+    cx: np.ndarray,
+    cy: np.ndarray,
+    *,
+    w: int,
+    h: int,
+    max_radius: int = 2,
+    chunk_size: int = 2_000_000,
+    logger=None,
+    context: str = "",
+) -> Tuple[np.ndarray, np.ndarray, dict]:
+    """Move duplicate raster centers onto nearby empty pixels.
+
+    The first tile at each pixel center stays fixed. Remaining colliding tiles are
+    reassigned to the nearest free pixel within ``max_radius`` in raster space.
+    Any tiles that still cannot be placed remain at their original centers.
+    """
+    cx0 = np.asarray(cx, dtype=np.int32).ravel()
+    cy0 = np.asarray(cy, dtype=np.int32).ravel()
+    n_tiles = int(cx0.size)
+    if cy0.size != n_tiles:
+        raise ValueError("cx and cy must have the same length.")
+    if n_tiles == 0:
+        return cx0.copy(), cy0.copy(), {
+            "applied": False,
+            "enabled": True,
+            "search_radius": int(max(0, max_radius)),
+            "n_tiles": 0,
+            "n_unique_centers_before": 0,
+            "n_unique_centers_after": 0,
+            "collision_fraction_before": 0.0,
+            "collision_fraction_after": 0.0,
+            "n_collided_tiles_before": 0,
+            "n_collided_tiles_after": 0,
+            "n_reassigned_tiles": 0,
+            "max_stack_before": 0,
+            "max_stack_after": 0,
+            "unresolved_tiles": 0,
+        }
+
+    w_i = int(max(1, w))
+    h_i = int(max(1, h))
+    if w_i * h_i <= 0:
+        raise ValueError("w and h must be positive.")
+    cx0 = np.clip(cx0, 0, max(0, w_i - 1))
+    cy0 = np.clip(cy0, 0, max(0, h_i - 1))
+
+    flat0 = cy0.astype(np.int64, copy=False) * np.int64(w_i) + cx0.astype(np.int64, copy=False)
+    order = np.argsort(flat0, kind="mergesort")
+    flat_sorted = flat0[order]
+    dup_sorted = np.zeros(n_tiles, dtype=bool)
+    if n_tiles > 1:
+        dup_sorted[1:] = flat_sorted[1:] == flat_sorted[:-1]
+    if not np.any(dup_sorted):
+        info = {
+            "applied": False,
+            "enabled": True,
+            "search_radius": int(max(0, max_radius)),
+            "n_tiles": int(n_tiles),
+            "n_unique_centers_before": int(n_tiles),
+            "n_unique_centers_after": int(n_tiles),
+            "collision_fraction_before": 0.0,
+            "collision_fraction_after": 0.0,
+            "n_collided_tiles_before": 0,
+            "n_collided_tiles_after": 0,
+            "n_reassigned_tiles": 0,
+            "max_stack_before": 1,
+            "max_stack_after": 1,
+            "unresolved_tiles": 0,
+        }
+        return cx0.copy(), cy0.copy(), info
+
+    run_starts = np.concatenate(([0], np.flatnonzero(flat_sorted[1:] != flat_sorted[:-1]) + 1))
+    counts = np.diff(np.concatenate((run_starts, [n_tiles])))
+    max_stack_before = int(counts.max()) if counts.size else 1
+    unique_before = int(run_starts.size)
+    collided_before = int(n_tiles - unique_before)
+
+    keep_mask = np.ones(n_tiles, dtype=bool)
+    keep_mask[order[dup_sorted]] = False
+    move_idx = np.flatnonzero(~keep_mask)
+    if move_idx.size == 0:
+        info = {
+            "applied": False,
+            "enabled": True,
+            "search_radius": int(max(0, max_radius)),
+            "n_tiles": int(n_tiles),
+            "n_unique_centers_before": int(unique_before),
+            "n_unique_centers_after": int(unique_before),
+            "collision_fraction_before": float(collided_before / max(1, n_tiles)),
+            "collision_fraction_after": float(collided_before / max(1, n_tiles)),
+            "n_collided_tiles_before": int(collided_before),
+            "n_collided_tiles_after": int(collided_before),
+            "n_reassigned_tiles": 0,
+            "max_stack_before": int(max_stack_before),
+            "max_stack_after": int(max_stack_before),
+            "unresolved_tiles": int(collided_before),
+        }
+        return cx0.copy(), cy0.copy(), info
+
+    cx_new = cx0.copy()
+    cy_new = cy0.copy()
+    occupancy = np.zeros(int(h_i) * int(w_i), dtype=bool)
+    occupancy[flat0[keep_mask]] = True
+    move_cx = cx0[move_idx]
+    move_cy = cy0[move_idx]
+    pending = np.ones(move_idx.size, dtype=bool)
+    offsets = _collision_search_offsets(int(max_radius))
+    work_chunk = int(max(1, chunk_size))
+
+    for dx, dy in offsets:
+        if not np.any(pending):
+            break
+        active_pos = np.flatnonzero(pending)
+        for start in range(0, active_pos.size, work_chunk):
+            local_pos = active_pos[start : start + work_chunk]
+            tx = move_cx[local_pos].astype(np.int64, copy=False) + np.int64(dx)
+            ty = move_cy[local_pos].astype(np.int64, copy=False) + np.int64(dy)
+            valid = (tx >= 0) & (ty >= 0) & (tx < w_i) & (ty < h_i)
+            if not np.any(valid):
+                continue
+            cand_pos = local_pos[valid]
+            cand_flat = ty[valid] * np.int64(w_i) + tx[valid]
+            free = ~occupancy[cand_flat]
+            if not np.any(free):
+                continue
+            cand_pos = cand_pos[free]
+            cand_flat = cand_flat[free]
+            cand_order = np.argsort(cand_flat, kind="mergesort")
+            cand_flat_sorted = cand_flat[cand_order]
+            first_hits = np.ones(cand_flat_sorted.size, dtype=bool)
+            if cand_flat_sorted.size > 1:
+                first_hits[1:] = cand_flat_sorted[1:] != cand_flat_sorted[:-1]
+            chosen = cand_order[first_hits]
+            chosen_pos = cand_pos[chosen]
+            chosen_flat = cand_flat[chosen]
+            chosen_idx = move_idx[chosen_pos]
+            cx_new[chosen_idx] = (chosen_flat % np.int64(w_i)).astype(np.int32, copy=False)
+            cy_new[chosen_idx] = (chosen_flat // np.int64(w_i)).astype(np.int32, copy=False)
+            occupancy[chosen_flat] = True
+            pending[chosen_pos] = False
+
+    unresolved_tiles = int(np.count_nonzero(pending))
+    flat_final = cy_new.astype(np.int64, copy=False) * np.int64(w_i) + cx_new.astype(np.int64, copy=False)
+    _, counts_after = np.unique(flat_final, return_counts=True)
+    unique_after_n = int(counts_after.size)
+    collided_after = int(n_tiles - unique_after_n)
+    max_stack_after = int(counts_after.max()) if counts_after.size else 1
+    reassigned = int(move_idx.size - unresolved_tiles)
+
+    info = {
+        "applied": bool(reassigned > 0),
+        "enabled": True,
+        "search_radius": int(max(0, max_radius)),
+        "n_tiles": int(n_tiles),
+        "n_unique_centers_before": int(unique_before),
+        "n_unique_centers_after": int(unique_after_n),
+        "collision_fraction_before": float(collided_before / max(1, n_tiles)),
+        "collision_fraction_after": float(collided_after / max(1, n_tiles)),
+        "n_collided_tiles_before": int(collided_before),
+        "n_collided_tiles_after": int(collided_after),
+        "n_reassigned_tiles": int(reassigned),
+        "max_stack_before": int(max_stack_before),
+        "max_stack_after": int(max_stack_after),
+        "unresolved_tiles": int(unresolved_tiles),
+    }
+
+    if logger is not None and collided_before > 0:
+        msg = f"{context}: " if context else ""
+        logger.info(
+            "%sResolved raster center collisions within radius=%d; before=%d after=%d reassigned=%d unresolved=%d.",
+            msg,
+            int(max(0, max_radius)),
+            int(collided_before),
+            int(collided_after),
+            int(reassigned),
+            int(unresolved_tiles),
+        )
+
+    return cx_new, cy_new, info
+
+
 def scale_points_to_canvas(
     points: np.ndarray,
     *,
@@ -496,6 +781,167 @@ def scale_points_to_canvas(
     if h is not None:
         cy = np.clip(cy, 0, max(0, int(h) - 1))
     return cx, cy
+
+
+def scale_points_to_canvas_soft(
+    points: np.ndarray,
+    *,
+    x_min_eff: float,
+    y_min_eff: float,
+    scale: float,
+    pixel_perfect: bool,
+    w: int,
+    h: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return nearest-center indices plus bilinear fractions for soft rasterization."""
+    if not bool(pixel_perfect):
+        raise ValueError("soft rasterization currently requires pixel_perfect=True.")
+    pts = np.asarray(points, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] < 2:
+        raise ValueError("points must be a 2D array with at least two columns.")
+    w_i = int(max(1, w))
+    h_i = int(max(1, h))
+    ux = (pts[:, 0] - float(x_min_eff)) * float(scale)
+    uy = (pts[:, 1] - float(y_min_eff)) * float(scale)
+    ux = np.clip(ux, 0.0, float(max(0, w_i - 1)))
+    uy = np.clip(uy, 0.0, float(max(0, h_i - 1)))
+    fx = ux - np.floor(ux)
+    fy = uy - np.floor(uy)
+    cx = np.floor(ux + 0.5).astype(np.int32)
+    cy = np.floor(uy + 0.5).astype(np.int32)
+    return cx, cy, fx.astype(np.float32), fy.astype(np.float32)
+
+
+def bilinear_support_from_centers(
+    cx: np.ndarray,
+    cy: np.ndarray,
+    fx: np.ndarray,
+    fy: np.ndarray,
+    *,
+    w: int,
+    h: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Expand nearest-center metadata into 4-neighbor bilinear support."""
+    cx_i = np.asarray(cx, dtype=np.int32).ravel()
+    cy_i = np.asarray(cy, dtype=np.int32).ravel()
+    fx_f = np.asarray(fx, dtype=np.float32).ravel()
+    fy_f = np.asarray(fy, dtype=np.float32).ravel()
+    n = int(cx_i.size)
+    if cy_i.size != n or fx_f.size != n or fy_f.size != n:
+        raise ValueError("cx, cy, fx, fy must have the same length.")
+    w_i = int(max(1, w))
+    h_i = int(max(1, h))
+    x0 = cx_i.astype(np.int64, copy=False) - (fx_f >= 0.5).astype(np.int64, copy=False)
+    y0 = cy_i.astype(np.int64, copy=False) - (fy_f >= 0.5).astype(np.int64, copy=False)
+    x0 = np.clip(x0, 0, max(0, w_i - 1)).astype(np.int32, copy=False)
+    y0 = np.clip(y0, 0, max(0, h_i - 1)).astype(np.int32, copy=False)
+    x1 = np.clip(x0.astype(np.int64, copy=False) + 1, 0, max(0, w_i - 1)).astype(np.int32, copy=False)
+    y1 = np.clip(y0.astype(np.int64, copy=False) + 1, 0, max(0, h_i - 1)).astype(np.int32, copy=False)
+    one_minus_fx = (1.0 - fx_f).astype(np.float32, copy=False)
+    one_minus_fy = (1.0 - fy_f).astype(np.float32, copy=False)
+    w00 = (one_minus_fx * one_minus_fy).astype(np.float32, copy=False)
+    w10 = (fx_f * one_minus_fy).astype(np.float32, copy=False)
+    w01 = (one_minus_fx * fy_f).astype(np.float32, copy=False)
+    w11 = (fx_f * fy_f).astype(np.float32, copy=False)
+    return x0, y0, x1, y1, w00, w10, w01, w11
+
+
+def rasterize_soft_bilinear(
+    *,
+    img: np.ndarray,
+    occupancy_mask: np.ndarray,
+    seed_values: np.ndarray,
+    cx: np.ndarray,
+    cy: np.ndarray,
+    fx: np.ndarray,
+    fy: np.ndarray,
+    chunk_size: int = 50_000,
+    background_value: Optional[float] = 1.0,
+) -> None:
+    """Bilinearly splat per-tile values into a raster image."""
+    img_arr = np.asarray(img)
+    if img_arr.ndim != 3:
+        raise ValueError("img must have shape (H, W, C).")
+    occ = np.asarray(occupancy_mask)
+    if occ.shape != img_arr.shape[:2]:
+        raise ValueError("occupancy_mask must match img spatial shape.")
+    vals = np.asarray(seed_values, dtype=np.float32)
+    if vals.ndim != 2 or vals.shape[0] != int(np.asarray(cx).size):
+        raise ValueError("seed_values must have shape (N, C) aligned to cx/cy.")
+
+    h_i, w_i = img_arr.shape[:2]
+    img_arr.fill(0.0)
+    weight_sum = np.zeros((h_i, w_i), dtype=np.float32)
+    work_chunk = int(max(1, chunk_size))
+
+    for start in range(0, vals.shape[0], work_chunk):
+        end = min(start + work_chunk, vals.shape[0])
+        x0, y0, x1, y1, w00, w10, w01, w11 = bilinear_support_from_centers(
+            np.asarray(cx[start:end]),
+            np.asarray(cy[start:end]),
+            np.asarray(fx[start:end]),
+            np.asarray(fy[start:end]),
+            w=w_i,
+            h=h_i,
+        )
+        chunk_vals = vals[start:end]
+        for px, py, pw in ((x0, y0, w00), (x1, y0, w10), (x0, y1, w01), (x1, y1, w11)):
+            np.add.at(img_arr, (py, px), chunk_vals * pw[:, None])
+            np.add.at(weight_sum, (py, px), pw)
+
+    touched = weight_sum > 0
+    occ[...] = touched
+    if np.any(touched):
+        img_arr[touched] /= weight_sum[touched, None]
+    if background_value is not None:
+        img_arr[~touched] = float(background_value)
+
+
+def sample_labels_soft_bilinear(
+    label_img: np.ndarray,
+    cx: np.ndarray,
+    cy: np.ndarray,
+    fx: np.ndarray,
+    fy: np.ndarray,
+    *,
+    chunk_size: int = 500_000,
+) -> np.ndarray:
+    """Read per-tile labels by bilinear voting over the 4-neighbor support."""
+    labels_img = np.asarray(label_img)
+    if labels_img.ndim != 2:
+        raise ValueError("label_img must be a 2D array.")
+    n = int(np.asarray(cx).size)
+    out = np.empty(n, dtype=np.int32)
+    h_i, w_i = labels_img.shape
+    work_chunk = int(max(1, chunk_size))
+
+    for start in range(0, n, work_chunk):
+        end = min(start + work_chunk, n)
+        x0, y0, x1, y1, w00, w10, w01, w11 = bilinear_support_from_centers(
+            np.asarray(cx[start:end]),
+            np.asarray(cy[start:end]),
+            np.asarray(fx[start:end]),
+            np.asarray(fy[start:end]),
+            w=w_i,
+            h=h_i,
+        )
+        candidates = np.stack(
+            [
+                labels_img[y0, x0],
+                labels_img[y0, x1],
+                labels_img[y1, x0],
+                labels_img[y1, x1],
+            ],
+            axis=1,
+        ).astype(np.int32, copy=False)
+        weights = np.stack([w00, w10, w01, w11], axis=1).astype(np.float32, copy=False)
+        scores = np.empty_like(weights)
+        for j in range(4):
+            scores[:, j] = np.sum(weights * (candidates == candidates[:, [j]]), axis=1)
+        best = np.argmax(scores, axis=1)
+        out[start:end] = candidates[np.arange(end - start), best]
+
+    return out
 
 
 def effective_extent(

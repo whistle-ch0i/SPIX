@@ -184,6 +184,12 @@ def cache_embedding_image(
     dim_other_segments: float = 0.3,
     dim_to_grey: bool = True,
     segment_key: Optional[str] = "Segment",
+    runtime_fill_from_boundary: bool = False,
+    runtime_fill_closing_radius: int = 1,
+    runtime_fill_holes: bool = True,
+    soft_rasterization: bool = False,
+    resolve_center_collisions: bool = False,
+    center_collision_radius: int = 2,
     **plot_kwargs,
 ) -> Dict[str, Any]:
     """Rasterize embeddings + spatial coords to an image and cache in ``adata.uns``.
@@ -191,6 +197,11 @@ def cache_embedding_image(
     The cached dict includes the image, geometry metadata, and a tile→obs
     mapping that allows later algorithms (e.g., SLIC) to sample labels
     for each tile efficiently without re-rasterizing.
+
+    Supports the same origin-preserving raster options used by
+    ``image_plot_slic`` and ``image_plot``:
+    runtime boundary fill, soft bilinear rasterization, and local center
+    collision resolution.
 
     Returns the cached dict and stores it under ``adata.uns[key]``.
     """
@@ -253,6 +264,12 @@ def cache_embedding_image(
             dim_other_segments=dim_other_segments,
             dim_to_grey=dim_to_grey,
             segment_key=segment_key,
+            runtime_fill_from_boundary=runtime_fill_from_boundary,
+            runtime_fill_closing_radius=runtime_fill_closing_radius,
+            runtime_fill_holes=runtime_fill_holes,
+            soft_rasterization=soft_rasterization,
+            resolve_center_collisions=resolve_center_collisions,
+            center_collision_radius=center_collision_radius,
             **plot_kwargs,
         )
         adata.uns[key] = cache
@@ -271,58 +288,91 @@ def cache_embedding_image(
     if store_barcodes not in {"auto", "always", "never"}:
         raise ValueError("store_barcodes must be one of {'auto','always','never'}.")
 
-    # Align tiles to obs index. Keep raster duplicates when origin=False.
-    tiles_df = adata.uns["tiles"]
-    inferred_info = adata.uns.get("tiles_inferred_grid_info", {})
-    inferred_mode = str(inferred_info.get("mode", "")).lower()
+    # For origin=True, prefer direct display coordinates from adata.obsm['spatial']
+    # to avoid reusing compacted coords-as-tiles geometry from adata.uns['tiles'].
+    use_direct_origin_spatial = False
+    spatial_direct = None
     if origin:
-        tiles = tiles_df[tiles_df.get("origin", 1) == 1]
+        try:
+            spatial_direct = np.asarray(adata.obsm["spatial"])
+        except Exception:
+            spatial_direct = None
+        if (
+            spatial_direct is not None
+            and spatial_direct.ndim == 2
+            and spatial_direct.shape[0] == adata.n_obs
+            and spatial_direct.shape[1] >= 2
+        ):
+            use_direct_origin_spatial = True
+
+    if use_direct_origin_spatial:
+        tile_obs_indices = np.arange(int(adata.n_obs), dtype=np.int64)
+        tile_barcodes = adata.obs.index.astype(str).to_numpy()
+        spatial_coords = np.asarray(spatial_direct[:, :2], dtype=float)
+        valid_mask = np.isfinite(spatial_coords).all(axis=1)
+        if not np.any(valid_mask):
+            raise ValueError("No finite coordinates found in adata.obsm['spatial'].")
+        if verbose:
+            missing = int((~valid_mask).sum())
+            if missing:
+                print(f"[cache_embedding_image] Dropping {missing} rows with non-finite direct spatial coordinates.")
+        tile_obs_indices = tile_obs_indices[valid_mask]
+        tile_barcodes = tile_barcodes[valid_mask]
+        spatial_coords = spatial_coords[valid_mask]
+        origin_flags = np.ones(int(spatial_coords.shape[0]), dtype=np.int8)
     else:
-        if inferred_mode == "boundary_voronoi" and ("origin" in tiles_df.columns):
-            tiles = tiles_df[tiles_df["origin"] == 0]
-            if verbose:
-                print("[cache_embedding_image] Using inferred boundary support-grid tiles only for origin=False caching.")
+        # Align tiles to obs index. Keep raster duplicates when origin=False.
+        tiles_df = adata.uns["tiles"]
+        inferred_info = adata.uns.get("tiles_inferred_grid_info", {})
+        inferred_mode = str(inferred_info.get("mode", "")).lower()
+        if origin:
+            tiles = tiles_df[tiles_df.get("origin", 1) == 1]
         else:
-            tiles = tiles_df
-    if "barcode" not in tiles.columns:
-        raise ValueError("adata.uns['tiles'] must contain a 'barcode' column.")
-    if "x" not in tiles.columns or "y" not in tiles.columns:
-        raise ValueError("adata.uns['tiles'] must contain 'x' and 'y' columns.")
+            if inferred_mode == "boundary_voronoi" and ("origin" in tiles_df.columns):
+                tiles = tiles_df[tiles_df["origin"] == 0]
+                if verbose:
+                    print("[cache_embedding_image] Using inferred boundary support-grid tiles only for origin=False caching.")
+            else:
+                tiles = tiles_df
+        if "barcode" not in tiles.columns:
+            raise ValueError("adata.uns['tiles'] must contain a 'barcode' column.")
+        if "x" not in tiles.columns or "y" not in tiles.columns:
+            raise ValueError("adata.uns['tiles'] must contain 'x' and 'y' columns.")
 
-    obs_index = pd.Index(adata.obs.index.astype(str))
-    tiles_idx = tiles.copy()
-    tiles_idx["barcode"] = tiles_idx["barcode"].astype(str)
-    if tiles_idx["barcode"].duplicated().any():
-        origin_vals = pd.to_numeric(tiles_idx.get("origin", 1), errors="coerce").fillna(1)
-        has_non_origin = (origin_vals != 1).any()
-        keep_dups = (not origin) and has_non_origin
-        if keep_dups:
-            if verbose:
-                print(
-                    "[cache_embedding_image] Duplicated barcodes detected (origin=False raster tiles); keeping duplicates."
-                )
-        else:
-            if verbose:
-                print(
-                    "[cache_embedding_image] Duplicated barcodes detected; keeping first occurrence for caching."
-                )
-            tiles_idx = tiles_idx.drop_duplicates("barcode", keep="first")
+        obs_index = pd.Index(adata.obs.index.astype(str))
+        tiles_idx = tiles.copy()
+        tiles_idx["barcode"] = tiles_idx["barcode"].astype(str)
+        if tiles_idx["barcode"].duplicated().any():
+            origin_vals = pd.to_numeric(tiles_idx.get("origin", 1), errors="coerce").fillna(1)
+            has_non_origin = (origin_vals != 1).any()
+            keep_dups = (not origin) and has_non_origin
+            if keep_dups:
+                if verbose:
+                    print(
+                        "[cache_embedding_image] Duplicated barcodes detected (origin=False raster tiles); keeping duplicates."
+                    )
+            else:
+                if verbose:
+                    print(
+                        "[cache_embedding_image] Duplicated barcodes detected; keeping first occurrence for caching."
+                    )
+                tiles_idx = tiles_idx.drop_duplicates("barcode", keep="first")
 
-    tile_barcodes = tiles_idx["barcode"].to_numpy()
-    tile_obs_indices = obs_index.get_indexer(tile_barcodes)
-    xy = tiles_idx[["x", "y"]]
-    valid_mask = (tile_obs_indices >= 0) & (~xy.isna().any(axis=1)).to_numpy()
-    if not np.any(valid_mask):
-        raise ValueError("No coordinates found after aligning tiles to adata.obs.")
-    if verbose:
-        missing = int((~valid_mask).sum())
-        if missing:
-            print(f"[cache_embedding_image] Dropping {missing} tiles with missing coordinates or unmatched barcodes.")
+        tile_barcodes = tiles_idx["barcode"].to_numpy()
+        tile_obs_indices = obs_index.get_indexer(tile_barcodes)
+        xy = tiles_idx[["x", "y"]]
+        valid_mask = (tile_obs_indices >= 0) & (~xy.isna().any(axis=1)).to_numpy()
+        if not np.any(valid_mask):
+            raise ValueError("No coordinates found after aligning tiles to adata.obs.")
+        if verbose:
+            missing = int((~valid_mask).sum())
+            if missing:
+                print(f"[cache_embedding_image] Dropping {missing} tiles with missing coordinates or unmatched barcodes.")
 
-    tile_obs_indices = tile_obs_indices[valid_mask].astype(np.int64, copy=False)
-    tile_barcodes = tile_barcodes[valid_mask]
-    spatial_coords = xy.to_numpy(dtype=float)[valid_mask]
-    origin_flags = pd.to_numeric(tiles_idx.get("origin", 1), errors="coerce").fillna(1).to_numpy()[valid_mask]
+        tile_obs_indices = tile_obs_indices[valid_mask].astype(np.int64, copy=False)
+        tile_barcodes = tile_barcodes[valid_mask]
+        spatial_coords = xy.to_numpy(dtype=float)[valid_mask]
+        origin_flags = pd.to_numeric(tiles_idx.get("origin", 1), errors="coerce").fillna(1).to_numpy()[valid_mask]
 
     coord_mode = str(coordinate_mode or "spatial").lower()
     if coord_mode not in {"spatial", "array", "visium", "visiumhd", "auto"}:
@@ -485,9 +535,52 @@ def cache_embedding_image(
             _MEMMAP_CLEANUP_PATHS.add(img_path)
     else:
         img = np.ones((h, w, dims), dtype=np.float32)
+    paint_mask = np.zeros((h, w), dtype=bool)
 
     # Precompute pixel offsets for square/circle tiles (relative to center)
     dx, dy = _raster.tile_pixel_offsets(int(s), pixel_shape=pixel_shape)
+    soft_enabled = bool(soft_rasterization)
+    if soft_enabled and (not bool(pixel_perfect) or int(s) != 1 or str(pixel_shape).lower() != "square"):
+        if verbose:
+            print(
+                "[cache_embedding_image] soft_rasterization requires pixel_perfect=True, tile_px==1, pixel_shape='square'; falling back to hard rasterization."
+            )
+        soft_enabled = False
+    if soft_enabled:
+        cx_seed, cy_seed, soft_fx_seed, soft_fy_seed = _raster.scale_points_to_canvas_soft(
+            spatial_coords,
+            x_min_eff=float(x_min_eff),
+            y_min_eff=float(y_min_eff),
+            scale=float(scale),
+            pixel_perfect=True,
+            w=int(w),
+            h=int(h),
+        )
+    else:
+        soft_fx_seed = None
+        soft_fy_seed = None
+        cx_seed, cy_seed = _raster.scale_points_to_canvas(
+            spatial_coords,
+            x_min_eff=float(x_min_eff),
+            y_min_eff=float(y_min_eff),
+            scale=float(scale),
+            pixel_perfect=bool(pixel_perfect),
+            w=int(w),
+            h=int(h),
+        )
+    collision_info = None
+    if resolve_center_collisions and not soft_enabled:
+        cx_seed, cy_seed, collision_info = _raster.resolve_center_collisions(
+            cx_seed,
+            cy_seed,
+            w=int(w),
+            h=int(h),
+            max_radius=int(center_collision_radius),
+            logger=None,
+            context="cache_embedding_image",
+        )
+    elif resolve_center_collisions and soft_enabled and verbose:
+        print("[cache_embedding_image] Ignoring resolve_center_collisions because soft_rasterization=True.")
 
     # Optional depth ordering similar to image_plot (alpha-driven)
     def _compute_alpha_from_values(values, arange=(0.1, 1.0), clip=None, invert=False):
@@ -530,34 +623,54 @@ def cache_embedding_image(
     # Keep intermediate index arrays bounded.
     target_pixels = int(os.environ.get("SPIX_CACHE_RASTER_TARGET_PIXELS", "25000000"))
     chunk_n = int(max(1, min(int(chunk_size), int(max(1, target_pixels // max(1, pixels_per_tile))))))
-    if pixels_per_tile == 1 and pixel_shape != "circle":
+    if soft_enabled:
+        _raster.rasterize_soft_bilinear(
+            img=img,
+            occupancy_mask=paint_mask,
+            seed_values=cols,
+            cx=cx_seed,
+            cy=cy_seed,
+            fx=soft_fx_seed,
+            fy=soft_fy_seed,
+            chunk_size=int(chunk_n),
+        )
+    elif pixels_per_tile == 1 and pixel_shape != "circle":
         # Fast path for s==1 square tiles: assign one pixel per tile (center pixel).
         for i in range(0, num_tiles, chunk_n):
             idx = order_idx[i : min(i + chunk_n, num_tiles)]
-            cx0, cy0 = _raster.scale_points_to_canvas(
-                spatial_coords[idx],
-                x_min_eff=float(x_min_eff),
-                y_min_eff=float(y_min_eff),
-                scale=float(scale),
-                pixel_perfect=bool(pixel_perfect),
-                w=int(w),
-                h=int(h),
-            )
+            cx0 = cx_seed[idx]
+            cy0 = cy_seed[idx]
             img[cy0, cx0] = cols[idx]
+            paint_mask[cy0, cx0] = True
     else:
         for i in range(0, num_tiles, chunk_n):
             idx = order_idx[i : min(i + chunk_n, num_tiles)]
-            cx0, cy0 = _raster.scale_points_to_canvas(
-                spatial_coords[idx],
-                x_min_eff=float(x_min_eff),
-                y_min_eff=float(y_min_eff),
-                scale=float(scale),
-                pixel_perfect=bool(pixel_perfect),
-            )
+            cx0 = cx_seed[idx]
+            cy0 = cy_seed[idx]
             all_x = np.clip((cx0[:, None] + dx[None, :]).ravel(), 0, w - 1)
             all_y = np.clip((cy0[:, None] + dy[None, :]).ravel(), 0, h - 1)
             tile_idx_map = np.repeat(idx, pixels_per_tile)
             img[all_y, all_x] = cols[tile_idx_map]
+            paint_mask[all_y, all_x] = True
+    runtime_fill_info = {
+        "applied": False,
+        "filled_pixels": 0,
+        "support_pixels": int(paint_mask.sum()),
+        "closing_radius": int(max(0, int(runtime_fill_closing_radius))),
+        "fill_holes": bool(runtime_fill_holes),
+    }
+    if runtime_fill_from_boundary:
+        runtime_fill_info = _raster.fill_raster_from_boundary(
+            img=img,
+            occupancy_mask=paint_mask,
+            seed_x=cx_seed,
+            seed_y=cy_seed,
+            seed_values=cols,
+            closing_radius=int(runtime_fill_closing_radius),
+            fill_holes=bool(runtime_fill_holes),
+            logger=None,
+            context="cache_embedding_image",
+        )
 
     # Optional: build label image for boundary overlay (preview only)
     label_img = None
@@ -565,25 +678,54 @@ def cache_embedding_image(
         # Map per-tile Segment labels
         seg_codes = pd.Categorical(segment_series.to_numpy()[tile_obs_indices]).codes
         label_img = np.full((h, w), -1, dtype=int)
-        for i in range(0, num_tiles, max(1, chunk_size)):
-            idx = order_idx[i : min(i + chunk_size, num_tiles)]
-            cx0, cy0 = _raster.scale_points_to_canvas(
-                spatial_coords[idx],
-                x_min_eff=float(x_min_eff),
-                y_min_eff=float(y_min_eff),
-                scale=float(scale),
-                pixel_perfect=bool(pixel_perfect),
+        if soft_enabled:
+            value_buf = np.full((h, w), -np.inf, dtype=np.float32)
+            chunk_n = int(max(1, chunk_size))
+            for i in range(0, num_tiles, chunk_n):
+                idx = order_idx[i : min(i + chunk_n, num_tiles)]
+                x0, y0, x1, y1, w00, w10, w01, w11 = _raster.bilinear_support_from_centers(
+                    cx_seed[idx],
+                    cy_seed[idx],
+                    soft_fx_seed[idx],
+                    soft_fy_seed[idx],
+                    w=int(w),
+                    h=int(h),
+                )
+                seg_chunk = seg_codes[idx]
+                for px, py, pw in ((x0, y0, w00), (x1, y0, w10), (x0, y1, w01), (x1, y1, w11)):
+                    mask_upd = pw > value_buf[py, px]
+                    if np.any(mask_upd):
+                        label_img[py[mask_upd], px[mask_upd]] = seg_chunk[mask_upd]
+                        value_buf[py[mask_upd], px[mask_upd]] = pw[mask_upd]
+        else:
+            for i in range(0, num_tiles, max(1, chunk_size)):
+                idx = order_idx[i : min(i + chunk_size, num_tiles)]
+                cx0 = cx_seed[idx]
+                cy0 = cy_seed[idx]
+                if pixel_shape == "circle":
+                    # Paint circle
+                    for j, t in enumerate(idx):
+                        lx = np.clip(cx0[j] + dx, 0, w - 1)
+                        ly = np.clip(cy0[j] + dy, 0, h - 1)
+                        label_img[ly, lx] = seg_codes[t]
+                else:
+                    all_x = np.clip((cx0[:, None] + dx[None, :]).ravel(), 0, w - 1)
+                    all_y = np.clip((cy0[:, None] + dy[None, :]).ravel(), 0, h - 1)
+                    label_img[all_y, all_x] = np.repeat(seg_codes[idx], len(dx))
+        if runtime_fill_from_boundary:
+            label_img_fill = label_img.astype(np.float32, copy=True)[..., None]
+            _raster.fill_raster_from_boundary(
+                img=label_img_fill,
+                occupancy_mask=paint_mask.copy(),
+                seed_x=cx_seed,
+                seed_y=cy_seed,
+                seed_values=seg_codes.astype(np.float32, copy=False)[:, None],
+                closing_radius=int(runtime_fill_closing_radius),
+                fill_holes=bool(runtime_fill_holes),
+                logger=None,
+                context="cache_embedding_image(label_img)",
             )
-            if pixel_shape == "circle":
-                # Paint circle
-                for j, t in enumerate(idx):
-                    lx = np.clip(cx0[j] + dx, 0, w - 1)
-                    ly = np.clip(cy0[j] + dy, 0, h - 1)
-                    label_img[ly, lx] = seg_codes[t]
-            else:
-                all_x = np.clip((cx0[:, None] + dx[None, :]).ravel(), 0, w - 1)
-                all_y = np.clip((cy0[:, None] + dy[None, :]).ravel(), 0, h - 1)
-                label_img[all_y, all_x] = np.repeat(seg_codes[idx], len(dx))
+            label_img = np.rint(label_img_fill[..., 0]).astype(int, copy=False)
 
     if downsample_factor and downsample_factor > 1.0:
         # Simple average pooling downsample to avoid extra deps
@@ -610,15 +752,33 @@ def cache_embedding_image(
         label_img = label_img.reshape(new_h, factor, new_w, factor).max(axis=(1, 3))
 
     # Compute sampling centers per tile (pixel indices)
-    cx, cy = _raster.scale_points_to_canvas(
-        spatial_coords,
-        x_min_eff=float(x_min_eff),
-        y_min_eff=float(y_min_eff),
-        scale=float(scale),
-        pixel_perfect=bool(pixel_perfect),
-        w=int(w),
-        h=int(h),
-    )
+    if downsample_factor and downsample_factor > 1.0 and soft_enabled:
+        cx, cy, soft_fx, soft_fy = _raster.scale_points_to_canvas_soft(
+            spatial_coords,
+            x_min_eff=float(x_min_eff),
+            y_min_eff=float(y_min_eff),
+            scale=float(scale),
+            pixel_perfect=True,
+            w=int(w),
+            h=int(h),
+        )
+    elif downsample_factor and downsample_factor > 1.0 and resolve_center_collisions:
+        factor = int(max(1, round(float(downsample_factor))))
+        cx = np.clip((cx_seed // factor).astype(np.int32, copy=False), 0, max(0, w - 1))
+        cy = np.clip((cy_seed // factor).astype(np.int32, copy=False), 0, max(0, h - 1))
+    elif downsample_factor and downsample_factor > 1.0:
+        cx, cy = _raster.scale_points_to_canvas(
+            spatial_coords,
+            x_min_eff=float(x_min_eff),
+            y_min_eff=float(y_min_eff),
+            scale=float(scale),
+            pixel_perfect=bool(pixel_perfect),
+            w=int(w),
+            h=int(h),
+        )
+    else:
+        cx, cy = cx_seed, cy_seed
+        soft_fx, soft_fy = soft_fx_seed, soft_fy_seed
 
     cache = {
         "img": img,
@@ -650,6 +810,10 @@ def cache_embedding_image(
         # per-tile mapping/meta
         "cx": cx.astype(np.int32),
         "cy": cy.astype(np.int32),
+        "soft_rasterization": bool(soft_enabled),
+        "soft_rasterization_mode": "bilinear" if soft_enabled else None,
+        "soft_fx": (soft_fx.astype(np.float16) if soft_enabled else None),
+        "soft_fy": (soft_fy.astype(np.float16) if soft_enabled else None),
         "tile_obs_indices": tile_obs_indices.astype(np.int64),
         # Store barcodes only when explicitly requested or when the dataset is small.
         # For huge VisiumHD datasets, storing a Python list of millions of strings
@@ -675,6 +839,27 @@ def cache_embedding_image(
         # provenance
         "created_by": "cache_embedding_image",
         "history": [],
+        "center_collision_resolution": (
+            dict(collision_info)
+            if collision_info is not None
+            else {
+                "applied": False,
+                "enabled": False,
+                "search_radius": int(center_collision_radius),
+                "ignored_due_to_soft_rasterization": bool(soft_enabled and resolve_center_collisions),
+                "n_tiles": int(num_tiles),
+                "n_unique_centers_before": None,
+                "n_unique_centers_after": None,
+                "collision_fraction_before": None,
+                "collision_fraction_after": None,
+                "n_collided_tiles_before": None,
+                "n_collided_tiles_after": None,
+                "n_reassigned_tiles": 0,
+                "max_stack_before": None,
+                "max_stack_after": None,
+                "unresolved_tiles": 0,
+            }
+        ),
         # image_plot compatibility: store provided params for traceability
         "image_plot_params": {
             "color_by": color_by,
@@ -707,8 +892,15 @@ def cache_embedding_image(
             "dim_to_grey": bool(dim_to_grey),
             "segment_key": seg_col,
             "segment_key_requested": segment_key,
+            "runtime_fill_from_boundary": bool(runtime_fill_from_boundary),
+            "runtime_fill_closing_radius": int(max(0, int(runtime_fill_closing_radius))),
+            "runtime_fill_holes": bool(runtime_fill_holes),
+            "soft_rasterization": bool(soft_enabled),
+            "resolve_center_collisions": bool(resolve_center_collisions),
+            "center_collision_radius": int(center_collision_radius),
             **plot_kwargs,
         },
+        "runtime_fill": runtime_fill_info,
     }
 
     # Optional: build preview RGB with boundary overlay
@@ -818,6 +1010,12 @@ def _cache_embedding_image_legacy(
     dim_other_segments: float,
     dim_to_grey: bool,
     segment_key: Optional[str],
+    runtime_fill_from_boundary: bool,
+    runtime_fill_closing_radius: int,
+    runtime_fill_holes: bool,
+    soft_rasterization: bool,
+    resolve_center_collisions: bool,
+    center_collision_radius: int,
     **plot_kwargs,
 ) -> Dict[str, Any]:
     """Legacy cache implementation (baseline for benchmarking)."""
@@ -1001,6 +1199,48 @@ def _cache_embedding_image_legacy(
 
     # Precompute pixel offsets for square/circle tiles (relative to center)
     dx, dy = _raster.tile_pixel_offsets(int(s), pixel_shape=pixel_shape)
+    soft_enabled = bool(soft_rasterization)
+    if soft_enabled and (not bool(pixel_perfect) or int(s) != 1 or str(pixel_shape).lower() != "square"):
+        if verbose:
+            print(
+                "[cache_embedding_image] soft_rasterization requires pixel_perfect=True, tile_px==1, pixel_shape='square'; falling back to hard rasterization (legacy)."
+            )
+        soft_enabled = False
+    if soft_enabled:
+        cx_seed, cy_seed, soft_fx_seed, soft_fy_seed = _raster.scale_points_to_canvas_soft(
+            spatial_coords,
+            x_min_eff=float(x_min_eff),
+            y_min_eff=float(y_min_eff),
+            scale=float(scale),
+            pixel_perfect=True,
+            w=int(w),
+            h=int(h),
+        )
+    else:
+        soft_fx_seed = None
+        soft_fy_seed = None
+        cx_seed, cy_seed = _raster.scale_points_to_canvas(
+            spatial_coords,
+            x_min_eff=float(x_min_eff),
+            y_min_eff=float(y_min_eff),
+            scale=float(scale),
+            pixel_perfect=bool(pixel_perfect),
+            w=int(w),
+            h=int(h),
+        )
+    collision_info = None
+    if resolve_center_collisions and not soft_enabled:
+        cx_seed, cy_seed, collision_info = _raster.resolve_center_collisions(
+            cx_seed,
+            cy_seed,
+            w=int(w),
+            h=int(h),
+            max_radius=int(center_collision_radius),
+            logger=None,
+            context="cache_embedding_image(legacy)",
+        )
+    elif resolve_center_collisions and soft_enabled and verbose:
+        print("[cache_embedding_image] Ignoring resolve_center_collisions because soft_rasterization=True (legacy).")
 
     def _compute_alpha_from_values(values, arange=(0.1, 1.0), clip=None, invert=False):
         v = np.asarray(values, dtype=float)
@@ -1037,42 +1277,99 @@ def _cache_embedding_image_legacy(
             order_idx = np.argsort(alpha_arr)
 
     num_tiles = spatial_coords.shape[0]
-    for i in range(0, num_tiles, max(1, chunk_size)):
-        idx = order_idx[i : min(i + chunk_size, num_tiles)]
-        cx0, cy0 = _raster.scale_points_to_canvas(
-            spatial_coords[idx],
-            x_min_eff=float(x_min_eff),
-            y_min_eff=float(y_min_eff),
-            scale=float(scale),
-            pixel_perfect=bool(pixel_perfect),
+    paint_mask = np.zeros((h, w), dtype=bool)
+    if soft_enabled:
+        _raster.rasterize_soft_bilinear(
+            img=img,
+            occupancy_mask=paint_mask,
+            seed_values=cols,
+            cx=cx_seed,
+            cy=cy_seed,
+            fx=soft_fx_seed,
+            fy=soft_fy_seed,
+            chunk_size=max(1, chunk_size),
         )
-        all_x = np.clip((cx0[:, None] + dx[None, :]).ravel(), 0, w - 1)
-        all_y = np.clip((cy0[:, None] + dy[None, :]).ravel(), 0, h - 1)
-        tile_idx_map = np.repeat(idx, len(dx))
-        img[all_y, all_x] = cols[tile_idx_map]
+    else:
+        for i in range(0, num_tiles, max(1, chunk_size)):
+            idx = order_idx[i : min(i + chunk_size, num_tiles)]
+            cx0 = cx_seed[idx]
+            cy0 = cy_seed[idx]
+            all_x = np.clip((cx0[:, None] + dx[None, :]).ravel(), 0, w - 1)
+            all_y = np.clip((cy0[:, None] + dy[None, :]).ravel(), 0, h - 1)
+            tile_idx_map = np.repeat(idx, len(dx))
+            img[all_y, all_x] = cols[tile_idx_map]
+            paint_mask[all_y, all_x] = True
+
+    runtime_fill_info = {
+        "applied": False,
+        "filled_pixels": 0,
+        "support_pixels": int(paint_mask.sum()),
+        "closing_radius": int(max(0, int(runtime_fill_closing_radius))),
+        "fill_holes": bool(runtime_fill_holes),
+    }
+    if runtime_fill_from_boundary:
+        runtime_fill_info = _raster.fill_raster_from_boundary(
+            img=img,
+            occupancy_mask=paint_mask,
+            seed_x=cx_seed,
+            seed_y=cy_seed,
+            seed_values=cols,
+            closing_radius=int(runtime_fill_closing_radius),
+            fill_holes=bool(runtime_fill_holes),
+            logger=None,
+            context="cache_embedding_image(legacy)",
+        )
 
     label_img = None
     if plot_boundaries and segment_available and segment_series is not None:
         seg_codes = pd.Categorical(coordinates_df["barcode"].map(segment_series)).codes
         label_img = np.full((h, w), -1, dtype=int)
-        for i in range(0, num_tiles, max(1, chunk_size)):
-            idx = order_idx[i : min(i + chunk_size, num_tiles)]
-            cx0, cy0 = _raster.scale_points_to_canvas(
-                spatial_coords[idx],
-                x_min_eff=float(x_min_eff),
-                y_min_eff=float(y_min_eff),
-                scale=float(scale),
-                pixel_perfect=bool(pixel_perfect),
+        if soft_enabled:
+            value_buf = np.full((h, w), -np.inf, dtype=np.float32)
+            for i in range(0, num_tiles, max(1, chunk_size)):
+                idx = order_idx[i : min(i + chunk_size, num_tiles)]
+                x0, y0, x1, y1, w00, w10, w01, w11 = _raster.bilinear_support_from_centers(
+                    cx_seed[idx],
+                    cy_seed[idx],
+                    soft_fx_seed[idx],
+                    soft_fy_seed[idx],
+                    w=int(w),
+                    h=int(h),
+                )
+                seg_chunk = seg_codes[idx]
+                for px, py, pw in ((x0, y0, w00), (x1, y0, w10), (x0, y1, w01), (x1, y1, w11)):
+                    mask_upd = pw > value_buf[py, px]
+                    if np.any(mask_upd):
+                        label_img[py[mask_upd], px[mask_upd]] = seg_chunk[mask_upd]
+                        value_buf[py[mask_upd], px[mask_upd]] = pw[mask_upd]
+        else:
+            for i in range(0, num_tiles, max(1, chunk_size)):
+                idx = order_idx[i : min(i + chunk_size, num_tiles)]
+                cx0 = cx_seed[idx]
+                cy0 = cy_seed[idx]
+                if pixel_shape == "circle":
+                    for j, t in enumerate(idx):
+                        lx = np.clip(cx0[j] + dx, 0, w - 1)
+                        ly = np.clip(cy0[j] + dy, 0, h - 1)
+                        label_img[ly, lx] = seg_codes[t]
+                else:
+                    all_x = np.clip((cx0[:, None] + dx[None, :]).ravel(), 0, w - 1)
+                    all_y = np.clip((cy0[:, None] + dy[None, :]).ravel(), 0, h - 1)
+                    label_img[all_y, all_x] = np.repeat(seg_codes[idx], len(dx))
+        if runtime_fill_from_boundary:
+            label_img_fill = label_img.astype(np.float32, copy=True)[..., None]
+            _raster.fill_raster_from_boundary(
+                img=label_img_fill,
+                occupancy_mask=paint_mask.copy(),
+                seed_x=cx_seed,
+                seed_y=cy_seed,
+                seed_values=seg_codes.astype(np.float32, copy=False)[:, None],
+                closing_radius=int(runtime_fill_closing_radius),
+                fill_holes=bool(runtime_fill_holes),
+                logger=None,
+                context="cache_embedding_image(label_img, legacy)",
             )
-            if pixel_shape == "circle":
-                for j, t in enumerate(idx):
-                    lx = np.clip(cx0[j] + dx, 0, w - 1)
-                    ly = np.clip(cy0[j] + dy, 0, h - 1)
-                    label_img[ly, lx] = seg_codes[t]
-            else:
-                all_x = np.clip((cx0[:, None] + dx[None, :]).ravel(), 0, w - 1)
-                all_y = np.clip((cy0[:, None] + dy[None, :]).ravel(), 0, h - 1)
-                label_img[all_y, all_x] = np.repeat(seg_codes[idx], len(dx))
+            label_img = np.rint(label_img_fill[..., 0]).astype(int, copy=False)
 
     if downsample_factor and downsample_factor > 1.0:
         factor = int(downsample_factor)
@@ -1095,15 +1392,33 @@ def _cache_embedding_image_legacy(
         label_img = label_img[: new_h * factor, : new_w * factor]
         label_img = label_img.reshape(new_h, factor, new_w, factor).max(axis=(1, 3))
 
-    cx, cy = _raster.scale_points_to_canvas(
-        spatial_coords,
-        x_min_eff=float(x_min_eff),
-        y_min_eff=float(y_min_eff),
-        scale=float(scale),
-        pixel_perfect=bool(pixel_perfect),
-        w=int(w),
-        h=int(h),
-    )
+    if downsample_factor and downsample_factor > 1.0 and soft_enabled:
+        cx, cy, soft_fx, soft_fy = _raster.scale_points_to_canvas_soft(
+            spatial_coords,
+            x_min_eff=float(x_min_eff),
+            y_min_eff=float(y_min_eff),
+            scale=float(scale),
+            pixel_perfect=True,
+            w=int(w),
+            h=int(h),
+        )
+    elif downsample_factor and downsample_factor > 1.0 and resolve_center_collisions:
+        factor = int(max(1, round(float(downsample_factor))))
+        cx = np.clip((cx_seed // factor).astype(np.int32, copy=False), 0, max(0, w - 1))
+        cy = np.clip((cy_seed // factor).astype(np.int32, copy=False), 0, max(0, h - 1))
+    elif downsample_factor and downsample_factor > 1.0:
+        cx, cy = _raster.scale_points_to_canvas(
+            spatial_coords,
+            x_min_eff=float(x_min_eff),
+            y_min_eff=float(y_min_eff),
+            scale=float(scale),
+            pixel_perfect=bool(pixel_perfect),
+            w=int(w),
+            h=int(h),
+        )
+    else:
+        cx, cy = cx_seed, cy_seed
+        soft_fx, soft_fy = soft_fx_seed, soft_fy_seed
 
     cache = {
         "img": img,
@@ -1134,6 +1449,10 @@ def _cache_embedding_image_legacy(
         "effective_dpi": float(dpi_effective),
         "cx": cx.astype(np.int32),
         "cy": cy.astype(np.int32),
+        "soft_rasterization": bool(soft_enabled),
+        "soft_rasterization_mode": "bilinear" if soft_enabled else None,
+        "soft_fx": (soft_fx.astype(np.float16) if soft_enabled else None),
+        "soft_fy": (soft_fy.astype(np.float16) if soft_enabled else None),
         "tile_obs_indices": tile_obs_indices.astype(np.int64),
         "barcodes": coordinates_df["barcode"].astype(str).to_list(),
         "origin_flags": coordinates_df.get("origin", pd.Series(index=coordinates_df.index, data=1))
@@ -1146,6 +1465,27 @@ def _cache_embedding_image_legacy(
         "img_path": None,
         "created_by": "cache_embedding_image_legacy",
         "history": [],
+        "center_collision_resolution": (
+            dict(collision_info)
+            if collision_info is not None
+            else {
+                "applied": False,
+                "enabled": False,
+                "search_radius": int(center_collision_radius),
+                "ignored_due_to_soft_rasterization": bool(soft_enabled and resolve_center_collisions),
+                "n_tiles": int(num_tiles),
+                "n_unique_centers_before": None,
+                "n_unique_centers_after": None,
+                "collision_fraction_before": None,
+                "collision_fraction_after": None,
+                "n_collided_tiles_before": None,
+                "n_collided_tiles_after": None,
+                "n_reassigned_tiles": 0,
+                "max_stack_before": None,
+                "max_stack_after": None,
+                "unresolved_tiles": 0,
+            }
+        ),
         "image_plot_params": {
             "color_by": color_by,
             "palette": palette,
@@ -1180,9 +1520,52 @@ def _cache_embedding_image_legacy(
             "dim_to_grey": bool(dim_to_grey),
             "segment_key": seg_col,
             "segment_key_requested": segment_key,
+            "runtime_fill_from_boundary": bool(runtime_fill_from_boundary),
+            "runtime_fill_closing_radius": int(max(0, int(runtime_fill_closing_radius))),
+            "runtime_fill_holes": bool(runtime_fill_holes),
+            "soft_rasterization": bool(soft_enabled),
+            "resolve_center_collisions": bool(resolve_center_collisions),
+            "center_collision_radius": int(center_collision_radius),
             **plot_kwargs,
         },
+        "runtime_fill": runtime_fill_info,
     }
+
+    if plot_boundaries and label_img is not None and boundary_method == "pixel":
+        if img.shape[2] >= 3:
+            base = img[:, :, :3].copy()
+        elif img.shape[2] == 2:
+            base = np.stack([img[:, :, 0], img[:, :, 1], np.zeros_like(img[:, :, 0])], axis=2)
+        else:
+            base = np.repeat(img, 3, axis=2)
+        bmask = find_boundaries(label_img, mode="outer", background=-1, connectivity=2)
+        if pixel_smoothing_sigma and pixel_smoothing_sigma > 0:
+            sm = gaussian_filter(bmask.astype(np.float32), pixel_smoothing_sigma)
+            bmask = sm >= 0.5
+        lw = max(1, int(round(boundary_linewidth)))
+        if lw > 1:
+            bmask = binary_dilation(bmask, iterations=lw - 1)
+        base_col = np.array(mcolors.to_rgb(boundary_color), dtype=np.float32)
+        if highlight_segments is not None and segment_available and segment_series is not None:
+            cats = pd.Categorical(segment_series).categories
+            codes = [cats.get_loc(seg) for seg in highlight_segments if seg in cats]
+            if codes:
+                hmask = np.isin(label_img, np.array(codes, dtype=int)) & bmask
+            else:
+                hmask = np.zeros_like(bmask)
+        else:
+            hmask = np.zeros_like(bmask)
+        if highlight_boundary_color is not None:
+            high_col = np.array(mcolors.to_rgb(highlight_boundary_color), dtype=np.float32)
+        else:
+            high_col = base_col
+        out = base.copy()
+        a = float(boundary_alpha)
+        for c in range(3):
+            out[..., c] = np.where(bmask & ~hmask, a * base_col[c] + (1 - a) * out[..., c], out[..., c])
+            out[..., c] = np.where(hmask, a * high_col[c] + (1 - a) * out[..., c], out[..., c])
+        cache["img_preview"] = np.clip(out, 0.0, 1.0).astype(np.float32)
+        cache["label_img"] = label_img.astype(np.int32)
 
     if show:
         try:
@@ -1210,8 +1593,9 @@ def rebuild_cached_image_from_obsm(
 ):
     """Rebuild a cached image from an embedding in ``adata.obsm``.
 
-    Uses cached geometry (extent, scale, tile size, centers) to keep pixel
-    alignment identical. This is used after smoothing/equalization of embeddings.
+    Uses cached geometry (extent, scale, tile size, centers, and optional soft
+    rasterization/fill settings) to keep pixel alignment identical. This is used
+    after smoothing/equalization of embeddings.
     """
     if key not in adata.uns:
         raise KeyError(f"No cached image found at adata.uns['{key}']")
@@ -1230,6 +1614,9 @@ def rebuild_cached_image_from_obsm(
     pixel_shape = str(cache.get("pixel_shape", "square"))
     cx = np.asarray(cache.get("cx"), dtype=int)
     cy = np.asarray(cache.get("cy"), dtype=int)
+    soft_enabled = bool(cache.get("soft_rasterization", False))
+    soft_fx = cache.get("soft_fx", None)
+    soft_fy = cache.get("soft_fy", None)
     tile_obs_indices = cache.get("tile_obs_indices", None)
     barcodes = list(cache.get("barcodes", []) or [])
     if tile_obs_indices is None and not barcodes:
@@ -1267,7 +1654,16 @@ def rebuild_cached_image_from_obsm(
         emb = _apply_brighten_continuous_rgb(emb, plot_params.get("continuous_gamma", 0.8))
         brighten_applied = True
 
+    if soft_enabled:
+        if soft_fx is None or soft_fy is None:
+            raise ValueError("Soft cache missing soft_fx/soft_fy metadata.")
+        soft_fx = np.asarray(soft_fx, dtype=np.float32)
+        soft_fy = np.asarray(soft_fy, dtype=np.float32)
+        if soft_fx.size != cx.size or soft_fy.size != cy.size:
+            raise ValueError("Cached soft raster metadata length mismatch with centers.")
+
     img = np.ones((h, w, emb.shape[1]), dtype=np.float32)
+    paint_mask = np.zeros((h, w), dtype=bool)
 
     # reconstruct top-left from centers and tile size
     xi = np.clip(cx - s // 2, 0, w - 1)
@@ -1284,8 +1680,22 @@ def rebuild_cached_image_from_obsm(
 
     n = int(cx.size)
     pixels_per_tile = int(len(dx))
-    if pixels_per_tile == 1 and pixel_shape != "circle":
-        img[np.clip(cy, 0, h - 1), np.clip(cx, 0, w - 1)] = emb
+    if soft_enabled:
+        _raster.rasterize_soft_bilinear(
+            img=img,
+            occupancy_mask=paint_mask,
+            seed_values=emb,
+            cx=np.asarray(cx, dtype=np.int32),
+            cy=np.asarray(cy, dtype=np.int32),
+            fx=soft_fx,
+            fy=soft_fy,
+            chunk_size=max(1, int(os.environ.get("SPIX_CACHE_REBUILD_CHUNK", "50000"))),
+        )
+    elif pixels_per_tile == 1 and pixel_shape != "circle":
+        yy = np.clip(cy, 0, h - 1)
+        xx = np.clip(cx, 0, w - 1)
+        img[yy, xx] = emb
+        paint_mask[yy, xx] = True
     else:
         chunk_n = int(os.environ.get("SPIX_CACHE_REBUILD_CHUNK", "50000"))
         for start in range(0, n, max(1, chunk_n)):
@@ -1294,6 +1704,21 @@ def rebuild_cached_image_from_obsm(
             all_y = np.clip((yi[start:end, None] + dy).ravel(), 0, h - 1)
             tile_idx_map = np.repeat(np.arange(start, end), pixels_per_tile)
             img[all_y, all_x] = emb[tile_idx_map]
+            paint_mask[all_y, all_x] = True
+
+    runtime_fill_cfg = dict(cache.get("runtime_fill", {}) or {})
+    if bool(runtime_fill_cfg.get("applied", False)) or bool(plot_params.get("runtime_fill_from_boundary", False)):
+        _raster.fill_raster_from_boundary(
+            img=img,
+            occupancy_mask=paint_mask,
+            seed_x=np.asarray(cx, dtype=np.int32),
+            seed_y=np.asarray(cy, dtype=np.int32),
+            seed_values=emb,
+            closing_radius=int(plot_params.get("runtime_fill_closing_radius", runtime_fill_cfg.get("closing_radius", 1))),
+            fill_holes=bool(plot_params.get("runtime_fill_holes", runtime_fill_cfg.get("fill_holes", True))),
+            logger=None,
+            context="rebuild_cached_image_from_obsm",
+        )
 
     out_cache = cache if in_place else dict(cache)
     out_cache["img"] = img
@@ -1308,6 +1733,7 @@ def rebuild_cached_image_from_obsm(
     out_plot_params = dict(out_cache.get("image_plot_params", {}) or {})
     out_plot_params["brighten_applied"] = bool(brighten_applied)
     out_cache["image_plot_params"] = out_plot_params
+    out_cache.pop("img_preview", None)
 
     if not in_place and out_key:
         adata.uns[out_key] = out_cache

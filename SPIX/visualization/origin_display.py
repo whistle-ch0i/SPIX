@@ -18,7 +18,9 @@ from .plotting import (
     _compute_alpha_from_values,
     _float_array_fast,
     _plot_boundaries_from_label_image,
+    _rasterize_rgba_and_label_buffer,
     _rebalance_color_array,
+    _resolve_plot_raster_state,
     _string_array_no_copy,
     _string_index_no_copy,
 )
@@ -266,6 +268,12 @@ def overlay_segment_boundaries_on_display(
     pixel_shape: str = "square",
     chunk_size: int = 50000,
     neighborhood_fill_px: int | None = None,
+    runtime_fill_from_boundary: bool = False,
+    runtime_fill_closing_radius: int = 1,
+    runtime_fill_holes: bool = True,
+    soft_rasterization: bool = False,
+    resolve_center_collisions: bool = False,
+    center_collision_radius: int = 2,
     xlim=None,
     ylim=None,
 ):
@@ -306,35 +314,58 @@ def overlay_segment_boundaries_on_display(
     w = int(raster_canvas["w"])
     h = int(raster_canvas["h"])
 
-    cx, cy = _raster.scale_points_to_canvas(
+    raster_state = _resolve_plot_raster_state(
         pts,
-        x_min_eff=x_min_eff,
-        y_min_eff=y_min_eff,
-        scale=scale,
+        x_min_eff=float(x_min_eff),
+        x_max_eff=float(x_max_eff),
+        y_min_eff=float(y_min_eff),
+        y_max_eff=float(y_max_eff),
+        scale=float(scale),
+        s=int(s),
+        w=int(w),
+        h=int(h),
         pixel_perfect=bool(pixel_perfect),
+        pixel_shape=pixel_shape,
+        coord_mode="spatial",
+        soft_rasterization=soft_rasterization,
+        resolve_center_collisions=resolve_center_collisions,
+        center_collision_radius=center_collision_radius,
+        logger=None,
+        verbose=False,
+        context="overlay_segment_boundaries_on_display",
     )
 
-    label_img = np.full((h, w), -1, dtype=np.int32)
-    seg_codes = pd.Categorical(coordinates_df[segment_key]).codes.astype(np.int32)
-    ox, oy = _raster.tile_pixel_offsets(int(s), pixel_shape=pixel_shape)
-    pixels_per_tile = int(ox.size)
-    target_pixels = int(max(1, 10000000 // max(1, pixels_per_tile)))
-    chunk_n = int(max(1, min(int(chunk_size), target_pixels)))
-
-    for i in range(0, len(cx), chunk_n):
-        end = min(i + chunk_n, len(cx))
-        chunk_cx = cx[i:end]
-        chunk_cy = cy[i:end]
-        chunk_seg = seg_codes[i:end]
-        all_x = np.clip((chunk_cx[:, None] + ox[None, :]).ravel(), 0, w - 1)
-        all_y = np.clip((chunk_cy[:, None] + oy[None, :]).ravel(), 0, h - 1)
-        label_img[all_y, all_x] = np.repeat(chunk_seg, pixels_per_tile, axis=0)
+    _, label_img, _ = _rasterize_rgba_and_label_buffer(
+        cols=np.zeros((len(pts), 3), dtype=np.float32),
+        cx=raster_state["cx"],
+        cy=raster_state["cy"],
+        w=int(raster_state["w"]),
+        h=int(raster_state["h"]),
+        s=int(raster_state["s"]),
+        pixel_shape=pixel_shape,
+        alpha_arr=None,
+        alpha_point=1.0,
+        vals=None,
+        prioritize_high_values=False,
+        soft_enabled=bool(raster_state["soft_enabled"]),
+        soft_fx=raster_state["soft_fx"],
+        soft_fy=raster_state["soft_fy"],
+        label_codes=pd.Categorical(coordinates_df[segment_key]).codes.astype(np.int32),
+        runtime_fill_from_boundary=bool(runtime_fill_from_boundary),
+        runtime_fill_closing_radius=int(runtime_fill_closing_radius),
+        runtime_fill_holes=bool(runtime_fill_holes),
+        chunk_size=int(chunk_size),
+        logger=None,
+        verbose=False,
+        context="overlay_segment_boundaries_on_display",
+    )
 
     occupied = label_img >= 0
     if neighborhood_fill_px is None:
-        neighborhood_fill_px = max(2, int(np.ceil(max(1, s) * 0.75)))
-    fill_px = int(max(0, neighborhood_fill_px))
-    if fill_px > 0 and np.any(occupied):
+        fill_px = 0 if runtime_fill_from_boundary else max(2, int(np.ceil(max(1, int(raster_state["s"])) * 0.75)))
+    else:
+        fill_px = int(max(0, neighborhood_fill_px))
+    if (not runtime_fill_from_boundary) and fill_px > 0 and np.any(occupied):
         neighborhood = binary_dilation(occupied, iterations=fill_px)
         missing = neighborhood & (label_img < 0)
         if np.any(missing):
@@ -354,7 +385,12 @@ def overlay_segment_boundaries_on_display(
         _plot_boundaries_from_label_image(
             ax,
             boundary_only,
-            [x_min_eff, x_max_eff, y_min_eff, y_max_eff],
+            [
+                float(raster_state["x_min_eff"]),
+                float(raster_state["x_max_eff"]),
+                float(raster_state["y_min_eff"]),
+                float(raster_state["y_max_eff"]),
+            ],
             boundary_color,
             boundary_linewidth,
             boundary_alpha,
@@ -433,6 +469,12 @@ def image_plot_with_spatial_image_display_boundaries(
     coordinate_mode: str = "spatial",
     array_row_key: str = "array_row",
     array_col_key: str = "array_col",
+    runtime_fill_from_boundary: bool = False,
+    runtime_fill_closing_radius: int = 1,
+    runtime_fill_holes: bool = True,
+    soft_rasterization: bool = False,
+    resolve_center_collisions: bool = False,
+    center_collision_radius: int = 2,
 ):
     """
     Plot display coordinates and overlay segment boundaries re-rasterized on the displayed tiles.
@@ -584,63 +626,61 @@ def image_plot_with_spatial_image_display_boundaries(
     _apply_axis_crop(ax, xlim=xlim, ylim=ylim)
 
     if use_imshow:
-        x_min_eff = float(raster_canvas["x_min_eff"])
-        x_max_eff = float(raster_canvas["x_max_eff"])
-        y_min_eff = float(raster_canvas["y_min_eff"])
-        y_max_eff = float(raster_canvas["y_max_eff"])
-        scale = float(raster_canvas["scale"])
-        s = int(raster_canvas["tile_px"])
-        w = int(raster_canvas["w"])
-        h = int(raster_canvas["h"])
-        cx, cy = _raster.scale_points_to_canvas(
+        raster_state = _resolve_plot_raster_state(
             pts,
-            x_min_eff=x_min_eff,
-            y_min_eff=y_min_eff,
-            scale=scale,
+            x_min_eff=float(raster_canvas["x_min_eff"]),
+            x_max_eff=float(raster_canvas["x_max_eff"]),
+            y_min_eff=float(raster_canvas["y_min_eff"]),
+            y_max_eff=float(raster_canvas["y_max_eff"]),
+            scale=float(raster_canvas["scale"]),
+            s=int(raster_canvas["tile_px"]),
+            w=int(raster_canvas["w"]),
+            h=int(raster_canvas["h"]),
             pixel_perfect=bool(pixel_perfect),
+            pixel_shape=pixel_shape,
+            coord_mode=coordinate_mode,
+            soft_rasterization=soft_rasterization,
+            resolve_center_collisions=resolve_center_collisions,
+            center_collision_radius=center_collision_radius,
+            logger=logger,
+            verbose=verbose,
+            context="image_plot_with_spatial_image_display_boundaries",
         )
-
-        img_rgba = np.zeros((h, w, 4), dtype=np.float32)
-        value_buf = np.full((h, w), -np.inf, dtype=float)
-        ox, oy = _raster.tile_pixel_offsets(int(s), pixel_shape=pixel_shape)
-        pixels_per_tile = int(ox.size)
-        target_pixels = int(max(1, 10000000 // max(1, pixels_per_tile)))
-        chunk_n = int(max(1, min(int(chunk_size), target_pixels)))
-        draw_vals = alpha_arr.astype(float) if alpha_arr is not None else np.arange(len(cx), dtype=float)
-
-        for i in range(0, len(cx), chunk_n):
-            end = min(i + chunk_n, len(cx))
-            chunk_cx = cx[i:end]
-            chunk_cy = cy[i:end]
-            chunk_cols = cols[i:end]
-            chunk_vals = draw_vals[i:end]
-            chunk_alpha = alpha_arr[i:end] if alpha_arr is not None else None
-
-            if not prioritize_high_values:
-                all_x = np.clip((chunk_cx[:, None] + ox[None, :]).ravel(), 0, w - 1)
-                all_y = np.clip((chunk_cy[:, None] + oy[None, :]).ravel(), 0, h - 1)
-                img_rgba[all_y, all_x, :3] = np.repeat(chunk_cols, pixels_per_tile, axis=0)
-                img_rgba[all_y, all_x, 3] = (
-                    np.repeat(chunk_alpha, pixels_per_tile, axis=0)
-                    if chunk_alpha is not None
-                    else float(alpha_point)
-                )
-            else:
-                for dx, dy in zip(ox, oy):
-                    px = np.clip(chunk_cx + dx, 0, w - 1)
-                    py = np.clip(chunk_cy + dy, 0, h - 1)
-                    mask_upd = chunk_vals > value_buf[py, px]
-                    if np.any(mask_upd):
-                        img_rgba[py[mask_upd], px[mask_upd], :3] = chunk_cols[mask_upd]
-                        img_rgba[py[mask_upd], px[mask_upd], 3] = (
-                            chunk_alpha[mask_upd] if chunk_alpha is not None else float(alpha_point)
-                        )
-                        value_buf[py[mask_upd], px[mask_upd]] = chunk_vals[mask_upd]
+        draw_vals = alpha_arr.astype(float) if alpha_arr is not None else np.arange(len(pts), dtype=float)
+        img_rgba, _, _ = _rasterize_rgba_and_label_buffer(
+            cols=cols,
+            cx=raster_state["cx"],
+            cy=raster_state["cy"],
+            w=int(raster_state["w"]),
+            h=int(raster_state["h"]),
+            s=int(raster_state["s"]),
+            pixel_shape=pixel_shape,
+            alpha_arr=alpha_arr,
+            alpha_point=float(alpha_point),
+            vals=draw_vals,
+            prioritize_high_values=bool(prioritize_high_values),
+            soft_enabled=bool(raster_state["soft_enabled"]),
+            soft_fx=raster_state["soft_fx"],
+            soft_fy=raster_state["soft_fy"],
+            label_codes=None,
+            runtime_fill_from_boundary=bool(runtime_fill_from_boundary),
+            runtime_fill_closing_radius=int(runtime_fill_closing_radius),
+            runtime_fill_holes=bool(runtime_fill_holes),
+            chunk_size=int(chunk_size),
+            logger=logger,
+            verbose=verbose,
+            context="image_plot_with_spatial_image_display_boundaries",
+        )
 
         ax.imshow(
             img_rgba,
             origin="lower",
-            extent=[x_min_eff, x_max_eff, y_min_eff, y_max_eff],
+            extent=[
+                float(raster_state["x_min_eff"]),
+                float(raster_state["x_max_eff"]),
+                float(raster_state["y_min_eff"]),
+                float(raster_state["y_max_eff"]),
+            ],
             interpolation="nearest",
         )
         overlay_segment_boundaries_on_display(
@@ -666,6 +706,12 @@ def image_plot_with_spatial_image_display_boundaries(
             pixel_perfect=pixel_perfect,
             pixel_shape=pixel_shape,
             chunk_size=chunk_size,
+            runtime_fill_from_boundary=runtime_fill_from_boundary,
+            runtime_fill_closing_radius=runtime_fill_closing_radius,
+            runtime_fill_holes=runtime_fill_holes,
+            soft_rasterization=soft_rasterization,
+            resolve_center_collisions=resolve_center_collisions,
+            center_collision_radius=center_collision_radius,
             xlim=xlim,
             ylim=ylim,
         )
@@ -710,6 +756,12 @@ def image_plot_with_spatial_image_display_boundaries(
             pixel_perfect=pixel_perfect,
             pixel_shape=pixel_shape,
             chunk_size=chunk_size,
+            runtime_fill_from_boundary=runtime_fill_from_boundary,
+            runtime_fill_closing_radius=runtime_fill_closing_radius,
+            runtime_fill_holes=runtime_fill_holes,
+            soft_rasterization=soft_rasterization,
+            resolve_center_collisions=resolve_center_collisions,
+            center_collision_radius=center_collision_radius,
             xlim=xlim,
             ylim=ylim,
         )
