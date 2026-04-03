@@ -306,11 +306,19 @@ def perform_pseudo_bulk_analysis(
             index=adata.obs_names,
             name=segment_key,
         )
+    total_segment_categories = len(segments.cat.categories)
+    segments = segments.cat.remove_unused_categories()
+    observed_segments = len(segments.cat.categories)
+    if observed_segments != total_segment_categories:
+        _logger.info(
+            "Removed %d unused segment categories before aggregation.",
+            total_segment_categories - observed_segments,
+        )
     # Handle potential NaN segments (groupby might drop them, ensure consistency)
     # It's safer to drop rows with NaN segments *before* aggregation if they exist
     # For now, assume segment_key has no NaNs or groupby handles them reasonably.
-    unique_segments = segments.cat.categories # This gets categories present in the data (observed=True implicitly uses these)
-    _logger.info(f"Found {len(unique_segments)} unique segments.")
+    unique_segments = segments.cat.categories
+    _logger.info(f"Found {len(unique_segments)} observed segments.")
 
     # --- Pseudo-Bulk Aggregation ---
 
@@ -418,10 +426,11 @@ def perform_pseudo_bulk_analysis(
         # Ensure at least x/y column names; fallback to generic if higher dimensional
         coord_cols = ['x', 'y'] + [f'z{i}' for i in range(spatial_df.shape[1] - 2)]
         spatial_df.columns = coord_cols[: spatial_df.shape[1]]
-        tiles_stub = spatial_df.reset_index().rename(columns={'index': 'barcode'})
-        tiles_stub['barcode'] = tiles_stub['barcode'].astype(str)
+        tiles_stub = spatial_df.copy()
+        tiles_stub.insert(0, 'barcode', new_adata.obs_names.astype(str).to_numpy())
         if 'origin' not in tiles_stub.columns:
             tiles_stub['origin'] = 1
+        tiles_stub['barcode'] = tiles_stub['barcode'].astype(str)
         new_adata.uns['tiles'] = tiles_stub
     except Exception as exc:
         _logger.warning(f"Failed to initialize segment-level tiles table for plotting: {exc}")
@@ -433,7 +442,7 @@ def perform_pseudo_bulk_analysis(
             new_adata.layers['counts'] = new_adata.X.astype(np.float32, copy=True)
         else:
             new_adata.layers['counts'] = np.asarray(new_adata.X, dtype=np.float32).copy()
-        _logger.info("Aggregated mean counts added to 'counts' layer.")
+        _logger.info("Aggregated counts added to 'counts' layer.")
     else:
         _logger.info("Skipping 'counts' layer copy (store_counts_layer=False).")
 
