@@ -3,6 +3,7 @@ from scipy.spatial import cKDTree
 from scipy.sparse import csr_matrix
 from scipy.sparse.linalg import expm_multiply, LinearOperator
 import pandas as pd
+import matplotlib.pyplot as plt
 from tqdm import tqdm
 import logging
 import multiprocessing
@@ -1975,6 +1976,1121 @@ def _init_smoothing_worker(precomputed_or_none):
         pass
 
 
+def _build_graph_precomputed_from_neighbors(
+    dists: np.ndarray,
+    idx: np.ndarray,
+    *,
+    graph_t: int,
+    graph_explicit="implicit",
+    graph_explicit_max_mb=None,
+    use_float32: bool = True,
+):
+    dists = np.asarray(dists)
+    idx = np.asarray(idx)
+    n_bins = int(dists.shape[0])
+    if n_bins <= 0:
+        raise ValueError("Graph precompute requires at least one row.")
+    if dists.ndim != 2 or idx.ndim != 2 or dists.shape != idx.shape:
+        raise ValueError("dists/idx must be 2D arrays with matching shape.")
+    if n_bins == 1 or dists.shape[1] == 0:
+        invdeg = np.ones(max(1, n_bins), dtype=np.float32 if use_float32 else np.float64)
+        return {"W": csr_matrix((n_bins, n_bins)), "Wt": None, "invdeg": invdeg}
+
+    sigma_loc = np.median(dists, axis=1) + 1e-9
+    gk = int(dists.shape[1])
+    nnz = int(n_bins) * int(gk)
+    use_int32 = nnz <= np.iinfo(np.int32).max and n_bins <= np.iinfo(np.int32).max
+    index_dtype = np.int32 if use_int32 else np.int64
+    indptr = (np.arange(n_bins + 1, dtype=index_dtype) * gk)
+    indices = idx.reshape(-1).astype(index_dtype, copy=False)
+    if use_float32:
+        d32 = dists.astype(np.float32, copy=False)
+        s32 = sigma_loc.astype(np.float32, copy=False)
+        data = np.exp(-(d32 ** 2) / (2.0 * (s32[:, None] ** 2))).reshape(-1).astype(np.float32, copy=False)
+    else:
+        data = np.exp(-(dists ** 2) / (2.0 * (sigma_loc[:, None] ** 2))).reshape(-1)
+    Wg = csr_matrix((data, indices, indptr), shape=(n_bins, n_bins))
+
+    row_sum = Wg.sum(1).A1
+    col_sum = Wg.sum(0).A1
+    deg = 0.5 * (row_sum + col_sum) + 1e-12
+    invdeg = 1.0 / deg
+    if use_float32 and invdeg.dtype != np.float32:
+        invdeg = invdeg.astype(np.float32, copy=False)
+    Wt = None
+    if int(graph_t) > 0:
+        Wt = Wg.transpose(copy=False)
+    graph = {"W": Wg, "Wt": Wt, "invdeg": invdeg}
+
+    if graph_explicit is None:
+        graph_mode = str(os.environ.get("SPIX_SMOOTH_GRAPH_EXPLICIT", "implicit")).strip().lower()
+    elif isinstance(graph_explicit, bool):
+        graph_mode = "explicit" if graph_explicit else "implicit"
+    else:
+        graph_mode = str(graph_explicit).strip().lower()
+    if graph_explicit_max_mb is None:
+        try:
+            graph_explicit_max_mb = float(os.environ.get("SPIX_SMOOTH_GRAPH_EXPLICIT_MAX_MB", "1024"))
+        except Exception:
+            graph_explicit_max_mb = 1024.0
+    else:
+        graph_explicit_max_mb = float(graph_explicit_max_mb)
+
+    use_explicit = False
+    if int(graph_t) > 0:
+        if graph_mode in {"1", "true", "yes", "explicit"}:
+            use_explicit = True
+        elif graph_mode in {"0", "false", "no", "implicit"}:
+            use_explicit = False
+        else:
+            nnz = int(Wg.nnz)
+            data_bytes = int(np.dtype(Wg.dtype).itemsize)
+            index_bytes = int(np.dtype(Wg.indices.dtype).itemsize)
+            est_bytes = (2 * nnz) * (data_bytes + index_bytes) + (int(n_bins) + 1) * index_bytes
+            est_mb = est_bytes / (1024.0 ** 2)
+            use_explicit = est_mb <= float(graph_explicit_max_mb)
+    if use_explicit:
+        if Wt is None:
+            Wt = Wg.transpose(copy=False)
+        S = (Wg + Wt).tocsr()
+        S.data *= 0.5
+        graph["S"] = S
+        graph["W"] = None
+        graph["Wt"] = None
+    return graph
+
+
+def _resolve_smoothing_tuning_inputs(
+    adata,
+    *,
+    embedding: str,
+    embedding_dims,
+    obs_mask,
+    coords,
+    n_dims_eval: int,
+    random_state: int,
+):
+    raw_embedding = np.asarray(adata.obsm[embedding])
+    if raw_embedding.dtype != np.float32:
+        raw_embedding = raw_embedding.astype(np.float32, copy=False)
+    n_obs, n_dim_total = raw_embedding.shape
+
+    if coords is None:
+        coords_local = None
+        try:
+            if "spatial" in adata.obsm:
+                coords_candidate = np.asarray(adata.obsm["spatial"], dtype=np.float32)
+                if coords_candidate.shape[0] == n_obs:
+                    coords_local = coords_candidate[:, :2]
+        except Exception:
+            coords_local = None
+        if coords_local is None:
+            try:
+                tiles_df = adata.uns["tiles"]
+                tiles_origin = tiles_df[tiles_df["origin"] == 1].copy()
+                tiles_origin["barcode"] = tiles_origin["barcode"].astype(str)
+                obs_idx = pd.Index(adata.obs_names.astype(str))
+                tiles_aligned = tiles_origin.set_index("barcode").reindex(obs_idx)
+                if tiles_aligned[["x", "y"]].isna().any().any():
+                    missing = int(tiles_aligned[["x", "y"]].isna().any(axis=1).sum())
+                    raise ValueError(f"Missing coordinates for {missing} observations when aligning tiles to obs.")
+                coords_local = tiles_aligned[["x", "y"]].to_numpy(dtype=np.float32)
+            except Exception as e:
+                raise ValueError(
+                    "Could not resolve coordinates from adata.obsm['spatial'] or adata.uns['tiles']."
+                ) from e
+        coords = coords_local
+    else:
+        coords = np.asarray(coords, dtype=np.float32)
+        if coords.ndim != 2 or coords.shape[0] != n_obs or coords.shape[1] < 2:
+            raise ValueError("coords must be shaped (n_obs, 2+).")
+        coords = coords[:, :2]
+
+    if obs_mask is not None:
+        if isinstance(obs_mask, (str, bytes)):
+            key = str(obs_mask)
+            if key not in adata.obs:
+                raise KeyError(f"obs_mask key '{key}' not found in adata.obs.")
+            mask = np.asarray(adata.obs[key]).astype(bool, copy=False)
+        else:
+            mask = np.asarray(obs_mask).astype(bool, copy=False)
+        if mask.shape[0] != n_obs:
+            raise ValueError("obs_mask must have length n_obs.")
+        if not bool(mask.any()):
+            raise ValueError("obs_mask selects 0 observations.")
+        if not bool(mask.all()):
+            raw_embedding = raw_embedding[mask]
+            coords = coords[mask]
+            n_obs = int(raw_embedding.shape[0])
+
+    if embedding_dims is None:
+        dims_pool = np.arange(n_dim_total, dtype=np.int32)
+    else:
+        dims_pool = np.asarray(list(embedding_dims), dtype=np.int32)
+        if dims_pool.size == 0:
+            raise ValueError("embedding_dims must be non-empty when provided.")
+        if dims_pool.min() < 0 or dims_pool.max() >= n_dim_total:
+            raise ValueError("embedding_dims contains out-of-range indices.")
+
+    n_dims_eval = int(max(1, n_dims_eval))
+    rng = np.random.default_rng(int(random_state))
+    if dims_pool.size <= n_dims_eval:
+        dims_eval = [int(x) for x in dims_pool.tolist()]
+    else:
+        dims_eval = sorted(int(x) for x in rng.choice(dims_pool, size=n_dims_eval, replace=False))
+    return raw_embedding, coords, dims_eval
+
+
+def _make_smoothing_candidates(
+    *,
+    methods,
+    knn_k,
+    knn_sigma,
+    graph_k,
+    graph_t,
+    bilateral_k,
+    bilateral_sigma_r,
+    bilateral_t,
+    gaussian_k,
+    gaussian_sigma,
+    gaussian_t,
+    guided_k,
+    guided_eps,
+    guided_sigma,
+    guided_t,
+    heat_k,
+    heat_sigma,
+    heat_time,
+    knn_k_grid=None,
+    knn_sigma_grid=None,
+    graph_k_grid=None,
+    graph_t_grid=None,
+    bilateral_k_grid=None,
+    bilateral_sigma_r_grid=None,
+    bilateral_t_grid=None,
+    gaussian_k_grid=None,
+    gaussian_sigma_grid=None,
+    gaussian_t_grid=None,
+    guided_k_grid=None,
+    guided_eps_grid=None,
+    guided_sigma_grid=None,
+    guided_t_grid=None,
+    heat_k_grid=None,
+    heat_sigma_grid=None,
+    heat_time_grid=None,
+):
+    methods = [str(m).strip().lower() for m in methods]
+    grid_map = {
+        "knn_k": [int(knn_k)] if knn_k_grid is None else sorted(set(int(max(1, x)) for x in knn_k_grid)),
+        "knn_sigma": [float(knn_sigma)] if knn_sigma_grid is None else sorted(set(float(x) for x in knn_sigma_grid)),
+        "graph_k": [int(graph_k)] if graph_k_grid is None else sorted(set(int(max(1, x)) for x in graph_k_grid)),
+        "graph_t": [int(graph_t)] if graph_t_grid is None else sorted(set(int(max(1, x)) for x in graph_t_grid)),
+        "bilateral_k": [int(bilateral_k)] if bilateral_k_grid is None else sorted(set(int(max(1, x)) for x in bilateral_k_grid)),
+        "bilateral_sigma_r": [float(bilateral_sigma_r)] if bilateral_sigma_r_grid is None else sorted(set(float(x) for x in bilateral_sigma_r_grid)),
+        "bilateral_t": [int(bilateral_t)] if bilateral_t_grid is None else sorted(set(int(max(1, x)) for x in bilateral_t_grid)),
+        "gaussian_k": [int(knn_k if gaussian_k is None else gaussian_k)] if gaussian_k_grid is None else sorted(set(int(max(1, x)) for x in gaussian_k_grid)),
+        "gaussian_sigma": [float(gaussian_sigma)] if gaussian_sigma_grid is None else sorted(set(float(x) for x in gaussian_sigma_grid)),
+        "gaussian_t": [int(gaussian_t)] if gaussian_t_grid is None else sorted(set(int(max(1, x)) for x in gaussian_t_grid)),
+        "guided_k": [int(knn_k if guided_k is None else guided_k)] if guided_k_grid is None else sorted(set(int(max(1, x)) for x in guided_k_grid)),
+        "guided_eps": [float(guided_eps)] if guided_eps_grid is None else sorted(set(float(x) for x in guided_eps_grid)),
+        "guided_sigma": [guided_sigma] if guided_sigma_grid is None else list(guided_sigma_grid),
+        "guided_t": [int(guided_t)] if guided_t_grid is None else sorted(set(int(max(1, x)) for x in guided_t_grid)),
+        "heat_k": [int((gaussian_k if gaussian_k is not None else knn_k) if heat_k is None else heat_k)] if heat_k_grid is None else sorted(set(int(max(1, x)) for x in heat_k_grid)),
+        "heat_sigma": [float((gaussian_sigma if heat_sigma is None else heat_sigma))] if heat_sigma_grid is None else sorted(set(float(x) for x in heat_sigma_grid)),
+        "heat_time": [float(heat_time)] if heat_time_grid is None else sorted(set(float(x) for x in heat_time_grid)),
+    }
+    active_keys = []
+    if "knn" in methods:
+        active_keys += ["knn_k", "knn_sigma"]
+    if "graph" in methods:
+        active_keys += ["graph_k", "graph_t"]
+    if "bilateral" in methods:
+        active_keys += ["bilateral_k", "bilateral_sigma_r", "bilateral_t"]
+    if "gaussian" in methods:
+        active_keys += ["gaussian_k", "gaussian_sigma", "gaussian_t"]
+    if "guided" in methods:
+        active_keys += ["guided_k", "guided_eps", "guided_sigma", "guided_t"]
+    if "heat" in methods:
+        active_keys += ["heat_k", "heat_sigma", "heat_time"]
+    active_keys = list(dict.fromkeys(active_keys))
+    candidates = []
+    for values in product(*[grid_map[k] for k in active_keys]):
+        row = dict(zip(active_keys, values))
+        for key, vals in grid_map.items():
+            row.setdefault(key, vals[0])
+        candidates.append(row)
+    return candidates
+
+
+def _ratio_preserve_score(x: float, eps: float = 1e-12) -> float:
+    x = float(max(eps, x))
+    return float(np.exp(-abs(np.log(x))))
+
+
+def _stabilized_edge_ratios(
+    d0: np.ndarray,
+    d1: np.ndarray,
+    *,
+    q_low: float,
+    q_high: float,
+):
+    d0 = np.asarray(d0, dtype=float)
+    d1 = np.asarray(d1, dtype=float)
+    thr_lo = float(np.quantile(d0, q_low))
+    thr_hi = float(np.quantile(d0, q_high))
+    low_mask = d0 <= thr_lo
+    high_mask = d0 >= thr_hi
+    d0_low = float(d0[low_mask].mean()) if bool(low_mask.any()) else float(d0.mean())
+    d1_low = float(d1[low_mask].mean()) if bool(low_mask.any()) else float(d1.mean())
+    d0_hi = float(d0[high_mask].mean()) if bool(high_mask.any()) else float(d0.mean())
+    d1_hi = float(d1[high_mask].mean()) if bool(high_mask.any()) else float(d1.mean())
+    d0_all = float(d0.mean())
+    d1_all = float(d1.mean())
+    eps = 1e-12
+    # Very-flat edges make raw ratios explode and break selection for strong
+    # smoothers such as graph diffusion. Use robust denominator floors so we
+    # compare against a meaningful local scale instead of near-zero noise.
+    low_floor = max(eps, thr_lo, 0.1 * d0_all)
+    high_floor = max(eps, thr_hi, 0.25 * d0_all)
+    all_floor = max(eps, 0.25 * d0_all)
+    r_low = d1_low / max(low_floor, d0_low)
+    r_hi = d1_hi / max(high_floor, d0_hi)
+    r_all = d1_all / max(all_floor, d0_all)
+    return {
+        "ratio_low": float(r_low),
+        "ratio_high": float(r_hi),
+        "ratio_all": float(r_all),
+    }
+
+
+def _finalize_smoothing_scores(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["smooth_gain"] = np.clip(1.0 - df["ratio_low"].astype(float), 0.0, None)
+    df["edge_preserve_ratio"] = df["ratio_high"].astype(float)
+    df["global_preserve_ratio"] = df["ratio_all"].astype(float)
+    df["edge_preserve"] = df["edge_preserve_ratio"].map(_ratio_preserve_score)
+    df["global_preserve"] = df["global_preserve_ratio"].map(_ratio_preserve_score)
+    df["tradeoff_product"] = (
+        df["smooth_gain"].astype(float)
+        * df["edge_preserve"].astype(float)
+        * df["global_preserve"].astype(float)
+    )
+    return df
+
+
+def _select_best_smoothing_candidate(
+    df: pd.DataFrame,
+    *,
+    selection_mode: str,
+    select_gain_fraction_val,
+    min_edge_val,
+    prefer_smooth_gain_within_keep: bool = False,
+):
+    if selection_mode == "score":
+        best_id = int(df.sort_values(["score"], ascending=False, kind="mergesort").iloc[0]["candidate_id"])
+    elif selection_mode == "product":
+        best_id = int(df.sort_values(["tradeoff_product"], ascending=False, kind="mergesort").iloc[0]["candidate_id"])
+    elif selection_mode == "max_gain":
+        keep = np.ones(df.shape[0], dtype=bool)
+        if min_edge_val is not None:
+            keep = keep & (df["edge_preserve"] >= min_edge_val)
+        kept = df[keep]
+        if kept.shape[0] == 0:
+            best_id = int(df.sort_values(["tradeoff_product"], ascending=False, kind="mergesort").iloc[0]["candidate_id"])
+        else:
+            best_id = int(
+                kept.sort_values(
+                    ["smooth_gain", "edge_preserve", "global_preserve", "score"],
+                    ascending=[False, False, False, False],
+                    kind="mergesort",
+                ).iloc[0]["candidate_id"]
+            )
+    else:
+        max_gain = float(df["smooth_gain"].max())
+        gain_thr = float(select_gain_fraction_val) * max_gain
+        keep = df["smooth_gain"] >= gain_thr
+        if min_edge_val is not None:
+            keep = keep & (df["edge_preserve"] >= min_edge_val)
+        kept = df[keep]
+        if kept.shape[0] == 0:
+            best_id = int(df.sort_values(["tradeoff_product"], ascending=False, kind="mergesort").iloc[0]["candidate_id"])
+        else:
+            sort_cols = ["edge_preserve", "global_preserve", "smooth_gain", "score"]
+            if prefer_smooth_gain_within_keep:
+                sort_cols = ["tradeoff_product", "smooth_gain", "edge_preserve", "global_preserve"]
+            best_id = int(
+                kept.sort_values(
+                    sort_cols,
+                    ascending=[False, False, False, False],
+                    kind="mergesort",
+                ).iloc[0]["candidate_id"]
+            )
+    return best_id
+
+
+def _build_smoothing_recommendation(best_row: dict, methods: list[str]) -> dict:
+    methods = [str(m).strip().lower() for m in methods]
+    keys = []
+    if "knn" in methods:
+        keys += ["knn_k", "knn_sigma"]
+    if "graph" in methods:
+        keys += ["graph_k", "graph_t"]
+    if "bilateral" in methods:
+        keys += ["bilateral_k", "bilateral_sigma_r", "bilateral_t"]
+    if "gaussian" in methods:
+        keys += ["gaussian_k", "gaussian_sigma", "gaussian_t"]
+    if "guided" in methods:
+        keys += ["guided_k", "guided_eps", "guided_sigma", "guided_t"]
+    if "heat" in methods:
+        keys += ["heat_k", "heat_sigma", "heat_time"]
+    params = {k: best_row[k] for k in keys if k in best_row and pd.notna(best_row[k])}
+    return {
+        "methods": list(methods),
+        "candidate_id": int(best_row["candidate_id"]),
+        "params": params,
+        "summary": ", ".join(f"{k}={v}" for k, v in params.items()),
+        "reason": (
+            f"Selected candidate {int(best_row['candidate_id'])} with "
+            f"smooth_gain={float(best_row.get('smooth_gain', float('nan'))):.4g}, "
+            f"edge_preserve={float(best_row.get('edge_preserve', float('nan'))):.4g}, "
+            f"global_preserve={float(best_row.get('global_preserve', float('nan'))):.4g}, "
+            f"score={float(best_row.get('score', float('nan'))):.4g}."
+        ),
+    }
+
+
+def _normalize_smoothing_approx_mode(approx_mode):
+    if approx_mode is None:
+        return None
+    if isinstance(approx_mode, bool):
+        return "grid" if approx_mode else None
+    mode = str(approx_mode).strip().lower()
+    if mode in {"", "none", "off", "false", "0", "full", "exact"}:
+        return None
+    if mode in {"approx", "grid", "coarse"}:
+        return "grid"
+    raise ValueError("approx_mode must be one of {None,'grid','approx','full','exact',True,False}.")
+
+
+def evaluate_smoothing_sweep(
+    adata,
+    *,
+    embedding: str = "X_embedding",
+    methods=("bilateral",),
+    embedding_dims=None,
+    obs_mask=None,
+    coords=None,
+    approx_mode: str | bool | None = "grid",
+    approx_target_n: int = 20_000,
+    approx_bin=None,
+    approx_max_bins=None,
+    knn_k: int = 35,
+    knn_sigma: float = 2.0,
+    knn_chunk: int = 10_000,
+    graph_k: int = 30,
+    graph_t: int = 2,
+    graph_tol=None,
+    graph_check_every: int = 1,
+    graph_explicit="implicit",
+    graph_explicit_max_mb=None,
+    bilateral_k: int = 30,
+    bilateral_sigma_r: float = 0.3,
+    bilateral_t: int = 3,
+    gaussian_sigma: float = 1.0,
+    gaussian_k=None,
+    gaussian_t: int = 1,
+    guided_k=None,
+    guided_eps: float = 1e-3,
+    guided_sigma=None,
+    guided_t: int = 1,
+    heat_time: float = 1.0,
+    heat_k=None,
+    heat_sigma=None,
+    heat_method: str = "krylov",
+    heat_tol: float = 1e-4,
+    heat_min_k: int = 0,
+    heat_max_k=None,
+    knn_k_grid=None,
+    knn_sigma_grid=None,
+    graph_k_grid=None,
+    graph_t_grid=None,
+    bilateral_k_grid=None,
+    bilateral_sigma_r_grid=None,
+    bilateral_t_grid=None,
+    gaussian_k_grid=None,
+    gaussian_sigma_grid=None,
+    gaussian_t_grid=None,
+    guided_k_grid=None,
+    guided_eps_grid=None,
+    guided_sigma_grid=None,
+    guided_t_grid=None,
+    heat_k_grid=None,
+    heat_sigma_grid=None,
+    heat_time_grid=None,
+    n_dims_eval: int = 3,
+    random_state: int = 0,
+    score_sample_edges: int = 200_000,
+    score_q_low: float = 0.2,
+    score_q_high: float = 0.8,
+    selection: str = "gain_then_edge",
+    select_gain_fraction=None,
+    select_min_edge_preserve=None,
+    score_w_edge: float = 1.0,
+    score_w_all: float = 0.2,
+    rescale_mode: str = "final",
+    use_float32=None,
+    fast_float32: bool = True,
+    n_jobs=None,
+    candidate_jobs=None,
+    candidate_backend: str = "threads",
+    verbose: bool = True,
+):
+    log = logging.getLogger(__name__)
+    if not verbose:
+        prev_level = log.level
+        log.setLevel(logging.WARNING)
+    try:
+        if isinstance(methods, (str, bytes)):
+            methods = [methods]
+        methods = [str(m).strip().lower() for m in methods]
+        valid_methods = {"knn", "graph", "bilateral", "gaussian", "guided", "heat"}
+        if not methods or any(m not in valid_methods for m in methods):
+            raise ValueError(f"methods must be a non-empty subset of {sorted(valid_methods)}.")
+        if score_q_low <= 0 or score_q_high >= 1 or score_q_low >= score_q_high:
+            raise ValueError("score_q_low/high must satisfy 0 < low < high < 1.")
+
+        selection_mode = str(selection).strip().lower()
+        if selection_mode not in {"gain_then_edge", "product", "score", "max_gain"}:
+            raise ValueError("selection must be one of {'gain_then_edge','product','score','max_gain'}.")
+        bilateral_only = set(methods) == {"bilateral"}
+        aggressive_bilateral_default = bool(
+            bilateral_only
+            and selection_mode == "gain_then_edge"
+            and select_gain_fraction is None
+            and select_min_edge_preserve is None
+        )
+        select_gain_fraction_val = None
+        if select_gain_fraction is not None:
+            select_gain_fraction_val = float(select_gain_fraction)
+            if not np.isfinite(select_gain_fraction_val) or not (0 < select_gain_fraction_val <= 1.0):
+                raise ValueError("select_gain_fraction must be in (0,1].")
+        min_edge_val = None if select_min_edge_preserve is None else float(select_min_edge_preserve)
+        if min_edge_val is not None and (not np.isfinite(min_edge_val) or not (0 < min_edge_val <= 1.0)):
+            raise ValueError("select_min_edge_preserve must be in (0,1].")
+
+        raw_embedding, coords_arr, dims_eval = _resolve_smoothing_tuning_inputs(
+            adata,
+            embedding=embedding,
+            embedding_dims=embedding_dims,
+            obs_mask=obs_mask,
+            coords=coords,
+            n_dims_eval=n_dims_eval,
+            random_state=random_state,
+        )
+        n_obs = int(raw_embedding.shape[0])
+
+        if n_jobs is None or int(n_jobs) == -1:
+            n_jobs = multiprocessing.cpu_count()
+        n_jobs = int(n_jobs)
+        neighbor_workers = max(1, n_jobs)
+
+        if use_float32 is None:
+            use_float32 = str(os.environ.get("SPIX_SMOOTH_FLOAT32", "0")).strip().lower() in {"1", "true", "yes"}
+        else:
+            use_float32 = bool(use_float32)
+        if fast_float32:
+            use_float32 = True
+
+        approx_mode_val = _normalize_smoothing_approx_mode(approx_mode)
+
+        if approx_max_bins is None:
+            try:
+                approx_max_bins = int(os.environ.get("SPIX_SMOOTH_APPROX_MAX_BINS", "500000"))
+            except Exception:
+                approx_max_bins = 500000
+
+        if approx_mode_val == "grid":
+            approx_info = _precompute_approx_grid(
+                coords_arr,
+                graph_k=int(graph_k),
+                graph_t=0,
+                graph_explicit=graph_explicit,
+                graph_explicit_max_mb=graph_explicit_max_mb,
+                use_float32=use_float32,
+                target_n=int(approx_target_n),
+                bin_size=approx_bin,
+                max_bins=approx_max_bins,
+                build_graph=False,
+                neighbor_workers=neighbor_workers,
+            )
+            bin_id = approx_info["bin_id"]
+            counts = approx_info["counts"]
+            centers = approx_info["centers"]
+            n_bins = int(approx_info["n_bins"])
+
+            E_eval = raw_embedding[:, dims_eval]
+            sum_dtype = np.float32 if fast_float32 else np.float64
+            E_bins = _aggregate_by_bins(E_eval, bin_id, counts, sum_dtype=sum_dtype).astype(np.float32, copy=False)
+            approx_meta = {
+                "mode": "grid",
+                "n_bins": int(n_bins),
+                "bin_size": float(approx_info.get("bin_size")),
+            }
+            if verbose:
+                log.info(
+                    "Smoothing sweep approx mode: grid | n_obs=%d -> n_bins=%d | bin_size=%.6g",
+                    int(n_obs),
+                    int(n_bins),
+                    float(approx_info.get("bin_size")),
+                )
+        else:
+            centers = np.asarray(coords_arr[:, :2], dtype=np.float32, copy=False)
+            n_bins = int(centers.shape[0])
+            E_bins = np.asarray(raw_embedding[:, dims_eval], dtype=np.float32, copy=False)
+            approx_meta = {
+                "mode": "full",
+                "n_bins": int(n_bins),
+                "bin_size": None,
+            }
+            if verbose:
+                log.info(
+                    "Smoothing sweep approx mode: full | n_obs=%d | no coarse binning",
+                    int(n_obs),
+                )
+        tuning_rescale_mode = str(rescale_mode).strip().lower()
+        if tuning_rescale_mode in {"final", "per_step"}:
+            mn0 = E_bins.min(axis=0, keepdims=True)
+            mx0 = E_bins.max(axis=0, keepdims=True)
+            denom0 = mx0 - mn0
+            denom0[denom0 < 1e-12] = 1e-12
+            E_bins = (E_bins - mn0) / denom0
+
+        candidates = _make_smoothing_candidates(
+            methods=methods,
+            knn_k=knn_k,
+            knn_sigma=knn_sigma,
+            graph_k=graph_k,
+            graph_t=graph_t,
+            bilateral_k=bilateral_k,
+            bilateral_sigma_r=bilateral_sigma_r,
+            bilateral_t=bilateral_t,
+            gaussian_k=gaussian_k,
+            gaussian_sigma=gaussian_sigma,
+            gaussian_t=gaussian_t,
+            guided_k=guided_k,
+            guided_eps=guided_eps,
+            guided_sigma=guided_sigma,
+            guided_t=guided_t,
+            heat_k=heat_k,
+            heat_sigma=heat_sigma,
+            heat_time=heat_time,
+            knn_k_grid=knn_k_grid,
+            knn_sigma_grid=knn_sigma_grid,
+            graph_k_grid=graph_k_grid,
+            graph_t_grid=graph_t_grid,
+            bilateral_k_grid=bilateral_k_grid,
+            bilateral_sigma_r_grid=bilateral_sigma_r_grid,
+            bilateral_t_grid=bilateral_t_grid,
+            gaussian_k_grid=gaussian_k_grid,
+            gaussian_sigma_grid=gaussian_sigma_grid,
+            gaussian_t_grid=gaussian_t_grid,
+            guided_k_grid=guided_k_grid,
+            guided_eps_grid=guided_eps_grid,
+            guided_sigma_grid=guided_sigma_grid,
+            guided_t_grid=guided_t_grid,
+            heat_k_grid=heat_k_grid,
+            heat_sigma_grid=heat_sigma_grid,
+            heat_time_grid=heat_time_grid,
+        )
+        if len(candidates) == 0:
+            raise RuntimeError("No smoothing candidates generated.")
+
+        k_needed = []
+        if "knn" in methods:
+            k_needed.append(max(int(c["knn_k"]) for c in candidates))
+        if "graph" in methods:
+            k_needed.append(max(int(c["graph_k"]) for c in candidates) + 1)
+        if "bilateral" in methods:
+            k_needed.append(max(int(c["bilateral_k"]) for c in candidates) + 1)
+        if "gaussian" in methods:
+            k_needed.append(max(int(c["gaussian_k"]) for c in candidates))
+        if "guided" in methods:
+            k_needed.append(max(int(c["guided_k"]) for c in candidates))
+        if "heat" in methods:
+            k_needed.append(max(int(c["heat_k"]) for c in candidates))
+        k_query = int(min(max(1, max(k_needed, default=1)), n_bins))
+        tree_bins = cKDTree(centers, balanced_tree=True, compact_nodes=True)
+        d_all, idx_all = tree_bins.query(centers, k=k_query, workers=neighbor_workers)
+        if k_query == 1:
+            d_all = d_all[:, None]
+            idx_all = idx_all[:, None]
+        d_all = d_all.astype(np.float32, copy=False)
+        idx_all = idx_all.astype(np.int32, copy=False)
+
+        if idx_all.shape[1] >= 1:
+            is_self = (idx_all[:, 0] == np.arange(n_bins, dtype=idx_all.dtype))
+            includes_self = bool(is_self.mean() >= 0.9)
+        else:
+            includes_self = False
+        start_pos = 1 if includes_self and idx_all.shape[1] > 1 else 0
+
+        rng = np.random.default_rng(int(random_state))
+        n_edges = int(max(1, score_sample_edges))
+        src = rng.integers(0, n_bins, size=n_edges, dtype=np.int32)
+        u = rng.random(size=n_edges).astype(np.float32, copy=False)
+
+        if selection_mode == "gain_then_edge" and select_gain_fraction_val is None:
+            # Bilateral-only tuning tends to prefer very small sigma_r because
+            # edge preservation dominates early. Apply only a mild default bias
+            # toward stronger smoothers while keeping edge preservation central.
+            select_gain_fraction_val = 0.85 if aggressive_bilateral_default else 0.8
+
+        def _score_candidate(E0_bins: np.ndarray, E1_bins: np.ndarray, *, k_eff: int) -> dict:
+            k_eff = int(max(1, min(k_eff, idx_all.shape[1] - (0 if not includes_self else 0))))
+            span = int(max(1, min(k_eff + (1 if includes_self else 0), idx_all.shape[1]) - start_pos))
+            pos = start_pos + (u * span).astype(np.int32)
+            dst = idx_all[src, pos]
+            scores = []
+            ratio_low_all = []
+            ratio_high_all = []
+            ratio_all_all = []
+            for j in range(E0_bins.shape[1]):
+                d0 = np.abs(E0_bins[src, j] - E0_bins[dst, j])
+                d1 = np.abs(E1_bins[src, j] - E1_bins[dst, j])
+                ratios = _stabilized_edge_ratios(
+                    d0,
+                    d1,
+                    q_low=score_q_low,
+                    q_high=score_q_high,
+                )
+                r_low = ratios["ratio_low"]
+                r_hi = ratios["ratio_high"]
+                r_all = ratios["ratio_all"]
+                eps = 1e-12
+                score = (1.0 - r_low) - float(score_w_edge) * abs(float(np.log(max(eps, r_hi)))) - float(score_w_all) * abs(float(np.log(max(eps, r_all))))
+                scores.append(float(score))
+                ratio_low_all.append(float(r_low))
+                ratio_high_all.append(float(r_hi))
+                ratio_all_all.append(float(r_all))
+            return {
+                "score": float(np.mean(scores)) if scores else float("nan"),
+                "ratio_low": float(np.mean(ratio_low_all)) if ratio_low_all else float("nan"),
+                "ratio_high": float(np.mean(ratio_high_all)) if ratio_high_all else float("nan"),
+                "ratio_all": float(np.mean(ratio_all_all)) if ratio_all_all else float("nan"),
+            }
+
+        if candidate_jobs is None:
+            candidate_jobs = n_jobs
+        candidate_jobs = int(max(1, min(int(candidate_jobs), len(candidates))))
+        candidate_backend = str(candidate_backend).strip().lower()
+        if candidate_backend not in {"threads", "processes"}:
+            raise ValueError("candidate_backend must be one of {'threads','processes'}.")
+        if candidate_backend == "processes":
+            if verbose:
+                log.warning(
+                    "evaluate_smoothing_sweep: process-based candidate parallelism is not enabled for this path; falling back to threads."
+                )
+            candidate_backend = "threads"
+
+        def _evaluate_one(item):
+            cand_id, cand = item
+            precomputed = {}
+            if "knn" in methods:
+                k = int(max(1, min(int(cand["knn_k"]), idx_all.shape[1])))
+                precomputed["knn"] = {
+                    "dists": d_all[:, :k].astype(np.float32, copy=False),
+                    "idx": idx_all[:, :k].astype(np.int32, copy=False),
+                }
+            if "graph" in methods:
+                k = int(max(1, min(int(cand["graph_k"]) + 1, idx_all.shape[1])))
+                d = d_all[:, 1:k].astype(np.float32, copy=False) if includes_self and k > 1 else d_all[:, :max(1, k - start_pos)].astype(np.float32, copy=False)
+                ix = idx_all[:, 1:k].astype(np.int32, copy=False) if includes_self and k > 1 else idx_all[:, :max(1, k - start_pos)].astype(np.int32, copy=False)
+                precomputed["graph"] = _build_graph_precomputed_from_neighbors(
+                    d,
+                    ix,
+                    graph_t=int(cand["graph_t"]),
+                    graph_explicit=graph_explicit,
+                    graph_explicit_max_mb=graph_explicit_max_mb,
+                    use_float32=use_float32,
+                )
+            if "bilateral" in methods:
+                k = int(max(1, min(int(cand["bilateral_k"]) + 1, idx_all.shape[1])))
+                d = d_all[:, :k].astype(np.float32, copy=False)
+                ix = idx_all[:, :k].astype(np.int32, copy=False)
+                if k > 1:
+                    sigma_s = (np.median(d[:, start_pos:], axis=1).astype(np.float32) + 1e-9).astype(np.float32)
+                else:
+                    sigma_s = np.full(d.shape[0], 1.0, dtype=np.float32)
+                precomputed["bilateral"] = {"dists": d, "idx": ix, "sigma_s": sigma_s}
+            if "gaussian" in methods:
+                k = int(max(1, min(int(cand["gaussian_k"]), idx_all.shape[1])))
+                precomputed["gaussian"] = {
+                    "dists": d_all[:, :k].astype(np.float32, copy=False),
+                    "idx": idx_all[:, :k].astype(np.int32, copy=False),
+                }
+            if "guided" in methods:
+                k = int(max(1, min(int(cand["guided_k"]), idx_all.shape[1])))
+                entry = {"idx": idx_all[:, :k].astype(np.int32, copy=False)}
+                if cand["guided_sigma"] is not None:
+                    entry["dists"] = d_all[:, :k].astype(np.float32, copy=False)
+                precomputed["guided"] = entry
+            if "heat" in methods:
+                k = int(max(1, min(int(cand["heat_k"]), idx_all.shape[1])))
+                heat_entry = {
+                    "W": _build_row_stochastic_csr(
+                        d_all[:, :k].astype(np.float32, copy=False),
+                        idx_all[:, :k].astype(np.int32, copy=False),
+                        sigma=float(cand["heat_sigma"]),
+                        fast_float32=fast_float32,
+                        sort_indices=False,
+                    )
+                }
+                precomputed["heat"] = heat_entry
+
+            E1_cols = []
+            for j in range(E_bins.shape[1]):
+                out_j = _process_dimension(
+                    E_bins[:, j].astype(np.float32, copy=False),
+                    methods,
+                    precomputed,
+                    float(cand["knn_sigma"]),
+                    int(knn_chunk),
+                    float(cand["bilateral_sigma_r"]),
+                    int(cand["bilateral_t"]),
+                    int(cand["graph_t"]),
+                    graph_tol,
+                    int(graph_check_every),
+                    int(cand["gaussian_t"]),
+                    float(cand["gaussian_sigma"]),
+                    float(cand["guided_eps"]),
+                    cand["guided_sigma"],
+                    int(cand["guided_t"]),
+                    float(cand["heat_time"]),
+                    str(heat_method),
+                    float(heat_tol),
+                    int(heat_min_k),
+                    heat_max_k,
+                    "none" if tuning_rescale_mode == "final" else rescale_mode,
+                    fast_float32,
+                ).astype(np.float32, copy=False)
+                E1_cols.append(out_j)
+            E1_bins = np.stack(E1_cols, axis=1).astype(np.float32, copy=False)
+
+            score = _score_candidate(E_bins, E1_bins, k_eff=max(1, int(cand.get("graph_k", cand.get("bilateral_k", cand.get("gaussian_k", cand.get("knn_k", 1)))))))
+            return {"candidate_id": int(cand_id), **cand, **score}
+
+        candidate_items = list(enumerate(candidates))
+        if verbose:
+            log.info(
+                "Smoothing sweep candidate evaluation: candidates=%d | backend=%s | jobs=%d",
+                len(candidate_items),
+                candidate_backend,
+                candidate_jobs,
+            )
+        results = []
+        if candidate_jobs <= 1 or len(candidate_items) <= 1:
+            for item in candidate_items:
+                results.append(_evaluate_one(item))
+        elif candidate_backend == "threads":
+            with ThreadPoolExecutor(max_workers=candidate_jobs) as executor:
+                future_to_item = {executor.submit(_evaluate_one, item): item for item in candidate_items}
+                for future in as_completed(future_to_item):
+                    results.append(future.result())
+
+        df = _finalize_smoothing_scores(pd.DataFrame(results))
+        best_id = _select_best_smoothing_candidate(
+            df,
+            selection_mode=selection_mode,
+            select_gain_fraction_val=select_gain_fraction_val,
+            min_edge_val=min_edge_val,
+            prefer_smooth_gain_within_keep=aggressive_bilateral_default,
+        )
+
+        df["is_best"] = df["candidate_id"] == int(best_id)
+        df = df.sort_values(["is_best", "tradeoff_product"], ascending=[False, False], kind="mergesort").reset_index(drop=True)
+        best_row = df.iloc[0].to_dict()
+
+        best = {
+            "methods": list(methods),
+            "embedding": embedding,
+            "rescale_mode": str(rescale_mode),
+        }
+        active_param_keys = list(_build_smoothing_recommendation(best_row, methods)["params"].keys())
+        for key in active_param_keys:
+            if key in best_row:
+                best[key] = best_row[key]
+        if embedding_dims is not None:
+            best["embedding_dims"] = list(embedding_dims)
+        if isinstance(obs_mask, (str, bytes)):
+            best["obs_mask"] = str(obs_mask)
+
+        return {
+            "best": best,
+            "candidates": df,
+            "dims_eval": dims_eval,
+            "approx": approx_meta,
+            "selection_result": {
+                "selected_candidate_id": int(best_id),
+                "selected": best_row,
+                "selection_mode": selection_mode,
+                "select_gain_fraction": select_gain_fraction_val,
+                "select_min_edge_preserve": min_edge_val,
+                "aggressive_bilateral_default": bool(aggressive_bilateral_default),
+            },
+            "recommendation": _build_smoothing_recommendation(best_row, methods),
+        }
+    finally:
+        if not verbose:
+            log.setLevel(prev_level)
+
+
+def plot_smoothing_sweep(
+    selection_result,
+    *,
+    param_x: str | None = None,
+    show: bool = True,
+    figsize=(12, 8),
+):
+    if not isinstance(selection_result, dict) or "candidates" not in selection_result:
+        raise ValueError("selection_result must be a dict returned by evaluate_smoothing_sweep or tune_smooth_image_params.")
+    df = selection_result["candidates"]
+    if not isinstance(df, pd.DataFrame) or df.shape[0] == 0:
+        raise ValueError("selection_result['candidates'] must be a non-empty DataFrame.")
+
+    candidate_cols = [
+        "knn_k", "knn_sigma", "graph_k", "graph_t",
+        "bilateral_k", "bilateral_sigma_r", "bilateral_t",
+        "gaussian_k", "gaussian_sigma", "gaussian_t",
+        "guided_k", "guided_eps", "guided_sigma", "guided_t",
+        "heat_k", "heat_sigma", "heat_time",
+    ]
+    if param_x is None:
+        varying = [c for c in candidate_cols if c in df.columns and pd.Series(df[c]).nunique(dropna=False) > 1]
+        if not varying:
+            raise ValueError("No varying smoothing parameter found to plot on x-axis.")
+        param_x = varying[0]
+    if param_x not in df.columns:
+        raise ValueError(f"param_x '{param_x}' not present in candidates DataFrame.")
+
+    candidate_cols = [
+        "knn_k", "knn_sigma", "graph_k", "graph_t",
+        "bilateral_k", "bilateral_sigma_r", "bilateral_t",
+        "gaussian_k", "gaussian_sigma", "gaussian_t",
+        "guided_k", "guided_eps", "guided_sigma", "guided_t",
+        "heat_k", "heat_sigma", "heat_time",
+    ]
+    varying = [c for c in candidate_cols if c in df.columns and pd.Series(df[c]).nunique(dropna=False) > 1]
+    multi_param = len(varying) > 1
+    plot_df = df.sort_values(param_x, kind="mergesort").reset_index(drop=True)
+    selected_mask = plot_df.get("is_best", pd.Series(False, index=plot_df.index)).astype(bool)
+    selection_meta = selection_result.get("selection_result", {})
+    recommendation = selection_result.get("recommendation", {})
+    metrics = [
+        ("score", "score"),
+        ("smooth_gain", "smooth_gain"),
+        ("edge_preserve", "edge_preserve"),
+        ("tradeoff_product", "tradeoff_product"),
+        ("ratio_low", "ratio_low"),
+        ("ratio_high", "ratio_high"),
+    ]
+    fig, axes = plt.subplots(2, 3, figsize=figsize)
+    axes = axes.ravel()
+    x = plot_df[param_x].to_numpy()
+    for ax, (col, title) in zip(axes, metrics):
+        if col not in plot_df.columns:
+            ax.axis("off")
+            continue
+        y = plot_df[col].to_numpy(dtype=float)
+        if multi_param:
+            ax.scatter(x, y, s=24, alpha=0.7)
+            agg = (
+                plot_df[[param_x, col]]
+                .groupby(param_x, as_index=False)
+                .median()
+                .sort_values(param_x, kind="mergesort")
+            )
+            ax.plot(
+                agg[param_x].to_numpy(dtype=float),
+                agg[col].to_numpy(dtype=float),
+                linewidth=1.5,
+                color="black",
+                alpha=0.8,
+            )
+        else:
+            ax.plot(x, y, marker="o", linewidth=1.5)
+        if np.any(selected_mask):
+            ax.scatter(
+                plot_df.loc[selected_mask, param_x].to_numpy(dtype=float),
+                plot_df.loc[selected_mask, col].to_numpy(dtype=float),
+                c="black",
+                s=40,
+                zorder=5,
+            )
+        ax.set_title(title)
+        ax.set_xlabel(param_x)
+    methods = selection_result.get("best", {}).get("methods", None)
+    fig.suptitle(
+        (
+            f"Smoothing Sweep | methods={methods} | aggregated over {', '.join(v for v in varying if v != param_x)}"
+            if multi_param and methods is not None
+            else (f"Smoothing Sweep | methods={methods}" if methods is not None else "Smoothing Sweep")
+        ),
+        fontsize=14,
+    )
+    if recommendation:
+        summary = recommendation.get("summary", "")
+        sel_mode = selection_meta.get("selection_mode", None)
+        gain_frac = selection_meta.get("select_gain_fraction", None)
+        msg = f"selected: {summary}" if summary else f"selected candidate={recommendation.get('candidate_id')}"
+        if sel_mode == "gain_then_edge":
+            if gain_frac is not None:
+                msg += f"\nrule: edge-preserve best among gain >= {float(gain_frac):.2f} x max_gain"
+            else:
+                msg += "\nrule: gain_then_edge"
+        elif sel_mode:
+            msg += f"\nrule: {sel_mode}"
+        fig.text(
+            0.99,
+            0.01,
+            msg,
+            ha="right",
+            va="bottom",
+            fontsize=9,
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.85, edgecolor="0.7"),
+        )
+    fig.tight_layout()
+    if show:
+        plt.show()
+    return {"fig": fig, "axes": axes, "param_x": param_x}
+
+
+def plot_smoothing_grid(
+    selection_result,
+    *,
+    x: str,
+    y: str,
+    facet: str | None = None,
+    value: str = "tradeoff_product",
+    cmap: str = "viridis",
+    show: bool = True,
+    figsize=None,
+):
+    if not isinstance(selection_result, dict) or "candidates" not in selection_result:
+        raise ValueError("selection_result must be a dict returned by evaluate_smoothing_sweep or tune_smooth_image_params.")
+    df = selection_result["candidates"]
+    if not isinstance(df, pd.DataFrame) or df.shape[0] == 0:
+        raise ValueError("selection_result['candidates'] must be a non-empty DataFrame.")
+    for col in [x, y, value]:
+        if col not in df.columns:
+            raise ValueError(f"Column '{col}' not found in candidates DataFrame.")
+    if facet is not None and facet not in df.columns:
+        raise ValueError(f"Facet column '{facet}' not found in candidates DataFrame.")
+
+    if facet is None:
+        facet_values = [None]
+    else:
+        facet_values = list(pd.unique(df[facet]))
+    n_panels = len(facet_values)
+    ncols = min(4, n_panels)
+    nrows = int(np.ceil(n_panels / ncols))
+    if figsize is None:
+        figsize = (4.5 * ncols, 4.0 * nrows)
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
+    axes_flat = axes.ravel()
+
+    selected = selection_result.get("selection_result", {}).get("selected", None)
+    im_ref = None
+    for i, facet_val in enumerate(facet_values):
+        ax = axes_flat[i]
+        sub = df if facet is None else df[df[facet] == facet_val]
+        pivot = pd.pivot_table(
+            sub,
+            index=y,
+            columns=x,
+            values=value,
+            aggfunc="mean",
+        ).sort_index().sort_index(axis=1)
+        im = ax.imshow(pivot.to_numpy(dtype=float), aspect="auto", origin="lower", cmap=cmap)
+        im_ref = im
+        ax.set_xticks(np.arange(pivot.shape[1]))
+        ax.set_xticklabels([str(v) for v in pivot.columns], rotation=45, ha="right")
+        ax.set_yticks(np.arange(pivot.shape[0]))
+        ax.set_yticklabels([str(v) for v in pivot.index])
+        ax.set_xlabel(x)
+        ax.set_ylabel(y)
+        title = f"{facet}={facet_val}" if facet is not None else value
+        ax.set_title(title)
+
+        if selected is not None:
+            sel_ok = True
+            if facet is not None:
+                sel_ok = selected.get(facet) == facet_val
+            if sel_ok and selected.get(x) in pivot.columns and selected.get(y) in pivot.index:
+                x_idx = list(pivot.columns).index(selected.get(x))
+                y_idx = list(pivot.index).index(selected.get(y))
+                ax.scatter([x_idx], [y_idx], s=120, facecolors="none", edgecolors="white", linewidths=2.0)
+                ax.scatter([x_idx], [y_idx], s=40, c="black", zorder=5)
+
+    for j in range(n_panels, len(axes_flat)):
+        axes_flat[j].axis("off")
+    if im_ref is not None:
+        fig.colorbar(im_ref, ax=axes_flat[:n_panels], shrink=0.9, label=value)
+    rec = selection_result.get("recommendation", None)
+    if rec is not None:
+        fig.suptitle(f"Smoothing Grid | best={rec['params']}", fontsize=13)
+    else:
+        fig.suptitle("Smoothing Grid", fontsize=13)
+    fig.tight_layout()
+    if show:
+        plt.show()
+    return {"fig": fig, "axes": axes, "x": x, "y": y, "facet": facet, "value": value}
+
+
+def fast_select_smoothing(
+    adata,
+    *,
+    embedding: str = "X_embedding",
+    methods=("bilateral",),
+    embedding_dims=None,
+    obs_mask=None,
+    coords=None,
+    approx_mode: str | bool | None = "grid",
+    approx_target_n: int = 20_000,
+    approx_bin=None,
+    approx_max_bins=None,
+    n_dims_eval: int = 3,
+    random_state: int = 0,
+    score_sample_edges: int = 100_000,
+    selection: str = "gain_then_edge",
+    n_jobs=None,
+    candidate_jobs=None,
+    candidate_backend: str = "threads",
+    verbose: bool = True,
+    **kwargs,
+):
+    return evaluate_smoothing_sweep(
+        adata,
+        embedding=embedding,
+        methods=methods,
+        embedding_dims=embedding_dims,
+        obs_mask=obs_mask,
+        coords=coords,
+        approx_mode=approx_mode,
+        approx_target_n=approx_target_n,
+        approx_bin=approx_bin,
+        approx_max_bins=approx_max_bins,
+        n_dims_eval=n_dims_eval,
+        random_state=random_state,
+        score_sample_edges=score_sample_edges,
+        selection=selection,
+        n_jobs=n_jobs,
+        candidate_jobs=candidate_jobs,
+        candidate_backend=candidate_backend,
+        verbose=verbose,
+        **kwargs,
+    )
+
+
 def _process_dimension(
     E_vec,
     methods,
@@ -2428,7 +3544,8 @@ def tune_smooth_image_params(
         # For tuning, compare candidates in the same scale as the final output.
         # `smooth_image(rescale_mode='final')` min-max rescales *after* all methods,
         # so we normalize the baseline as well to make ratios meaningful.
-        if str(rescale_mode).strip().lower() in {"final", "per_step"}:
+        tuning_rescale_mode = str(rescale_mode).strip().lower()
+        if tuning_rescale_mode in {"final", "per_step"}:
             mn0 = E_bins.min(axis=0, keepdims=True)
             mx0 = E_bins.max(axis=0, keepdims=True)
             denom0 = mx0 - mn0
@@ -2533,20 +3650,16 @@ def tune_smooth_image_params(
             for j in range(E0_bins.shape[1]):
                 d0 = np.abs(E0_bins[src, j] - E0_bins[dst, j])
                 d1 = np.abs(E1_bins[src, j] - E1_bins[dst, j])
-                thr_lo = float(np.quantile(d0, score_q_low))
-                thr_hi = float(np.quantile(d0, score_q_high))
-                low_mask = d0 <= thr_lo
-                high_mask = d0 >= thr_hi
-                d0_low = float(d0[low_mask].mean()) if bool(low_mask.any()) else float(d0.mean())
-                d1_low = float(d1[low_mask].mean()) if bool(low_mask.any()) else float(d1.mean())
-                d0_hi = float(d0[high_mask].mean()) if bool(high_mask.any()) else float(d0.mean())
-                d1_hi = float(d1[high_mask].mean()) if bool(high_mask.any()) else float(d1.mean())
-                d0_all = float(d0.mean())
-                d1_all = float(d1.mean())
+                ratios = _stabilized_edge_ratios(
+                    d0,
+                    d1,
+                    q_low=score_q_low,
+                    q_high=score_q_high,
+                )
+                r_low = ratios["ratio_low"]
+                r_hi = ratios["ratio_high"]
+                r_all = ratios["ratio_all"]
                 eps = 1e-12
-                r_low = d1_low / max(eps, d0_low)
-                r_hi = d1_hi / max(eps, d0_hi)
-                r_all = d1_all / max(eps, d0_all)
                 score = (1.0 - r_low) - w_edge_eff * abs(float(np.log(max(eps, r_hi)))) - w_all_eff * abs(
                     float(np.log(max(eps, r_all)))
                 )
@@ -2604,15 +3717,9 @@ def tune_smooth_image_params(
                     1e-4,  # heat_tol (unused unless 'heat' in methods)
                     0,  # heat_min_k (unused)
                     None,  # heat_max_k (unused)
-                    rescale_mode,
+                    "none" if tuning_rescale_mode == "final" else rescale_mode,
                     fast_float32,
                 ).astype(np.float32, copy=False)
-                # Match `smooth_image(rescale_mode='final')`: rescale after all methods.
-                if str(rescale_mode).strip().lower() == "final":
-                    mn = float(out_j.min())
-                    mx = float(out_j.max())
-                    denom = max(1e-12, mx - mn)
-                    out_j = (out_j - mn) / denom
                 E1_cols.append(out_j)
             E1_bins = np.stack(E1_cols, axis=1).astype(np.float32, copy=False)
 
@@ -2631,54 +3738,13 @@ def tune_smooth_image_params(
         df = pd.DataFrame(results)
         if df.shape[0] == 0:
             raise RuntimeError("No candidates evaluated.")
-        df["smooth_gain"] = 1.0 - df["ratio_low"]
-        df["edge_preserve"] = df["ratio_high"]
-        df["tradeoff_product"] = df["smooth_gain"] * df["edge_preserve"]
-
-        # Select "best" without requiring a manual strength knob.
-        if selection_mode == "score":
-            best_id = int(df.sort_values(["score"], ascending=False, kind="mergesort").iloc[0]["candidate_id"])
-        elif selection_mode == "product":
-            best_id = int(
-                df.sort_values(["tradeoff_product"], ascending=False, kind="mergesort").iloc[0]["candidate_id"]
-            )
-        elif selection_mode == "max_gain":
-            keep = np.ones(df.shape[0], dtype=bool)
-            if min_edge_val is not None:
-                keep = keep & (df["edge_preserve"] >= min_edge_val)
-            kept = df[keep]
-            if kept.shape[0] == 0:
-                # Fallback to product objective if constraint is too strict.
-                best_id = int(
-                    df.sort_values(["tradeoff_product"], ascending=False, kind="mergesort").iloc[0]["candidate_id"]
-                )
-            else:
-                best_id = int(
-                    kept.sort_values(["smooth_gain", "edge_preserve", "score"], ascending=[False, False, False], kind="mergesort")
-                    .iloc[0]["candidate_id"]
-                )
-        else:
-            # gain_then_edge:
-            # 1) keep candidates with at least a fraction of the best smoothing gain
-            # 2) among them, choose the one with best edge preservation
-            max_gain = float(df["smooth_gain"].max())
-            gain_thr = select_gain_fraction_val * max_gain
-            keep = df["smooth_gain"] >= gain_thr
-            if min_edge_val is not None:
-                keep = keep & (df["edge_preserve"] >= min_edge_val)
-            kept = df[keep]
-            if kept.shape[0] == 0:
-                # Fallback to product objective (reasonable balance).
-                best_id = int(
-                    df.sort_values(["tradeoff_product"], ascending=False, kind="mergesort").iloc[0]["candidate_id"]
-                )
-            else:
-                kept = kept.sort_values(
-                    ["edge_preserve", "smooth_gain", "score"],
-                    ascending=[False, False, False],
-                    kind="mergesort",
-                )
-                best_id = int(kept.iloc[0]["candidate_id"])
+        df = _finalize_smoothing_scores(df)
+        best_id = _select_best_smoothing_candidate(
+            df,
+            selection_mode=selection_mode,
+            select_gain_fraction_val=select_gain_fraction_val,
+            min_edge_val=min_edge_val,
+        )
 
         df["is_best"] = df["candidate_id"] == int(best_id)
         # Present best first, then by balanced tradeoff.
@@ -2721,6 +3787,7 @@ def tune_smooth_image_params(
                 "n_bins": int(n_bins),
                 "bin_size": float(approx_info.get("bin_size")),
             },
+            "recommendation": _build_smoothing_recommendation(best_row, methods),
         }
     finally:
         if not verbose:

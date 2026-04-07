@@ -2,6 +2,7 @@
 # Full code with alpha-driven draw priority so less transparent (more opaque) spots render on top.
 
 import os
+import re
 import numpy as np
 import pandas as pd
 from pandas.api.types import is_numeric_dtype
@@ -342,6 +343,7 @@ def _plot_boundaries_from_label_image(
     render: str = "contour",  # 'contour'|'raster'
     thickness_px: int = 1,    # used when render='raster'
     antialiased: bool = True, # used when render='contour'
+    include_background: bool = False,
 ):
     """Plot boundaries extracted from a label image.
 
@@ -363,6 +365,8 @@ def _plot_boundaries_from_label_image(
         background=-1,
         connectivity=2,
     )
+    if not include_background:
+        boundary_mask &= (np.asarray(label_img) >= 0)
     render_mode = str(render or "contour").lower()
     if render_mode not in {"contour", "raster"}:
         render_mode = "contour"
@@ -411,6 +415,12 @@ def _plot_boundaries_from_label_image(
         antialiaseds=bool(antialiased),
     )
     ax.add_collection(lc)
+
+
+def _sanitize_segment_key_for_uns(name: str) -> str:
+    sanitized = re.sub(r"[^0-9a-zA-Z_]+", "_", str(name))
+    sanitized = sanitized.strip("_")
+    return sanitized or "Segment"
 
 
 def _resolve_plot_raster_state(
@@ -646,7 +656,9 @@ def _rasterize_rgba_and_label_buffer(
                         if label_img is not None:
                             label_img[py[mask_upd], px[mask_upd]] = label_codes_arr[i:end][mask_upd]
 
-    if runtime_fill_from_boundary:
+    fill_active = bool(runtime_fill_from_boundary) or bool(runtime_fill_holes)
+    fill_radius = int(runtime_fill_closing_radius) if bool(runtime_fill_from_boundary) else 0
+    if fill_active:
         seed_rgba = np.empty((cols_arr.shape[0], 4), dtype=np.float32)
         seed_rgba[:, :3] = cols_arr
         if alpha_chunk is not None:
@@ -659,7 +671,7 @@ def _rasterize_rgba_and_label_buffer(
             seed_x=cx_arr,
             seed_y=cy_arr,
             seed_values=seed_rgba,
-            closing_radius=int(runtime_fill_closing_radius),
+            closing_radius=int(fill_radius),
             fill_holes=bool(runtime_fill_holes),
             logger=logger if verbose else None,
             context=context,
@@ -672,12 +684,14 @@ def _rasterize_rgba_and_label_buffer(
                 seed_x=cx_arr,
                 seed_y=cy_arr,
                 seed_values=label_codes_arr.astype(np.float32, copy=False)[:, None],
-                closing_radius=int(runtime_fill_closing_radius),
+                closing_radius=int(fill_radius),
                 fill_holes=bool(runtime_fill_holes),
                 logger=logger if verbose else None,
                 context=f"{context}(label_img)",
             )
             label_img = np.rint(label_img_fill[..., 0]).astype(int, copy=False)
+    if label_img is not None:
+        label_img[~paint_mask] = -1
 
     return img, label_img, paint_mask
 
@@ -696,11 +710,11 @@ def image_plot(
     imshow_tile_size_quantile=None,
     imshow_tile_size_rounding="floor",
     imshow_tile_size_shrink=0.98,
-    pixel_perfect: bool = True,
+    pixel_perfect: bool = False,
     origin=True,
     plot_boundaries=False,  # Toggle for plotting boundaries
-    boundary_method="convex_hull",  # Options: 'convex_hull', 'alphashape', 'oriented_bbox', 'concave_hull', 'pixel'
-    alpha=0.3,  # Transparency of boundaries (not per-spot alpha)
+    boundary_method="pixel",  # Options: 'convex_hull', 'alphashape', 'oriented_bbox', 'concave_hull', 'pixel'
+    alpha=1.0,  # Transparency of boundaries (not per-spot alpha)
     boundary_color="black",  # Default boundary color (if using a fixed color)
     boundary_linewidth=1.0,  # Line width of boundaries
     aspect_ratio_threshold=3.0,  # Threshold to determine if a segment is elongated
@@ -730,6 +744,7 @@ def image_plot(
     pixel_boundary_render: str = "contour",  # 'contour'|'raster'
     pixel_boundary_thickness_px: int = 1,    # used when pixel_boundary_render='raster'
     pixel_boundary_antialiased: bool = True, # used when pixel_boundary_render='contour'
+    pixel_boundary_include_background: bool = False,
     use_imshow=True,  # When True, render points as an image for speed
     pixel_shape="square",  # 'square' (default) or 'circle'
     chunk_size=50000,  # Control chunking
@@ -936,7 +951,6 @@ def image_plot(
             coord_mode = "visiumhd"
         else:
             coord_mode = "spatial"
-
     fast_continuous_rgb = bool(
         use_imshow
         and (color_by is None)
@@ -1068,8 +1082,10 @@ def image_plot(
                 if step is not None:
                     t_grid = perf_counter()
                     xi0, yi0, w0, h0, x0_int, y0_int = _coords_to_grid_indices(x_plot, y_plot, step=step)
-                    max_raster_px = int(os.environ.get("SPIX_PLOT_MAX_RASTER_PIXELS", "25000000"))
-                    max_raster_px = max(1, max_raster_px)
+                    max_raster_px = _raster.resolve_max_raster_pixels(
+                        env_key="SPIX_PLOT_MAX_RASTER_PIXELS",
+                        n_points=len(x_plot),
+                    )
                     total0 = int(w0) * int(h0)
                     ds = int(max(1, int(np.ceil(np.sqrt(float(total0) / float(max_raster_px))))))
                     xi = (xi0 // ds).astype(np.int64, copy=False)
@@ -1224,7 +1240,9 @@ def image_plot(
                 img[all_y, all_x, 3] = 1.0
                 paint_mask[all_y, all_x] = True
 
-        if runtime_fill_from_boundary:
+        fill_active = bool(runtime_fill_from_boundary) or bool(runtime_fill_holes)
+        fill_radius = int(runtime_fill_closing_radius) if bool(runtime_fill_from_boundary) else 0
+        if fill_active:
             seed_rgba = np.empty((cols.shape[0], 4), dtype=np.float32)
             seed_rgba[:, :3] = cols.astype(np.float32, copy=False)
             seed_rgba[:, 3] = 1.0
@@ -1234,7 +1252,7 @@ def image_plot(
                 seed_x=cx,
                 seed_y=cy,
                 seed_values=seed_rgba,
-                closing_radius=int(runtime_fill_closing_radius),
+                closing_radius=int(fill_radius),
                 fill_holes=bool(runtime_fill_holes),
                 logger=logger if verbose else None,
                 context="image_plot",
@@ -1642,6 +1660,18 @@ def image_plot(
     color_for_pixel = (
         fixed_boundary_color if fixed_boundary_color is not None else boundary_color
     )
+    stored_pixel_boundary = None
+    if segment_available and plot_boundaries and boundary_method == "pixel":
+        seg_uns_key = f"{_sanitize_segment_key_for_uns(seg_col or segment_key)}_pixel_boundary"
+        candidate_payload = adata.uns.get(seg_uns_key, None)
+        if isinstance(candidate_payload, dict):
+            try:
+                if bool(candidate_payload.get("origin", origin)) == bool(origin):
+                    stored_pixel_boundary = candidate_payload
+                    if verbose:
+                        logger.info("image_plot: using stored pixel boundary payload from adata.uns['%s'].", seg_uns_key)
+            except Exception:
+                stored_pixel_boundary = None
 
     if segment_available:
         # Normalize highlight_segments input
@@ -1697,8 +1727,10 @@ def image_plot(
                     t_grid = perf_counter()
                     xi0, yi0, w0, h0, x0_int, y0_int = _coords_to_grid_indices(x, y, step=step)
 
-                    max_raster_px = int(os.environ.get("SPIX_PLOT_MAX_RASTER_PIXELS", "25000000"))
-                    max_raster_px = max(1, max_raster_px)
+                    max_raster_px = _raster.resolve_max_raster_pixels(
+                        env_key="SPIX_PLOT_MAX_RASTER_PIXELS",
+                        n_points=len(x),
+                    )
                     total0 = int(w0) * int(h0)
                     ds = int(max(1, int(np.ceil(np.sqrt(float(total0) / float(max_raster_px))))))
                     xi = (xi0 // ds).astype(np.int64, copy=False)
@@ -1752,6 +1784,12 @@ def image_plot(
             imshow_tile_size_eff = 1.0
         raster_canvas = raster_canvas_for_imshow
         if raster_canvas is None:
+            raster_context = "image_plot(pixel-boundary)" if (plot_boundaries and boundary_method == "pixel") else "image_plot"
+            raster_context = (
+                "image_plot_with_spatial_image(pixel-boundary)"
+                if (plot_boundaries and boundary_method == "pixel")
+                else "image_plot_with_spatial_image"
+            )
             raster_canvas = _raster.resolve_raster_canvas(
                 pts=pts,
                 x_min=float(x_min),
@@ -1769,7 +1807,7 @@ def image_plot(
                 pixel_perfect=bool(pixel_perfect),
                 n_points=int(n_points_eff),
                 logger=logger,
-                context="image_plot",
+                context=raster_context,
             )
         s_data_units = float(raster_canvas["s_data_units"])
         x_min_eff = float(raster_canvas["x_min_eff"])
@@ -1867,8 +1905,16 @@ def image_plot(
         img = np.zeros((h, w, 4), dtype=np.float32)  # start fully transparent
         paint_mask = np.zeros((h, w), dtype=bool)
         value_buf = np.full((h, w), -np.inf, dtype=float)
+        use_stored_boundary_labels = stored_pixel_boundary is not None
         label_img = None
-        if plot_boundaries and boundary_method == "pixel" and segment_available:
+        if use_stored_boundary_labels:
+            label_img = np.asarray(stored_pixel_boundary.get("label_img"), dtype=int)
+            stored_support_mask = stored_pixel_boundary.get("support_mask", None)
+            if stored_support_mask is not None:
+                stored_support_mask = np.asarray(stored_support_mask, dtype=bool)
+                if stored_support_mask.shape == label_img.shape:
+                    label_img = np.where(stored_support_mask, label_img, -1)
+        elif plot_boundaries and boundary_method == "pixel" and segment_available:
             label_img = np.full((h, w), -1, dtype=int)
             seg_codes = pd.Categorical(coordinates_df["Segment"]).codes
 
@@ -1900,7 +1946,7 @@ def image_plot(
                 chunk_size=int(chunk_n),
                 background_value=None,
             )
-            if label_img is not None:
+            if label_img is not None and (not use_stored_boundary_labels):
                 for i in range(0, len(cx), chunk_n):
                     end = min(i + chunk_n, len(cx))
                     x0, y0, x1, y1, w00, w10, w01, w11 = _raster.bilinear_support_from_centers(
@@ -1936,7 +1982,7 @@ def image_plot(
                     else:
                         img[all_y, all_x, 3] = 1.0
                     paint_mask[all_y, all_x] = True
-                    if label_img is not None:
+                    if label_img is not None and (not use_stored_boundary_labels):
                         label_img[all_y, all_x] = np.repeat(seg_codes[i:end], pixels_per_tile, axis=0)
                 else:
                     # Slow path: depth buffer / draw priority.
@@ -1951,10 +1997,12 @@ def image_plot(
                             )
                             value_buf[py[mask_upd], px[mask_upd]] = chunk_vals[mask_upd]
                             paint_mask[py[mask_upd], px[mask_upd]] = True
-                            if label_img is not None:
+                            if label_img is not None and (not use_stored_boundary_labels):
                                 label_img[py[mask_upd], px[mask_upd]] = seg_codes[i:end][mask_upd]
 
-        if runtime_fill_from_boundary:
+        fill_active = bool(runtime_fill_from_boundary) or bool(runtime_fill_holes)
+        fill_radius = int(runtime_fill_closing_radius) if bool(runtime_fill_from_boundary) else 0
+        if fill_active:
             seed_rgba = np.empty((cols.shape[0], 4), dtype=np.float32)
             seed_rgba[:, :3] = cols.astype(np.float32, copy=False)
             if alpha_arr is not None:
@@ -1967,12 +2015,12 @@ def image_plot(
                 seed_x=cx,
                 seed_y=cy,
                 seed_values=seed_rgba,
-                closing_radius=int(runtime_fill_closing_radius),
+                closing_radius=int(fill_radius),
                 fill_holes=bool(runtime_fill_holes),
                 logger=logger if verbose else None,
                 context="image_plot",
             )
-            if label_img is not None:
+            if label_img is not None and (not use_stored_boundary_labels):
                 label_img_fill = label_img.astype(np.float32, copy=True)[..., None]
                 _raster.fill_raster_from_boundary(
                     img=label_img_fill,
@@ -1980,12 +2028,14 @@ def image_plot(
                     seed_x=cx,
                     seed_y=cy,
                     seed_values=seg_codes.astype(np.float32, copy=False)[:, None],
-                    closing_radius=int(runtime_fill_closing_radius),
+                    closing_radius=int(fill_radius),
                     fill_holes=bool(runtime_fill_holes),
                     logger=logger if verbose else None,
                     context="image_plot(label_img)",
                 )
                 label_img = np.rint(label_img_fill[..., 0]).astype(int, copy=False)
+        if label_img is not None and (not use_stored_boundary_labels):
+            label_img[~paint_mask] = -1
         if verbose and collision_info is not None:
             logger.info(
                 "image_plot: center collision fraction %.4f -> %.4f.",
@@ -2110,10 +2160,20 @@ def image_plot(
                     angle += theta
 
         if label_img is not None:
+            boundary_extent = (
+                [
+                    float(stored_pixel_boundary.get("x_min_eff", x_min_eff)),
+                    float(stored_pixel_boundary.get("x_max_eff", x_max_eff)),
+                    float(stored_pixel_boundary.get("y_min_eff", y_min_eff)),
+                    float(stored_pixel_boundary.get("y_max_eff", y_max_eff)),
+                ]
+                if stored_pixel_boundary is not None
+                else [x_min_eff, x_max_eff, y_min_eff, y_max_eff]
+            )
             _plot_boundaries_from_label_image(
                 ax,
                 label_img,
-                [x_min_eff, x_max_eff, y_min_eff, y_max_eff],
+                boundary_extent,
                 color_for_pixel,
                 boundary_linewidth,
                 alpha,
@@ -2122,6 +2182,7 @@ def image_plot(
                 render=pixel_boundary_render,
                 thickness_px=pixel_boundary_thickness_px,
                 antialiased=pixel_boundary_antialiased,
+                include_background=bool(pixel_boundary_include_background),
             )
             if highlight_segments:
                 categories = pd.Categorical(coordinates_df["Segment"]).categories
@@ -2146,7 +2207,7 @@ def image_plot(
                         _plot_boundaries_from_label_image(
                             ax,
                             highlight_label_img,
-                            [x_min_eff, x_max_eff, y_min_eff, y_max_eff],
+                            boundary_extent,
                             highlight_col,
                             highlight_linewidth,
                             alpha,
@@ -2155,6 +2216,7 @@ def image_plot(
                             render=pixel_boundary_render,
                             thickness_px=pixel_boundary_thickness_px,
                             antialiased=pixel_boundary_antialiased,
+                            include_background=bool(pixel_boundary_include_background),
                         )
 
     else:
@@ -2309,6 +2371,7 @@ def image_plot(
                 render=pixel_boundary_render,
                 thickness_px=pixel_boundary_thickness_px,
                 antialiased=pixel_boundary_antialiased,
+                include_background=bool(pixel_boundary_include_background),
             )
 
             if highlight_segments:
@@ -2343,6 +2406,7 @@ def image_plot(
                             render=pixel_boundary_render,
                             thickness_px=pixel_boundary_thickness_px,
                             antialiased=pixel_boundary_antialiased,
+                            include_background=bool(pixel_boundary_include_background),
                         )
 
     ax.set_aspect("equal")
@@ -2727,11 +2791,11 @@ def image_plot_with_spatial_image(
     imshow_tile_size_quantile=None,
     imshow_tile_size_rounding="floor",
     imshow_tile_size_shrink=0.98,
-    pixel_perfect: bool = True,
+    pixel_perfect: bool = False,
     origin=True,
     plot_boundaries=False,
-    boundary_method="convex_hull",
-    alpha=0.3,            # boundary alpha (not per-spot)
+    boundary_method="pixel",
+    alpha=1.0,            # boundary alpha (not per-spot)
     alpha_point=1.0,      # default per-spot alpha when alpha_by is None (scatter/imshow path)
     boundary_color="black",
     boundary_linewidth=1.0,
@@ -2774,6 +2838,7 @@ def image_plot_with_spatial_image(
     pixel_boundary_render: str = "contour",  # 'contour'|'raster'
     pixel_boundary_thickness_px: int = 1,    # used when pixel_boundary_render='raster'
     pixel_boundary_antialiased: bool = True, # used when pixel_boundary_render='contour'
+    pixel_boundary_include_background: bool = False,
     use_imshow=True,
     pixel_shape="square",
     chunk_size=50000,
@@ -3334,6 +3399,22 @@ def image_plot_with_spatial_image(
         if highlight_linewidth is None:
             highlight_linewidth = boundary_linewidth * 2
 
+    stored_pixel_boundary = None
+    if segment_available and plot_boundaries and boundary_method == "pixel":
+        seg_uns_key = f"{_sanitize_segment_key_for_uns(seg_col or segment_key)}_pixel_boundary"
+        candidate_payload = adata.uns.get(seg_uns_key, None)
+        if isinstance(candidate_payload, dict):
+            try:
+                if bool(candidate_payload.get("origin", origin)) == bool(origin):
+                    stored_pixel_boundary = candidate_payload
+                    if verbose:
+                        logger.info(
+                            "image_plot_with_spatial_image: using stored pixel boundary payload from adata.uns['%s'].",
+                            seg_uns_key,
+                        )
+            except Exception:
+                stored_pixel_boundary = None
+
     orientation = str(display_orientation or "image").lower()
     if orientation not in {"image", "cartesian"}:
         orientation = "image"
@@ -3410,8 +3491,10 @@ def image_plot_with_spatial_image(
                     t_grid = perf_counter()
                     xi0, yi0, w0, h0, x0_int, y0_int = _coords_to_grid_indices(x, y, step=step)
 
-                    max_raster_px = int(os.environ.get("SPIX_PLOT_MAX_RASTER_PIXELS", "25000000"))
-                    max_raster_px = max(1, max_raster_px)
+                    max_raster_px = _raster.resolve_max_raster_pixels(
+                        env_key="SPIX_PLOT_MAX_RASTER_PIXELS",
+                        n_points=len(x),
+                    )
                     total0 = int(w0) * int(h0)
                     ds = int(max(1, int(np.ceil(np.sqrt(float(total0) / float(max_raster_px))))))
                     xi = (xi0 // ds).astype(np.int64, copy=False)
@@ -3481,7 +3564,7 @@ def image_plot_with_spatial_image(
                 pixel_perfect=bool(pixel_perfect),
                 n_points=int(n_points_eff),
                 logger=logger,
-                context="image_plot_with_spatial_image",
+                context=raster_context,
             )
         s_data_units = float(raster_canvas["s_data_units"])
         x_min_eff = float(raster_canvas["x_min_eff"])
@@ -3526,7 +3609,8 @@ def image_plot_with_spatial_image(
             logger.info("Scaled tile size (in pixels): %d", int(s))
 
         seg_codes = None
-        if plot_boundaries and boundary_method == "pixel" and segment_available:
+        use_stored_boundary_labels = stored_pixel_boundary is not None
+        if (not use_stored_boundary_labels) and plot_boundaries and boundary_method == "pixel" and segment_available:
             seg_source = coordinates["Segment"] if "Segment" in coordinates.columns else coordinates_df["Segment"]
             seg_codes = pd.Categorical(seg_source).codes
 
@@ -3554,6 +3638,13 @@ def image_plot_with_spatial_image(
             verbose=verbose,
             context="image_plot_with_spatial_image",
         )
+        if use_stored_boundary_labels:
+            label_img = np.asarray(stored_pixel_boundary.get("label_img"), dtype=int)
+            stored_support_mask = stored_pixel_boundary.get("support_mask", None)
+            if stored_support_mask is not None:
+                stored_support_mask = np.asarray(stored_support_mask, dtype=bool)
+                if stored_support_mask.shape == label_img.shape:
+                    label_img = np.where(stored_support_mask, label_img, -1)
         if verbose and raster_state["collision_info"] is not None:
             logger.info(
                 "image_plot_with_spatial_image: center collision fraction %.4f -> %.4f.",
@@ -3570,10 +3661,20 @@ def image_plot_with_spatial_image(
         if verbose:
             logger.info("image_plot_with_spatial_image total time: %.3fs", perf_counter() - t_all)
         if label_img is not None:
+            boundary_extent = (
+                [
+                    float(stored_pixel_boundary.get("x_min_eff", x_min_eff)),
+                    float(stored_pixel_boundary.get("x_max_eff", x_max_eff)),
+                    float(stored_pixel_boundary.get("y_min_eff", y_min_eff)),
+                    float(stored_pixel_boundary.get("y_max_eff", y_max_eff)),
+                ]
+                if stored_pixel_boundary is not None
+                else [x_min_eff, x_max_eff, y_min_eff, y_max_eff]
+            )
             _plot_boundaries_from_label_image(
                 ax,
                 label_img,
-                [x_min_eff, x_max_eff, y_min_eff, y_max_eff],
+                boundary_extent,
                 color_for_pixel,
                 boundary_linewidth,
                 alpha,
@@ -3582,6 +3683,7 @@ def image_plot_with_spatial_image(
                 render=pixel_boundary_render,
                 thickness_px=pixel_boundary_thickness_px,
                 antialiased=pixel_boundary_antialiased,
+                include_background=bool(pixel_boundary_include_background),
             )
 
     else:
@@ -3661,91 +3763,120 @@ def image_plot_with_spatial_image(
 
         # Pixel boundary extraction for scatter
         if plot_boundaries and boundary_method == "pixel" and segment_available:
-            pts = coordinates[["x", "y"]].values
-            raster_canvas_scatter = _raster.resolve_raster_canvas(
-                pts=pts,
-                x_min=float(x_min),
-                x_max=float(x_max),
-                y_min=float(y_min),
-                y_max=float(y_max),
-                figsize=figsize,
-                fig_dpi=fig.get_dpi(),
-                imshow_tile_size=imshow_tile_size,
-                imshow_scale_factor=imshow_scale_factor,
-                imshow_tile_size_mode=imshow_tile_size_mode,
-                imshow_tile_size_quantile=imshow_tile_size_quantile,
-                imshow_tile_size_rounding=imshow_tile_size_rounding,
-                imshow_tile_size_shrink=imshow_tile_size_shrink,
-                pixel_perfect=bool(pixel_perfect),
-                n_points=int(len(pts)),
-                logger=logger if verbose else None,
-                context="image_plot_with_spatial_image(scatter-boundaries)",
-            )
-            raster_state = _resolve_plot_raster_state(
-                pts,
-                x_min_eff=float(raster_canvas_scatter["x_min_eff"]),
-                x_max_eff=float(raster_canvas_scatter["x_max_eff"]),
-                y_min_eff=float(raster_canvas_scatter["y_min_eff"]),
-                y_max_eff=float(raster_canvas_scatter["y_max_eff"]),
-                scale=float(raster_canvas_scatter["scale"]),
-                s=int(raster_canvas_scatter["tile_px"]),
-                w=int(raster_canvas_scatter["w"]),
-                h=int(raster_canvas_scatter["h"]),
-                pixel_perfect=bool(pixel_perfect),
-                pixel_shape=pixel_shape,
-                coord_mode=coord_mode,
-                soft_rasterization=soft_rasterization,
-                resolve_center_collisions=resolve_center_collisions,
-                center_collision_radius=center_collision_radius,
-                logger=logger,
-                verbose=verbose,
-                context="image_plot_with_spatial_image(scatter-boundaries)",
-            )
-            seg_source = coordinates["Segment"] if "Segment" in coordinates.columns else coordinates_df["Segment"]
-            seg_codes = pd.Categorical(seg_source).codes
-            _, label_img, _ = _rasterize_rgba_and_label_buffer(
-                cols=np.zeros((len(pts), 3), dtype=np.float32),
-                cx=raster_state["cx"],
-                cy=raster_state["cy"],
-                w=int(raster_state["w"]),
-                h=int(raster_state["h"]),
-                s=int(raster_state["s"]),
-                pixel_shape=pixel_shape,
-                alpha_arr=None,
-                alpha_point=1.0,
-                vals=vals,
-                prioritize_high_values=bool(prioritize_high_values),
-                soft_enabled=bool(raster_state["soft_enabled"]),
-                soft_fx=raster_state["soft_fx"],
-                soft_fy=raster_state["soft_fy"],
-                label_codes=seg_codes,
-                runtime_fill_from_boundary=bool(runtime_fill_from_boundary),
-                runtime_fill_closing_radius=int(runtime_fill_closing_radius),
-                runtime_fill_holes=bool(runtime_fill_holes),
-                chunk_size=int(chunk_size),
-                logger=logger,
-                verbose=verbose,
-                context="image_plot_with_spatial_image(scatter-boundaries)",
-            )
+            if stored_pixel_boundary is not None:
+                label_img = np.asarray(stored_pixel_boundary.get("label_img"), dtype=int)
+                stored_support_mask = stored_pixel_boundary.get("support_mask", None)
+                if stored_support_mask is not None:
+                    stored_support_mask = np.asarray(stored_support_mask, dtype=bool)
+                    if stored_support_mask.shape == label_img.shape:
+                        label_img = np.where(stored_support_mask, label_img, -1)
+                boundary_extent = [
+                    float(stored_pixel_boundary.get("x_min_eff", x_min)),
+                    float(stored_pixel_boundary.get("x_max_eff", x_max)),
+                    float(stored_pixel_boundary.get("y_min_eff", y_min)),
+                    float(stored_pixel_boundary.get("y_max_eff", y_max)),
+                ]
+                _plot_boundaries_from_label_image(
+                    ax,
+                    label_img,
+                    boundary_extent,
+                    color_for_pixel,
+                    boundary_linewidth,
+                    alpha,
+                    linestyle,
+                    pixel_smoothing_sigma,
+                    render=pixel_boundary_render,
+                    thickness_px=pixel_boundary_thickness_px,
+                    antialiased=pixel_boundary_antialiased,
+                    include_background=bool(pixel_boundary_include_background),
+                )
+            else:
+                pts = coordinates[["x", "y"]].values
+                raster_canvas_scatter = _raster.resolve_raster_canvas(
+                    pts=pts,
+                    x_min=float(x_min),
+                    x_max=float(x_max),
+                    y_min=float(y_min),
+                    y_max=float(y_max),
+                    figsize=figsize,
+                    fig_dpi=fig.get_dpi(),
+                    imshow_tile_size=imshow_tile_size,
+                    imshow_scale_factor=imshow_scale_factor,
+                    imshow_tile_size_mode=imshow_tile_size_mode,
+                    imshow_tile_size_quantile=imshow_tile_size_quantile,
+                    imshow_tile_size_rounding=imshow_tile_size_rounding,
+                    imshow_tile_size_shrink=imshow_tile_size_shrink,
+                    pixel_perfect=bool(pixel_perfect),
+                    n_points=int(len(pts)),
+                    logger=logger if verbose else None,
+                    context="image_plot_with_spatial_image(scatter-boundaries)",
+                )
+                raster_state = _resolve_plot_raster_state(
+                    pts,
+                    x_min_eff=float(raster_canvas_scatter["x_min_eff"]),
+                    x_max_eff=float(raster_canvas_scatter["x_max_eff"]),
+                    y_min_eff=float(raster_canvas_scatter["y_min_eff"]),
+                    y_max_eff=float(raster_canvas_scatter["y_max_eff"]),
+                    scale=float(raster_canvas_scatter["scale"]),
+                    s=int(raster_canvas_scatter["tile_px"]),
+                    w=int(raster_canvas_scatter["w"]),
+                    h=int(raster_canvas_scatter["h"]),
+                    pixel_perfect=bool(pixel_perfect),
+                    pixel_shape=pixel_shape,
+                    coord_mode=coord_mode,
+                    soft_rasterization=soft_rasterization,
+                    resolve_center_collisions=resolve_center_collisions,
+                    center_collision_radius=center_collision_radius,
+                    logger=logger,
+                    verbose=verbose,
+                    context="image_plot_with_spatial_image(scatter-boundaries)",
+                )
+                seg_source = coordinates["Segment"] if "Segment" in coordinates.columns else coordinates_df["Segment"]
+                seg_codes = pd.Categorical(seg_source).codes
+                _, label_img, _ = _rasterize_rgba_and_label_buffer(
+                    cols=np.zeros((len(pts), 3), dtype=np.float32),
+                    cx=raster_state["cx"],
+                    cy=raster_state["cy"],
+                    w=int(raster_state["w"]),
+                    h=int(raster_state["h"]),
+                    s=int(raster_state["s"]),
+                    pixel_shape=pixel_shape,
+                    alpha_arr=None,
+                    alpha_point=1.0,
+                    vals=vals,
+                    prioritize_high_values=bool(prioritize_high_values),
+                    soft_enabled=bool(raster_state["soft_enabled"]),
+                    soft_fx=raster_state["soft_fx"],
+                    soft_fy=raster_state["soft_fy"],
+                    label_codes=seg_codes,
+                    runtime_fill_from_boundary=bool(runtime_fill_from_boundary),
+                    runtime_fill_closing_radius=int(runtime_fill_closing_radius),
+                    runtime_fill_holes=bool(runtime_fill_holes),
+                    chunk_size=int(chunk_size),
+                    logger=logger,
+                    verbose=verbose,
+                    context="image_plot_with_spatial_image(scatter-boundaries)",
+                )
 
-            _plot_boundaries_from_label_image(
-                ax,
-                label_img,
-                [
-                    float(raster_state["x_min_eff"]),
-                    float(raster_state["x_max_eff"]),
-                    float(raster_state["y_min_eff"]),
-                    float(raster_state["y_max_eff"]),
-                ],
-                color_for_pixel,
-                boundary_linewidth,
-                alpha,
-                linestyle,
-                pixel_smoothing_sigma,
-                render=pixel_boundary_render,
-                thickness_px=pixel_boundary_thickness_px,
-                antialiased=pixel_boundary_antialiased,
-            )
+                _plot_boundaries_from_label_image(
+                    ax,
+                    label_img,
+                    [
+                        float(raster_state["x_min_eff"]),
+                        float(raster_state["x_max_eff"]),
+                        float(raster_state["y_min_eff"]),
+                        float(raster_state["y_max_eff"]),
+                    ],
+                    color_for_pixel,
+                    boundary_linewidth,
+                    alpha,
+                    linestyle,
+                    pixel_smoothing_sigma,
+                    render=pixel_boundary_render,
+                    thickness_px=pixel_boundary_thickness_px,
+                    antialiased=pixel_boundary_antialiased,
+                    include_background=bool(pixel_boundary_include_background),
+                )
 
     # Non-pixel boundary methods (parity with `image_plot`)
     if segment_available and plot_boundaries and boundary_method != "pixel":
@@ -3968,3 +4099,11 @@ def image_plot_with_spatial_image(
 
     plt.show()
     # Do not return plot object to avoid auto display
+    coord_mode = str(coordinate_mode or "spatial").lower()
+    if coord_mode not in {"spatial", "array", "visium", "visiumhd", "auto"}:
+        coord_mode = "spatial"
+    if coord_mode == "auto":
+        if origin and (array_row_key in adata.obs.columns) and (array_col_key in adata.obs.columns) and int(adata.n_obs) >= 200_000:
+            coord_mode = "visiumhd"
+        else:
+            coord_mode = "spatial"

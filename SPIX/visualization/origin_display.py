@@ -21,6 +21,7 @@ from .plotting import (
     _rasterize_rgba_and_label_buffer,
     _rebalance_color_array,
     _resolve_plot_raster_state,
+    _sanitize_segment_key_for_uns,
     _string_array_no_copy,
     _string_index_no_copy,
 )
@@ -248,14 +249,17 @@ def overlay_segment_boundaries_on_display(
     coordinates_df: pd.DataFrame,
     *,
     segment_key: str,
+    stored_boundary_payload: dict | None = None,
+    stored_boundary_scale: float = 1.0,
     boundary_color: str = "black",
     boundary_linewidth: float = 1.0,
-    boundary_alpha: float = 0.9,
+    boundary_alpha: float = 1.0,
     boundary_style: str = "solid",
     pixel_smoothing_sigma: float = 0.0,
     pixel_boundary_render: str = "contour",
     pixel_boundary_thickness_px: int = 1,
     pixel_boundary_antialiased: bool = True,
+    pixel_boundary_include_background: bool = False,
     figsize=(10, 10),
     fig_dpi: float = 100.0,
     imshow_tile_size=None,
@@ -264,7 +268,7 @@ def overlay_segment_boundaries_on_display(
     imshow_tile_size_quantile=None,
     imshow_tile_size_rounding: str = "floor",
     imshow_tile_size_shrink: float = 0.98,
-    pixel_perfect: bool = True,
+    pixel_perfect: bool = False,
     pixel_shape: str = "square",
     chunk_size: int = 50000,
     neighborhood_fill_px: int | None = None,
@@ -277,6 +281,37 @@ def overlay_segment_boundaries_on_display(
     xlim=None,
     ylim=None,
 ):
+    if stored_boundary_payload is not None:
+        label_img = np.asarray(stored_boundary_payload.get("label_img"), dtype=np.int32)
+        stored_support_mask = stored_boundary_payload.get("support_mask", None)
+        if stored_support_mask is not None:
+            stored_support_mask = np.asarray(stored_support_mask, dtype=bool)
+            if stored_support_mask.shape == label_img.shape:
+                label_img = np.where(stored_support_mask, label_img, -1)
+        extent = [
+            float(stored_boundary_payload.get("x_min_eff", 0.0)) * float(stored_boundary_scale),
+            float(stored_boundary_payload.get("x_max_eff", float(label_img.shape[1]))) * float(stored_boundary_scale),
+            float(stored_boundary_payload.get("y_min_eff", 0.0)) * float(stored_boundary_scale),
+            float(stored_boundary_payload.get("y_max_eff", float(label_img.shape[0]))) * float(stored_boundary_scale),
+        ]
+        linestyle = {"solid": "-", "dashed": "--", "dotted": ":"}.get(boundary_style, "-")
+        _plot_boundaries_from_label_image(
+            ax,
+            label_img,
+            extent,
+            boundary_color,
+            boundary_linewidth,
+            boundary_alpha,
+            linestyle,
+            pixel_smoothing_sigma,
+            render=pixel_boundary_render,
+            thickness_px=pixel_boundary_thickness_px,
+            antialiased=pixel_boundary_antialiased,
+            include_background=bool(pixel_boundary_include_background),
+        )
+        _apply_axis_crop(ax, xlim=xlim, ylim=ylim)
+        return
+
     if segment_key not in coordinates_df.columns:
         raise ValueError(f"'{segment_key}' must be present in coordinates_df.")
 
@@ -361,11 +396,12 @@ def overlay_segment_boundaries_on_display(
     )
 
     occupied = label_img >= 0
+    fill_active = bool(runtime_fill_from_boundary) or bool(runtime_fill_holes)
     if neighborhood_fill_px is None:
-        fill_px = 0 if runtime_fill_from_boundary else max(2, int(np.ceil(max(1, int(raster_state["s"])) * 0.75)))
+        fill_px = 0 if fill_active else max(2, int(np.ceil(max(1, int(raster_state["s"])) * 0.75)))
     else:
         fill_px = int(max(0, neighborhood_fill_px))
-    if (not runtime_fill_from_boundary) and fill_px > 0 and np.any(occupied):
+    if (not fill_active) and fill_px > 0 and np.any(occupied):
         neighborhood = binary_dilation(occupied, iterations=fill_px)
         missing = neighborhood & (label_img < 0)
         if np.any(missing):
@@ -399,6 +435,7 @@ def overlay_segment_boundaries_on_display(
             render=pixel_boundary_render,
             thickness_px=pixel_boundary_thickness_px,
             antialiased=pixel_boundary_antialiased,
+            include_background=bool(pixel_boundary_include_background),
         )
     _apply_axis_crop(ax, xlim=xlim, ylim=ylim)
 
@@ -418,7 +455,7 @@ def image_plot_with_spatial_image_display_boundaries(
     imshow_tile_size_quantile=None,
     imshow_tile_size_rounding="floor",
     imshow_tile_size_shrink=0.98,
-    pixel_perfect: bool = True,
+    pixel_perfect: bool = False,
     origin=True,
     segment_key="Segment",
     boundary_alpha=0.9,
@@ -435,6 +472,8 @@ def image_plot_with_spatial_image_display_boundaries(
     bw=False,
     boundary_style="solid",
     cmap=None,
+    brighten_continuous: bool = False,
+    continuous_gamma: float = 0.8,
     rebalance_method: str = "minmax",
     rebalance_vmin=None,
     rebalance_vmax=None,
@@ -445,6 +484,7 @@ def image_plot_with_spatial_image_display_boundaries(
     pixel_boundary_render: str = "contour",
     pixel_boundary_thickness_px: int = 1,
     pixel_boundary_antialiased: bool = True,
+    pixel_boundary_include_background: bool = False,
     use_imshow=True,
     pixel_shape="square",
     chunk_size=50000,
@@ -500,8 +540,85 @@ def image_plot_with_spatial_image_display_boundaries(
     if len(dimensions) not in [1, 3]:
         raise ValueError("Visualization requires 1D or 3D embeddings.")
 
-    library_id, spatial_data = _check_spatial_data(adata.uns, library_id)
     suppress_img = (img is False) or (img_key is False)
+    if suppress_img and show:
+        from .plotting import image_plot as _image_plot
+
+        if verbose:
+            logger.info(
+                "image_plot_with_spatial_image_display_boundaries: img=False, delegating to image_plot(..., plot_boundaries=True, boundary_method='pixel')."
+            )
+
+        return _image_plot(
+            adata,
+            dimensions=dimensions,
+            embedding=embedding,
+            figsize=figsize,
+            fig_dpi=fig_dpi,
+            point_size=point_size,
+            scaling_factor=scaling_factor,
+            imshow_tile_size=imshow_tile_size,
+            imshow_scale_factor=imshow_scale_factor,
+            imshow_tile_size_mode=imshow_tile_size_mode,
+            imshow_tile_size_quantile=imshow_tile_size_quantile,
+            imshow_tile_size_rounding=imshow_tile_size_rounding,
+            imshow_tile_size_shrink=imshow_tile_size_shrink,
+            pixel_perfect=pixel_perfect,
+            origin=origin,
+            plot_boundaries=True,
+            boundary_method="pixel",
+            alpha=boundary_alpha,
+            boundary_color=boundary_color,
+            boundary_linewidth=boundary_linewidth,
+            boundary_style=boundary_style,
+            cmap=cmap,
+            rebalance_method=rebalance_method,
+            rebalance_vmin=rebalance_vmin,
+            rebalance_vmax=rebalance_vmax,
+            color_vmin=color_vmin,
+            color_vmax=color_vmax,
+            color_percentiles=color_percentiles,
+            pixel_smoothing_sigma=pixel_smoothing_sigma,
+            pixel_boundary_render=pixel_boundary_render,
+            pixel_boundary_thickness_px=pixel_boundary_thickness_px,
+            pixel_boundary_antialiased=pixel_boundary_antialiased,
+            pixel_boundary_include_background=pixel_boundary_include_background,
+            use_imshow=use_imshow,
+            pixel_shape=pixel_shape,
+            chunk_size=chunk_size,
+            prioritize_high_values=prioritize_high_values,
+            verbose=verbose,
+            title=title if title is not None else f"{embedding} - display boundaries",
+            show_colorbar=show_colorbar,
+            color_by=color_by,
+            palette=palette,
+            show_legend=show_legend,
+            legend_loc=legend_loc,
+            legend_ncol=legend_ncol,
+            legend_outside=legend_outside,
+            legend_bbox_to_anchor=legend_bbox_to_anchor,
+            legend_fontsize=legend_fontsize,
+            segment_key=segment_key,
+            alpha_by=alpha_by,
+            alpha_range=alpha_range,
+            alpha_clip=alpha_clip,
+            alpha_invert=alpha_invert,
+            brighten_continuous=brighten_continuous,
+            continuous_gamma=continuous_gamma,
+            coordinate_mode=coordinate_mode,
+            array_row_key=array_row_key,
+            array_col_key=array_col_key,
+            runtime_fill_from_boundary=runtime_fill_from_boundary,
+            runtime_fill_closing_radius=runtime_fill_closing_radius,
+            runtime_fill_holes=runtime_fill_holes,
+            soft_rasterization=soft_rasterization,
+            resolve_center_collisions=resolve_center_collisions,
+            center_collision_radius=center_collision_radius,
+            xlim=xlim,
+            ylim=ylim,
+        )
+
+    library_id, spatial_data = _check_spatial_data(adata.uns, library_id)
     if suppress_img:
         img = None
         img_key = None
@@ -525,6 +642,20 @@ def image_plot_with_spatial_image_display_boundaries(
 
     coordinates_df[segment_key] = coordinates_df["barcode"].map(adata.obs[segment_key])
     coordinates_df = coordinates_df.dropna(subset=[segment_key]).reset_index(drop=True)
+    stored_boundary_payload = None
+    seg_uns_key = f"{_sanitize_segment_key_for_uns(segment_key)}_pixel_boundary"
+    candidate_payload = adata.uns.get(seg_uns_key, None)
+    if isinstance(candidate_payload, dict):
+        try:
+            if bool(candidate_payload.get("origin", origin)) == bool(origin):
+                stored_boundary_payload = candidate_payload
+                if verbose:
+                    logger.info(
+                        "image_plot_with_spatial_image_display_boundaries: using stored pixel boundary payload from adata.uns['%s'].",
+                        seg_uns_key,
+                    )
+        except Exception:
+            stored_boundary_payload = None
     coordinates_df, cols, raw_vals, use_categorical, category_lut, categories = _resolve_display_colors(
         adata,
         coordinates_df,
@@ -540,6 +671,17 @@ def image_plot_with_spatial_image_display_boundaries(
         color_vmax=color_vmax,
         color_percentiles=color_percentiles,
     )
+
+    if (not use_categorical) and cols.ndim == 2 and cols.shape[1] == 3 and brighten_continuous:
+        max_per_pixel = cols.max(axis=1, keepdims=True)
+        scale_cols = np.where(max_per_pixel > 0, 1.0 / max_per_pixel, 0.0)
+        cols = np.clip(cols * scale_cols, 0.0, 1.0)
+        try:
+            gamma = float(continuous_gamma)
+            if gamma > 0 and gamma != 1.0:
+                cols = np.clip(np.power(cols, gamma), 0.0, 1.0)
+        except Exception:
+            pass
 
     alpha_arr = None
     if alpha_by is not None:
@@ -687,6 +829,8 @@ def image_plot_with_spatial_image_display_boundaries(
             ax,
             coordinates_df,
             segment_key=segment_key,
+            stored_boundary_payload=stored_boundary_payload,
+            stored_boundary_scale=float(img_scaling_factor_adjusted),
             boundary_color=boundary_color,
             boundary_linewidth=boundary_linewidth,
             boundary_alpha=boundary_alpha,
@@ -695,6 +839,7 @@ def image_plot_with_spatial_image_display_boundaries(
             pixel_boundary_render=pixel_boundary_render,
             pixel_boundary_thickness_px=pixel_boundary_thickness_px,
             pixel_boundary_antialiased=pixel_boundary_antialiased,
+            pixel_boundary_include_background=pixel_boundary_include_background,
             figsize=figsize,
             fig_dpi=fig.get_dpi(),
             imshow_tile_size=imshow_tile_size,
@@ -737,6 +882,8 @@ def image_plot_with_spatial_image_display_boundaries(
             ax,
             coordinates_df,
             segment_key=segment_key,
+            stored_boundary_payload=stored_boundary_payload,
+            stored_boundary_scale=float(img_scaling_factor_adjusted),
             boundary_color=boundary_color,
             boundary_linewidth=boundary_linewidth,
             boundary_alpha=boundary_alpha,
@@ -745,6 +892,7 @@ def image_plot_with_spatial_image_display_boundaries(
             pixel_boundary_render=pixel_boundary_render,
             pixel_boundary_thickness_px=pixel_boundary_thickness_px,
             pixel_boundary_antialiased=pixel_boundary_antialiased,
+            pixel_boundary_include_background=pixel_boundary_include_background,
             figsize=figsize,
             fig_dpi=fig.get_dpi(),
             imshow_tile_size=imshow_tile_size,

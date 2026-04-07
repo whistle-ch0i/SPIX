@@ -2,15 +2,47 @@ from __future__ import annotations
 
 import re
 from contextlib import contextmanager
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Sequence
+import multiprocessing as mp
 
 import matplotlib.pyplot as plt
+import numpy as np
 from anndata import AnnData
+import pandas as pd
 
 from ..superpixel.segmentation import segment_image
 from ..visualization.plotting import image_plot
 from .gene_expression_embedding import add_gene_expression_embedding
+
+
+_GALLERY_ADATA: AnnData | None = None
+
+
+def _set_gallery_adata(adata: AnnData | None) -> None:
+    global _GALLERY_ADATA
+    _GALLERY_ADATA = adata
+
+
+def _build_minimal_gallery_adata(
+    adata: AnnData,
+    *,
+    segment_keys: Sequence[str | None],
+) -> AnnData:
+    """Build a lightweight AnnData for gene-expression rendering workers.
+
+    Process-parallel rendering does not need the full SPIX object. Keeping only
+    X, var_names, the requested segment columns, and spatial coordinates
+    substantially lowers worker memory use.
+    """
+    obs_cols = [str(k) for k in segment_keys if (k is not None and str(k) in adata.obs.columns)]
+    obs = adata.obs.loc[:, obs_cols].copy() if obs_cols else pd.DataFrame(index=adata.obs.index.copy())
+    var = pd.DataFrame(index=adata.var_names.copy())
+    mini = AnnData(X=adata.X, obs=obs, var=var)
+    if "spatial" in adata.obsm:
+        mini.obsm["spatial"] = np.asarray(adata.obsm["spatial"])
+    return mini
 
 
 def _sanitize_path_token(value: str) -> str:
@@ -85,22 +117,33 @@ def _default_image_plot_kwargs(
     return {
         "dimensions": list(image_dimensions),
         "embedding": gene_embedding_key,
-        "boundary_method": "pixel",
-        "figsize": (10, 10),
-        "fixed_boundary_color": "Black",
-        "cmap": "viridis",
-        "boundary_linewidth": 1,
-        "show_colorbar": True,
-        "prioritize_high_values": True,
-        "runtime_fill_from_boundary": True,
-        "runtime_fill_closing_radius": 2,
-        "runtime_fill_holes": True,
-        "soft_rasterization": True,
-        "resolve_center_collisions": False,
-        "alpha": 1,
-        "plot_boundaries": False,
-        "origin": True,
     }
+
+
+def _render_gene_mode_to_file(task: tuple[str, str | None, str, str, dict[str, Any], dict[str, Any], bool, bool, str]) -> Path:
+    gene, segment_key, embedding_key, title, resolved_image_kwargs, embed_kwargs, normalize_total, log1p, output_path = task
+    if _GALLERY_ADATA is None:
+        raise RuntimeError("Gallery worker state is not initialized.")
+    adata = _GALLERY_ADATA
+
+    add_gene_expression_embedding(
+        adata,
+        genes=[gene],
+        segment_key=segment_key,
+        embedding_key=embedding_key,
+        normalize_total=normalize_total,
+        log1p=log1p,
+        **embed_kwargs,
+    )
+
+    with _patched_pyplot_show(suppress=True):
+        image_plot(adata, title=title, **resolved_image_kwargs)
+
+    fig = plt.gcf()
+    out = Path(output_path)
+    fig.savefig(out, bbox_inches="tight")
+    plt.close(fig)
+    return out
 
 
 def plot_gene_expression_triplets(
@@ -125,6 +168,8 @@ def plot_gene_expression_triplets(
     verbose: bool = True,
     segment_image_kwargs: dict[str, Any] | None = None,
     image_plot_kwargs: dict[str, Any] | None = None,
+    n_jobs: int = 1,
+    backend: str = "process",
 ) -> dict[str, Any]:
     """Render SPIX, GRID, and raw gene-expression image plots for each gene.
 
@@ -184,6 +229,66 @@ def plot_gene_expression_triplets(
         print(f"[warn] Missing genes skipped: {', '.join(missing_genes)}")
 
     saved_paths: list[Path] = []
+    embed_kwargs = {"layer": None, "aggregation": "sum"}
+    run_parallel = (not display_inline) and (out_dir is not None) and int(max(1, n_jobs)) > 1 and str(backend).lower() == "process"
+
+    if run_parallel:
+        if verbose:
+            print(f"[parallel] rendering gene panels with processes: jobs={int(max(1, n_jobs))}")
+        tasks: list[tuple[str, str | None, str, str, dict[str, Any], dict[str, Any], bool, bool, str]] = []
+        for gene in valid_genes:
+            for mode_label, segment_key, _ in plot_modes:
+                title = title_template.format(
+                    gene=gene,
+                    mode=mode_label,
+                    segment_key=segment_key if segment_key is not None else "None",
+                )
+                output_path = out_dir / (
+                    f"{_sanitize_path_token(gene)}__{_sanitize_path_token(mode_label.lower())}.png"
+                )
+                tasks.append(
+                    (
+                        str(gene),
+                        segment_key,
+                        str(gene_embedding_key),
+                        str(title),
+                        dict(resolved_image_kwargs),
+                        dict(embed_kwargs),
+                        bool(normalize_total),
+                        bool(log1p),
+                        str(output_path),
+                    )
+                )
+        ctx = mp.get_context("fork")
+        worker_adata = _build_minimal_gallery_adata(
+            adata,
+            segment_keys=[spix_segment_key, grid_segment_key],
+        )
+        _set_gallery_adata(worker_adata)
+        try:
+            with ProcessPoolExecutor(
+                max_workers=int(max(1, n_jobs)),
+                mp_context=ctx,
+                initializer=_set_gallery_adata,
+                initargs=(worker_adata,),
+            ) as ex:
+                futs = [ex.submit(_render_gene_mode_to_file, task) for task in tasks]
+                for fut in as_completed(futs):
+                    out = fut.result()
+                    saved_paths.append(Path(out))
+                    if verbose:
+                        print(f"[saved] {out}")
+        finally:
+            _set_gallery_adata(None)
+
+        return {
+            "genes": valid_genes,
+            "missing_genes": missing_genes,
+            "saved_paths": saved_paths,
+            "spix_segment_key": spix_segment_key,
+            "grid_segment_key": grid_segment_key,
+        }
+
     for gene in valid_genes:
         if verbose:
             print(f"[gene] {gene}")
@@ -196,6 +301,7 @@ def plot_gene_expression_triplets(
                 embedding_key=gene_embedding_key,
                 normalize_total=normalize_total,
                 log1p=log1p,
+                **embed_kwargs,
             )
             title = title_template.format(
                 gene=gene,
@@ -222,3 +328,80 @@ def plot_gene_expression_triplets(
         "spix_segment_key": spix_segment_key,
         "grid_segment_key": grid_segment_key,
     }
+
+
+def plot_gene_expression(
+    adata: AnnData,
+    gene: str,
+    *,
+    segment_key: str | None = "Segment",
+    layer: str | None = None,
+    normalize_total: bool = True,
+    log1p: bool = True,
+    aggregation: str = "sum",
+    embedding_key: str = "X_gene_embedding",
+    image_dimensions: Sequence[int] = (0,),
+    title: str | None = None,
+    **image_plot_kwargs: Any,
+):
+    """Convenience wrapper to visualize one gene with `image_plot`.
+
+    This mirrors the common notebook pattern:
+    1. build a one-gene embedding with `add_gene_expression_embedding`
+    2. call `image_plot(...)`
+
+    Parameters
+    ----------
+    adata
+        AnnData object.
+    gene
+        Gene name to visualize.
+    segment_key
+        Segment key used for segment-level aggregation. Set to ``None`` for raw per-cell plotting.
+    layer
+        Optional layer to use instead of ``adata.X``.
+    normalize_total
+        Whether to normalize total counts before plotting.
+    log1p
+        Whether to apply ``log1p`` after normalization.
+    aggregation
+        Aggregation mode passed to `add_gene_expression_embedding`.
+    embedding_key
+        Temporary obsm key used for the generated gene embedding.
+    image_dimensions
+        Dimensions passed to `image_plot`; default `(0,)`.
+    title
+        Plot title. Defaults to the gene name.
+    **image_plot_kwargs
+        Extra keyword arguments forwarded directly to `image_plot`. Common overrides include
+        `figsize`, `cmap`, `fixed_boundary_color`, `plot_boundaries`, and `origin`.
+    """
+    add_gene_expression_embedding(
+        adata,
+        genes=[str(gene)],
+        layer=layer,
+        segment_key=segment_key,
+        embedding_key=embedding_key,
+        normalize_total=normalize_total,
+        log1p=log1p,
+        aggregation=aggregation,
+    )
+
+    resolved_image_kwargs = _default_image_plot_kwargs(
+        image_dimensions=image_dimensions,
+        gene_embedding_key=embedding_key,
+    )
+    if image_plot_kwargs:
+        resolved_image_kwargs.update(image_plot_kwargs)
+    # Keep boundary rendering and any other segment-aware image_plot behavior
+    # aligned with the aggregation segment_key unless the caller explicitly
+    # overrides it through image_plot kwargs.
+    if segment_key is not None and "segment_key" not in resolved_image_kwargs:
+        resolved_image_kwargs["segment_key"] = segment_key
+    resolved_image_kwargs["embedding"] = embedding_key
+
+    return image_plot(
+        adata,
+        title=str(gene) if title is None else str(title),
+        **resolved_image_kwargs,
+    )

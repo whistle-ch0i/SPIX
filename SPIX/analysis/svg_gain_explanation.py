@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping as ABCMapping
 from pathlib import Path
 import re
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 import matplotlib.pyplot as plt
 from matplotlib.transforms import Bbox
@@ -1005,8 +1006,8 @@ def plot_spix_discovery_reasons(
 def _load_matched_segment_index(
     segments_index_csv: str,
     *,
-    focus_compactness: float = 0.1,
-    reference_compactness: float = 1e7,
+    focus_compactness: float | Mapping[float, float] = 0.1,
+    reference_compactness: float | Mapping[float, float] = 1e7,
     compactness_tol: float = 1e-9,
 ) -> Tuple[Path, pd.DataFrame]:
     index_path = Path(segments_index_csv).resolve()
@@ -1050,16 +1051,64 @@ def _load_matched_segment_index(
         idx = pd.concat([idx, file_df], ignore_index=True, sort=False)
         idx = idx.drop_duplicates(subset=["resolution", "compactness"], keep="first")
 
-    focus_df = idx[np.isclose(idx["compactness"], float(focus_compactness), atol=float(compactness_tol))].copy()
-    ref_df = idx[np.isclose(idx["compactness"], float(reference_compactness), atol=float(compactness_tol))].copy()
-    if focus_df.empty or ref_df.empty:
-        raise ValueError("Could not find both focus/reference compactness entries in segments_index.csv")
+    def _resolve_compactness_map(
+        value: float | Mapping[float, float],
+        label: str,
+    ) -> Dict[float, float]:
+        if isinstance(value, ABCMapping):
+            resolved: Dict[float, float] = {}
+            for k, v in value.items():
+                try:
+                    rk = float(k)
+                    rv = float(v)
+                except Exception as e:
+                    raise ValueError(f"{label} compactness map must contain numeric resolution -> compactness values.") from e
+                resolved[rk] = rv
+            if not resolved:
+                raise ValueError(f"{label} compactness map is empty.")
+            return resolved
+        return {float(res): float(value) for res in sorted(idx["resolution"].unique())}
 
-    matched = (
-        focus_df.merge(ref_df, on="resolution", suffixes=("_focus", "_reference"))
-        .sort_values("resolution")
-        .reset_index(drop=True)
-    )
+    focus_map = _resolve_compactness_map(focus_compactness, "focus")
+    ref_map = _resolve_compactness_map(reference_compactness, "reference")
+
+    matched_rows: List[Dict[str, object]] = []
+    available_res = np.asarray(sorted(idx["resolution"].unique()), dtype=float)
+    for res in available_res:
+        focus_target = focus_map.get(float(res), None)
+        ref_target = ref_map.get(float(res), None)
+        if focus_target is None or ref_target is None:
+            continue
+
+        focus_candidates = idx[
+            (np.isclose(idx["resolution"], float(res), atol=float(compactness_tol)))
+            & (np.isclose(idx["compactness"], float(focus_target), atol=float(compactness_tol)))
+        ].copy()
+        ref_candidates = idx[
+            (np.isclose(idx["resolution"], float(res), atol=float(compactness_tol)))
+            & (np.isclose(idx["compactness"], float(ref_target), atol=float(compactness_tol)))
+        ].copy()
+        if focus_candidates.empty or ref_candidates.empty:
+            continue
+
+        focus_row = focus_candidates.iloc[0]
+        ref_row = ref_candidates.iloc[0]
+        matched_rows.append(
+            {
+                "resolution": float(res),
+                "scale_id_focus": focus_row.get("scale_id", None),
+                "compactness_focus": float(focus_row["compactness"]),
+                "path_focus": focus_row["path"],
+                "scale_id_reference": ref_row.get("scale_id", None),
+                "compactness_reference": float(ref_row["compactness"]),
+                "path_reference": ref_row["path"],
+            }
+        )
+
+    if not matched_rows:
+        raise ValueError("Could not find matched focus/reference compactness entries in segments_index.csv")
+
+    matched = pd.DataFrame(matched_rows).sort_values("resolution").reset_index(drop=True)
     if matched.empty:
         raise ValueError("No matched resolutions between focus and reference compactness groups")
 
@@ -1530,8 +1579,8 @@ def collect_expression_concentration_profiles(
     *,
     rank_summary_df: Optional[pd.DataFrame] = None,
     resolution: Optional[float] = None,
-    focus_compactness: float = 0.1,
-    reference_compactness: float = 1e7,
+    focus_compactness: float | Mapping[float, float] = 0.1,
+    reference_compactness: float | Mapping[float, float] = 1e7,
     layer: Optional[str] = None,
     top_fraction: float = 0.1,
     compactness_tol: float = 1e-9,
@@ -1583,8 +1632,8 @@ def collect_expression_concentration_profiles(
         }
 
         for method, path_col, compactness in [
-            ("SPIX", "path_focus", focus_compactness),
-            ("GRID", "path_reference", reference_compactness),
+            ("SPIX", "path_focus", float(row["compactness_focus"])),
+            ("GRID", "path_reference", float(row["compactness_reference"])),
         ]:
             seg_path = _resolve_segment_path(str(row[path_col]), index_path.parent)
             seg_key = str(seg_path)

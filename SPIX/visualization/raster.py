@@ -6,6 +6,48 @@ from scipy import ndimage as ndi
 from scipy.spatial import KDTree
 
 
+_DEFAULT_MAX_RASTER_PIXELS = 25_000_000
+
+
+def resolve_max_raster_pixels(
+    *,
+    env_key: str = "SPIX_PLOT_MAX_RASTER_PIXELS",
+    fallback_env_key: Optional[str] = None,
+    n_points: Optional[int] = None,
+    support_fraction: Optional[float] = None,
+    default: int = _DEFAULT_MAX_RASTER_PIXELS,
+) -> int:
+    """Resolve a raster pixel cap, auto-raising it for large point counts.
+
+    Default behavior keeps the historical 25M cap, but if the raw number of
+    points exceeds that cap we allow the cap to grow to at least ``n_points``.
+    """
+    raw = os.environ.get(env_key, None)
+    if raw is None and fallback_env_key is not None:
+        raw = os.environ.get(fallback_env_key, None)
+    try:
+        base = int(raw) if raw is not None else int(default)
+    except Exception:
+        base = int(default)
+    base = max(1, int(base))
+    if n_points is not None:
+        try:
+            base = max(base, int(n_points))
+        except Exception:
+            pass
+    if support_fraction is not None and n_points is not None:
+        try:
+            sf = float(support_fraction)
+            if np.isfinite(sf) and sf > 0:
+                margin = float(os.environ.get("SPIX_PLOT_SUPPORT_FRACTION_CAP_MARGIN", "1.30"))
+                margin = max(1.0, float(margin))
+                needed = float(n_points) / float(max(sf, 1e-6))
+                base = max(base, int(np.ceil(float(needed) * float(margin))))
+        except Exception:
+            pass
+    return int(base)
+
+
 def _tile_sample_rng() -> np.random.Generator:
     """Return a local RNG for tile-size estimation.
 
@@ -252,8 +294,10 @@ def resolve_figsize_dpi_for_tiles(
         req_w_px = int(nx)
         req_h_px = int(ny)
 
-    max_raster_px = int(os.environ.get("SPIX_PLOT_MAX_RASTER_PIXELS", "25000000"))
-    max_raster_px = max(1, max_raster_px)
+    max_raster_px = resolve_max_raster_pixels(
+        env_key="SPIX_PLOT_MAX_RASTER_PIXELS",
+        n_points=n_points,
+    )
     req_total = int(req_w_px) * int(req_h_px)
     if req_total > max_raster_px:
         if logger is not None:
@@ -341,6 +385,164 @@ def resolve_figsize_dpi_for_tiles(
     return figsize, fig_dpi
 
 
+def maybe_boost_canvas_for_unique_centers(
+    *,
+    pts: np.ndarray,
+    x_min_eff: float,
+    y_min_eff: float,
+    x_range: float,
+    y_range: float,
+    scale: float,
+    w: int,
+    h: int,
+    pixel_perfect: bool,
+    tile_px: int,
+    logger=None,
+    context: str = "",
+) -> tuple[float, int, int, dict]:
+    if int(tile_px) != 1:
+        return float(scale), int(w), int(h), {
+            "applied": False,
+            "unique_before": None,
+            "unique_after": None,
+            "boost": 1.0,
+        }
+    pts_arr = np.asarray(pts, dtype=float)
+    n_pts = int(pts_arr.shape[0])
+    if n_pts <= 1:
+        return float(scale), int(w), int(h), {
+            "applied": False,
+            "unique_before": n_pts,
+            "unique_after": n_pts,
+            "boost": 1.0,
+        }
+    if str(os.environ.get("SPIX_PLOT_AUTO_BOOST_UNIQUE_CENTERS", "1")).strip().lower() in {"0", "false", "no"}:
+        return float(scale), int(w), int(h), {
+            "applied": False,
+            "unique_before": None,
+            "unique_after": None,
+            "boost": 1.0,
+        }
+
+    default_target_unique_fraction = "1.0"
+    default_max_boost = "4.0"
+    target_unique_fraction = float(
+        np.clip(
+            float(
+                os.environ.get("SPIX_PLOT_TARGET_UNIQUE_CENTER_FRACTION", default_target_unique_fraction)
+            ),
+            0.75,
+            1.0,
+        )
+    )
+    max_boost = float(
+        np.clip(
+            float(
+                os.environ.get("SPIX_PLOT_MAX_CENTER_BOOST", default_max_boost)
+            ),
+            1.0,
+            8.0,
+        )
+    )
+
+    cx0, cy0 = scale_points_to_canvas(
+        pts_arr,
+        x_min_eff=float(x_min_eff),
+        y_min_eff=float(y_min_eff),
+        scale=float(scale),
+        pixel_perfect=bool(pixel_perfect),
+        w=int(w),
+        h=int(h),
+    )
+    unique_before = int(np.unique(cy0.astype(np.int64) * np.int64(max(1, int(w))) + cx0.astype(np.int64)).size)
+    target_unique = int(np.ceil(float(n_pts) * float(target_unique_fraction)))
+    if unique_before >= target_unique:
+        return float(scale), int(w), int(h), {
+            "applied": False,
+            "unique_before": unique_before,
+            "unique_after": unique_before,
+            "boost": 1.0,
+        }
+
+    support_fraction_est = float(unique_before) / float(max(1, int(w) * int(h)))
+    max_raster_px = resolve_max_raster_pixels(
+        env_key="SPIX_SEGMENT_MAX_RASTER_PIXELS",
+        fallback_env_key="SPIX_PLOT_MAX_RASTER_PIXELS",
+        n_points=n_pts,
+        support_fraction=support_fraction_est,
+    )
+    base_scale = float(scale)
+    best_scale = float(scale)
+    best_w = int(w)
+    best_h = int(h)
+    best_unique = int(unique_before)
+
+    max_scale = float(scale) * float(max_boost)
+    scale_cap = float(np.sqrt(float(max_raster_px) / float(max(1e-9, float(x_range) * float(y_range)))))
+    max_scale = min(float(max_scale), float(scale_cap))
+    if max_scale > float(scale) + 1e-9:
+        # Probe a broader range of scales instead of stopping at the first plateau.
+        # Distinct raster centers can increase in jumps after several non-improving steps.
+        candidate_scales = np.geomspace(float(scale) * 1.01, float(max_scale), num=24)
+        candidate_scales = np.unique(np.asarray(candidate_scales, dtype=float))
+        for cand_scale in candidate_scales:
+            cand_scale = float(cand_scale)
+            if cand_scale <= best_scale + 1e-9:
+                continue
+            cand_w = max(1, int(np.ceil(float(x_range) * float(cand_scale))))
+            cand_h = max(1, int(np.ceil(float(y_range) * float(cand_scale))))
+            if int(cand_w) * int(cand_h) > max_raster_px:
+                continue
+            cxc, cyc = scale_points_to_canvas(
+                pts_arr,
+                x_min_eff=float(x_min_eff),
+                y_min_eff=float(y_min_eff),
+                scale=float(cand_scale),
+                pixel_perfect=bool(pixel_perfect),
+                w=int(cand_w),
+                h=int(cand_h),
+            )
+            cand_unique = int(
+                np.unique(cyc.astype(np.int64) * np.int64(max(1, int(cand_w))) + cxc.astype(np.int64)).size
+            )
+            if cand_unique > best_unique:
+                best_scale = float(cand_scale)
+                best_w = int(cand_w)
+                best_h = int(cand_h)
+                best_unique = int(cand_unique)
+                if best_unique >= target_unique:
+                    break
+
+    applied = best_unique > unique_before
+    if applied and logger is not None:
+        msg = f"{context}: " if context else ""
+        logger.info(
+            "%sboosted raster canvas for unique centers: %dx%d -> %dx%d | unique centers %d -> %d",
+            msg,
+            int(w),
+            int(h),
+            int(best_w),
+            int(best_h),
+            int(unique_before),
+            int(best_unique),
+        )
+        if best_unique < target_unique:
+            logger.warning(
+                "%starget unique centers not fully reached after canvas boost search: target=%d achieved=%d max_boost=%.3f max_raster_px=%d",
+                msg,
+                int(target_unique),
+                int(best_unique),
+                float(max_boost),
+                int(max_raster_px),
+            )
+    return float(best_scale), int(best_w), int(best_h), {
+        "applied": bool(applied),
+        "unique_before": int(unique_before),
+        "unique_after": int(best_unique),
+        "boost": float(best_scale / max(base_scale, 1e-9)),
+    }
+
+
 def resolve_raster_canvas(
     *,
     pts: np.ndarray,
@@ -366,27 +568,52 @@ def resolve_raster_canvas(
     user_dpi_given = fig_dpi is not None
     auto_sized = (not user_figsize_given) or (not user_dpi_given)
     shrink_eff = 1.0 if pixel_perfect else float(imshow_tile_size_shrink)
+    context_str = str(context or "")
+    is_pixel_boundary_context = "pixel-boundary" in context_str.lower()
+    is_display_family = (
+        (
+            ("image_plot" in context_str)
+            or ("overlay_segment_boundaries_on_display" in context_str)
+        )
+        and ("image_plot_slic_segmentation" not in context_str)
+        and ("cache_embedding_image" not in context_str)
+        and ("rebuild_cached_image_from_obsm" not in context_str)
+    )
+    display_scale_factor = float(imshow_scale_factor)
+    scale_factor_for_estimate = 1.0 if is_display_family else float(imshow_scale_factor)
 
     s_data_units = estimate_tile_size_units(
         np.asarray(pts),
         imshow_tile_size,
-        imshow_scale_factor,
+        scale_factor_for_estimate,
         imshow_tile_size_mode,
         imshow_tile_size_quantile,
         shrink_eff,
         logger=logger,
     )
-    s_data_units = cap_tile_size_by_render_extent(
-        s_data_units=float(s_data_units),
-        x_min=float(x_min),
-        x_max=float(x_max),
-        y_min=float(y_min),
-        y_max=float(y_max),
-        pixel_perfect=bool(pixel_perfect),
-        n_points=int(n_points),
-        logger=logger,
-        context=str(context or ""),
-    )
+    # Respect explicit tile-size controls. The density cap is useful for auto
+    # estimation, but if the caller explicitly specifies imshow_tile_size or a
+    # non-default imshow_scale_factor they expect visible changes in tile size.
+    if (imshow_tile_size is None) and (float(scale_factor_for_estimate) == 1.0):
+        s_data_units = cap_tile_size_by_render_extent(
+            s_data_units=float(s_data_units),
+            x_min=float(x_min),
+            x_max=float(x_max),
+            y_min=float(y_min),
+            y_max=float(y_max),
+            pixel_perfect=bool(pixel_perfect),
+            n_points=int(n_points),
+            logger=logger,
+            context=str(context or ""),
+        )
+    elif logger is not None and context:
+        logger.info(
+            "%sexplicit imshow tile sizing enabled: s_data_units=%.3f (tile=%s scale_factor=%.3f)",
+            f"{context}: ",
+            float(s_data_units),
+            "auto" if imshow_tile_size is None else f"{float(imshow_tile_size):.3f}",
+            float(scale_factor_for_estimate),
+        )
 
     x_min_eff, x_max_eff, y_min_eff, y_max_eff = effective_extent(
         x_min=float(x_min),
@@ -399,9 +626,12 @@ def resolve_raster_canvas(
     x_range = (x_max_eff - x_min_eff) or 1.0
     y_range = (y_max_eff - y_min_eff) or 1.0
 
-    figsize_resolved, fig_dpi_resolved = resolve_figsize_dpi_for_tiles(
-        figsize=figsize,
-        fig_dpi=fig_dpi,
+    # Raster canvas geometry should depend on the data/tile density, not on the
+    # user's output figure settings. Figure figsize/dpi are applied later only
+    # to the rendered display.
+    canvas_figsize, canvas_fig_dpi = resolve_figsize_dpi_for_tiles(
+        figsize=None,
+        fig_dpi=None,
         x_range=float(x_range),
         y_range=float(y_range),
         s_data_units=float(s_data_units),
@@ -409,12 +639,11 @@ def resolve_raster_canvas(
         n_points=int(n_points),
         logger=logger,
     )
-    if figsize_resolved is None:
-        figsize_resolved = tuple(default_figsize)
-
-    dpi_in = int(fig_dpi_resolved) if fig_dpi_resolved is not None else 100
-    w_pixels = int(np.ceil(float(figsize_resolved[0]) * float(dpi_in)))
-    h_pixels = int(np.ceil(float(figsize_resolved[1]) * float(dpi_in)))
+    if canvas_figsize is None:
+        canvas_figsize = tuple(default_figsize)
+    dpi_in = int(canvas_fig_dpi) if canvas_fig_dpi is not None else 100
+    w_pixels = int(np.ceil(float(canvas_figsize[0]) * float(dpi_in)))
+    h_pixels = int(np.ceil(float(canvas_figsize[1]) * float(dpi_in)))
 
     scale_raw = scale_raw_from_canvas(
         w_pixels=int(w_pixels),
@@ -422,7 +651,7 @@ def resolve_raster_canvas(
         x_range=float(x_range),
         y_range=float(y_range),
         pixel_perfect=bool(pixel_perfect),
-        auto_sized=bool(auto_sized),
+        auto_sized=True,
     )
     if pixel_perfect and s_data_units > 0:
         pitch_px = max(1, int(np.round(float(s_data_units) * float(scale_raw))))
@@ -434,6 +663,78 @@ def resolve_raster_canvas(
 
     w = max(1, int(np.ceil(float(x_range) * float(scale))))
     h = max(1, int(np.ceil(float(y_range) * float(scale))))
+    scale, w, h, canvas_boost = maybe_boost_canvas_for_unique_centers(
+        pts=np.asarray(pts),
+        x_min_eff=float(x_min_eff),
+        y_min_eff=float(y_min_eff),
+        x_range=float(x_range),
+        y_range=float(y_range),
+        scale=float(scale),
+        w=int(w),
+        h=int(h),
+        pixel_perfect=bool(pixel_perfect),
+        tile_px=int(tile_px),
+        logger=logger,
+        context=str(context or ""),
+    )
+
+    explicit_tile_control = (imshow_tile_size is not None)
+    if is_display_family and (not is_pixel_boundary_context) and (not explicit_tile_control) and (not bool(pixel_perfect)) and int(tile_px) == 1:
+        support_fraction_est = float(n_points) / float(max(1, int(w) * int(h)))
+        target_support_fraction = float(
+            np.clip(
+                float(os.environ.get("SPIX_PLOT_DISPLAY_MIN_SUPPORT_FRACTION", "0.22")),
+                0.05,
+                0.9,
+            )
+        )
+        if support_fraction_est > 0 and support_fraction_est < target_support_fraction:
+            tile_px_target = int(
+                np.ceil(np.sqrt(float(target_support_fraction) / float(max(support_fraction_est, 1e-9))))
+            )
+            tile_px_target = int(
+                np.clip(
+                    tile_px_target,
+                    1,
+                    int(max(1, int(os.environ.get("SPIX_PLOT_DISPLAY_MAX_TILE_PX", "4")))),
+                )
+            )
+            if tile_px_target > int(tile_px):
+                tile_px = int(tile_px_target)
+                if logger is not None:
+                    logger.info(
+                        "%sauto-increased display tile size: tile_px %d -> %d (support_est=%.4f target=%.4f)",
+                        f"{context}: " if context else "",
+                        1,
+                        int(tile_px),
+                        float(support_fraction_est),
+                        float(target_support_fraction),
+                    )
+    elif is_display_family and (not is_pixel_boundary_context) and explicit_tile_control and logger is not None and context:
+        logger.info(
+            "%sdisplay auto tile grow skipped due to explicit absolute tile size (tile=%s)",
+            f"{context}: ",
+            "auto" if imshow_tile_size is None else f"{float(imshow_tile_size):.3f}",
+        )
+
+    if is_display_family and (not is_pixel_boundary_context) and float(display_scale_factor) != 1.0:
+        tile_px_before = int(tile_px)
+        tile_px = max(1, int(np.ceil(float(tile_px) * float(display_scale_factor))))
+        if logger is not None and context:
+            logger.info(
+                "%sdisplay tile scale applied post-auto: tile_px %d -> %d (scale_factor=%.3f)",
+                f"{context}: ",
+                int(tile_px_before),
+                int(tile_px),
+                float(display_scale_factor),
+            )
+
+    fig_dpi_resolved = int(fig_dpi) if fig_dpi is not None else int(dpi_in)
+    if figsize is not None:
+        figsize_resolved = tuple(figsize)
+    else:
+        dpi_use = max(1, int(fig_dpi_resolved))
+        figsize_resolved = (float(w) / float(dpi_use), float(h) / float(dpi_use))
 
     return {
         "figsize": tuple(figsize_resolved),
@@ -451,6 +752,7 @@ def resolve_raster_canvas(
         "tile_px": int(tile_px),
         "w": int(w),
         "h": int(h),
+        "canvas_boost": canvas_boost,
     }
 
 
@@ -496,7 +798,9 @@ def fill_raster_from_boundary(
     """Morphologically fill raster support from observed tiles without resnapping points.
 
     The image is updated in-place by assigning each newly filled pixel the value
-    of its nearest observed tile center in raster space.
+    of its nearest observed tile center in raster space. The occupancy/support
+    mask is also expanded in-place so downstream masked segmentation sees the
+    filled support instead of only the original seed pixels.
     """
     occ = np.asarray(occupancy_mask, dtype=bool)
     if occ.ndim != 2:
@@ -541,6 +845,13 @@ def fill_raster_from_boundary(
             img[fy, fx] = vals[np.asarray(valid).nonzero()[0][np.asarray(nn_idx, dtype=np.int64)]]
         else:
             filled_pixels = 0
+
+    # Propagate the filled support back to the caller's occupancy mask so
+    # downstream mask-based logic uses the morphologically completed support.
+    try:
+        occupancy_mask[...] = support_mask
+    except Exception:
+        pass
 
     if logger is not None and filled_pixels > 0:
         msg = f"{context}: " if context else ""

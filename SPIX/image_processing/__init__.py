@@ -6,6 +6,7 @@ from .image_cache import (
     list_cached_images,
     show_cached_image,
     show_all_cached_images,
+    summarize_cached_overlap,
     rebuild_cached_image_from_obsm,
 )
 
@@ -16,5 +17,6 @@ __all__ += [
     "list_cached_images",
     "show_cached_image",
     "show_all_cached_images",
+    "summarize_cached_overlap",
     "rebuild_cached_image_from_obsm",
 ]

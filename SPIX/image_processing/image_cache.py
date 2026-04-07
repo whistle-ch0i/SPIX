@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import os
+import time
 import atexit
 import glob
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Optional, Dict, Any, List, Sequence, Tuple
 import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
 from skimage.segmentation import find_boundaries
+from skimage.transform import resize
 from scipy.ndimage import gaussian_filter, binary_dilation
 
 # no additional utils needed here after function removals
@@ -38,6 +40,71 @@ def _default_memmap_dir() -> str:
     if env:
         return env
     return os.path.join(os.getcwd(), ".spix_cache")
+
+
+def _downsample_support_mask(mask: np.ndarray, new_h: int, new_w: int) -> np.ndarray:
+    mask_arr = np.asarray(mask, dtype=bool)
+    if mask_arr.shape == (int(new_h), int(new_w)):
+        return mask_arr
+    resized = resize(
+        mask_arr.astype(np.float32),
+        (int(new_h), int(new_w)),
+        order=0,
+        anti_aliasing=False,
+        preserve_range=True,
+    )
+    return (resized >= 0.5).astype(bool, copy=False)
+
+
+def _auto_preview_figsize_from_image_shape(shape: Tuple[int, ...]) -> tuple[float, float]:
+    """Choose a readable preview figure size from an image shape.
+
+    Uses only display geometry; does not affect rasterization.
+    Keeps the long side around 10 inches and the short side at least 5 inches.
+    """
+    try:
+        h = int(shape[0])
+        w = int(shape[1])
+    except Exception:
+        return (10.0, 8.0)
+    if h <= 0 or w <= 0:
+        return (10.0, 8.0)
+    aspect = float(w) / float(h)
+    long_side = 10.0
+    short_floor = 5.0
+    if aspect >= 1.0:
+        fig_w = long_side
+        fig_h = max(short_floor, long_side / max(aspect, 1e-9))
+    else:
+        fig_h = long_side
+        fig_w = max(short_floor, long_side * aspect)
+    return (float(fig_w), float(fig_h))
+
+
+def _resolve_cached_preview_figsize_and_dpi(
+    cache: dict,
+    img_shape: Tuple[int, ...],
+    *,
+    figsize: Optional[tuple] = None,
+    fig_dpi: Optional[int] = None,
+) -> tuple[Optional[tuple], Optional[int]]:
+    """Resolve cached preview size, preferring original raster size when unspecified."""
+    resolved_figsize = figsize if figsize is not None else cache.get("figsize", None)
+    resolved_dpi = fig_dpi if fig_dpi is not None else cache.get("fig_dpi", None)
+    if resolved_dpi is None:
+        resolved_dpi = cache.get("raster_dpi", cache.get("effective_dpi", 100))
+    if resolved_figsize is None:
+        try:
+            h = int(img_shape[0])
+            w = int(img_shape[1])
+            dpi_use = float(resolved_dpi) if resolved_dpi is not None else 100.0
+            if h > 0 and w > 0 and dpi_use > 0:
+                resolved_figsize = (float(w) / dpi_use, float(h) / dpi_use)
+            else:
+                resolved_figsize = _auto_preview_figsize_from_image_shape(img_shape)
+        except Exception:
+            resolved_figsize = _auto_preview_figsize_from_image_shape(img_shape)
+    return resolved_figsize, resolved_dpi
 
 
 def clear_memmap_cache(
@@ -137,7 +204,7 @@ def cache_embedding_image(
     imshow_tile_size_quantile: Optional[float] = None,
     imshow_tile_size_rounding: str = "floor",
     imshow_tile_size_shrink: float = 0.98,
-    pixel_perfect: bool = True,
+    pixel_perfect: bool = False,
     pixel_shape: str = "square",
     chunk_size: int = 50000,
     downsample_factor: float = 1.0,
@@ -207,6 +274,7 @@ def cache_embedding_image(
     """
     if embedding not in adata.obsm:
         raise ValueError(f"Embedding '{embedding}' not found in adata.obsm.")
+    t_total0 = time.perf_counter() if verbose else None
 
     impl = (implementation or "auto").lower()
     if impl not in {"auto", "optimized", "legacy"}:
@@ -373,6 +441,7 @@ def cache_embedding_image(
         tile_barcodes = tile_barcodes[valid_mask]
         spatial_coords = xy.to_numpy(dtype=float)[valid_mask]
         origin_flags = pd.to_numeric(tiles_idx.get("origin", 1), errors="coerce").fillna(1).to_numpy()[valid_mask]
+    t_coords = time.perf_counter() if verbose else None
 
     coord_mode = str(coordinate_mode or "spatial").lower()
     if coord_mode not in {"spatial", "array", "visium", "visiumhd", "auto"}:
@@ -382,6 +451,7 @@ def cache_embedding_image(
             coord_mode = "visiumhd"
         else:
             coord_mode = "spatial"
+
     if coord_mode in {"array", "visium", "visiumhd"}:
         if (array_row_key not in adata.obs.columns) or (array_col_key not in adata.obs.columns):
             raise ValueError(
@@ -406,6 +476,7 @@ def cache_embedding_image(
         tile_obs_indices = tile_obs_indices[coord_mask]
         tile_barcodes = tile_barcodes[coord_mask]
         origin_flags = origin_flags[coord_mask]
+    t_coordmode = time.perf_counter() if verbose else None
 
     # Select embedding channels (support embeddings that already contain only these dims)
     E_full = np.asarray(adata.obsm[embedding])
@@ -420,6 +491,7 @@ def cache_embedding_image(
     embeddings = emb[tile_obs_indices]
     barcodes = tile_barcodes
     dim_cols = [f"dim{i}" for i, _ in enumerate(range(embeddings.shape[1]))]
+    t_embed = time.perf_counter() if verbose else None
 
     segment_series = None
     seg_col: Optional[str] = None
@@ -466,6 +538,8 @@ def cache_embedding_image(
     imshow_tile_size_eff = imshow_tile_size
     if coord_mode == "visiumhd" and imshow_tile_size_eff is None:
         imshow_tile_size_eff = 1.0
+    user_figsize_input = figsize
+    user_fig_dpi_input = fig_dpi
     raster_canvas = _raster.resolve_raster_canvas(
         pts=spatial_coords,
         x_min=float(x_min),
@@ -497,6 +571,7 @@ def cache_embedding_image(
     s = int(raster_canvas["tile_px"])
     w = int(raster_canvas["w"])
     h = int(raster_canvas["h"])
+    t_canvas = time.perf_counter() if verbose else None
 
     # Normalize embedding channels 0..1 per channel
     dims = embeddings.shape[1]
@@ -505,6 +580,7 @@ def cache_embedding_image(
     brighten_applied = bool(brighten_continuous and dims == 3)
     if brighten_applied:
         cols = _apply_brighten_continuous_rgb(cols, continuous_gamma)
+    t_scale = time.perf_counter() if verbose else None
 
     if verbose:
         print(f"Rasterizing → image size (h, w, C)=({h}, {w}, {dims}) | tile_px={s}")
@@ -581,6 +657,7 @@ def cache_embedding_image(
         )
     elif resolve_center_collisions and soft_enabled and verbose:
         print("[cache_embedding_image] Ignoring resolve_center_collisions because soft_rasterization=True.")
+    t_centers = time.perf_counter() if verbose else None
 
     # Optional depth ordering similar to image_plot (alpha-driven)
     def _compute_alpha_from_values(values, arange=(0.1, 1.0), clip=None, invert=False):
@@ -652,6 +729,7 @@ def cache_embedding_image(
             tile_idx_map = np.repeat(idx, pixels_per_tile)
             img[all_y, all_x] = cols[tile_idx_map]
             paint_mask[all_y, all_x] = True
+    t_raster = time.perf_counter() if verbose else None
     runtime_fill_info = {
         "applied": False,
         "filled_pixels": 0,
@@ -659,18 +737,22 @@ def cache_embedding_image(
         "closing_radius": int(max(0, int(runtime_fill_closing_radius))),
         "fill_holes": bool(runtime_fill_holes),
     }
-    if runtime_fill_from_boundary:
+    fill_active = bool(runtime_fill_from_boundary) or bool(runtime_fill_holes)
+    fill_radius = int(runtime_fill_closing_radius) if bool(runtime_fill_from_boundary) else 0
+    if fill_active:
         runtime_fill_info = _raster.fill_raster_from_boundary(
             img=img,
             occupancy_mask=paint_mask,
             seed_x=cx_seed,
             seed_y=cy_seed,
             seed_values=cols,
-            closing_radius=int(runtime_fill_closing_radius),
+            closing_radius=int(fill_radius),
             fill_holes=bool(runtime_fill_holes),
             logger=None,
             context="cache_embedding_image",
         )
+    support_mask = np.asarray(paint_mask, dtype=bool)
+    t_fill = time.perf_counter() if verbose else None
 
     # Optional: build label image for boundary overlay (preview only)
     label_img = None
@@ -712,7 +794,7 @@ def cache_embedding_image(
                     all_x = np.clip((cx0[:, None] + dx[None, :]).ravel(), 0, w - 1)
                     all_y = np.clip((cy0[:, None] + dy[None, :]).ravel(), 0, h - 1)
                     label_img[all_y, all_x] = np.repeat(seg_codes[idx], len(dx))
-        if runtime_fill_from_boundary:
+        if fill_active:
             label_img_fill = label_img.astype(np.float32, copy=True)[..., None]
             _raster.fill_raster_from_boundary(
                 img=label_img_fill,
@@ -720,7 +802,7 @@ def cache_embedding_image(
                 seed_x=cx_seed,
                 seed_y=cy_seed,
                 seed_values=seg_codes.astype(np.float32, copy=False)[:, None],
-                closing_radius=int(runtime_fill_closing_radius),
+                closing_radius=int(fill_radius),
                 fill_holes=bool(runtime_fill_holes),
                 logger=None,
                 context="cache_embedding_image(label_img)",
@@ -736,11 +818,13 @@ def cache_embedding_image(
         pooled = pooled.reshape(new_h, factor, new_w, factor, dims).mean(axis=(1, 3))
         img = pooled.astype(np.float32)
         h, w = img.shape[:2]
+        support_mask = _downsample_support_mask(support_mask, h, w)
         scale /= factor
         s = max(1, int(np.ceil(s_data_units * scale)))
         dpi_effective = float(dpi_in) / float(factor)
     else:
         dpi_effective = float(dpi_in)
+    t_downsample = time.perf_counter() if verbose else None
 
     # If we built a label image, downsample it to match
     if label_img is not None and downsample_factor and downsample_factor > 1.0:
@@ -750,6 +834,9 @@ def cache_embedding_image(
         # nearest pooling for labels
         label_img = label_img[: new_h * factor, : new_w * factor]
         label_img = label_img.reshape(new_h, factor, new_w, factor).max(axis=(1, 3))
+    if label_img is not None and support_mask.shape == label_img.shape:
+        label_img = np.asarray(label_img, dtype=np.int32)
+        label_img[~support_mask] = -1
 
     # Compute sampling centers per tile (pixel indices)
     if downsample_factor and downsample_factor > 1.0 and soft_enabled:
@@ -787,6 +874,8 @@ def cache_embedding_image(
         "total_pixels": int(h * w),
         "channels": int(dims),
         "coordinate_mode": str(coord_mode),
+        "array_row_key": str(array_row_key),
+        "array_col_key": str(array_col_key),
         "x_min": float(x_min),
         "x_max": float(x_max),
         "y_min": float(y_min),
@@ -803,10 +892,11 @@ def cache_embedding_image(
         "embedding_key": str(embedding),
         "dimensions": list(dimensions),
         "origin": bool(origin),
-        "figsize": tuple(figsize),
-        "fig_dpi": None if fig_dpi is None else int(fig_dpi),
+        "figsize": None if user_figsize_input is None else tuple(user_figsize_input),
+        "fig_dpi": None if user_fig_dpi_input is None else int(user_fig_dpi_input),
         "raster_dpi": int(dpi_in),
         "effective_dpi": float(dpi_effective),
+        "downsample_factor": float(downsample_factor),
         # per-tile mapping/meta
         "cx": cx.astype(np.int32),
         "cy": cy.astype(np.int32),
@@ -814,6 +904,7 @@ def cache_embedding_image(
         "soft_rasterization_mode": "bilinear" if soft_enabled else None,
         "soft_fx": (soft_fx.astype(np.float16) if soft_enabled else None),
         "soft_fy": (soft_fy.astype(np.float16) if soft_enabled else None),
+        "support_mask": support_mask.astype(bool, copy=False),
         "tile_obs_indices": tile_obs_indices.astype(np.int64),
         # Store barcodes only when explicitly requested or when the dataset is small.
         # For huge VisiumHD datasets, storing a Python list of millions of strings
@@ -948,6 +1039,20 @@ def cache_embedding_image(
         cache["label_img"] = label_img.astype(np.int32)
 
     adata.uns[key] = cache
+    if verbose and all(v is not None for v in [t_total0, t_coords, t_coordmode, t_embed, t_canvas, t_scale, t_centers, t_raster, t_fill, t_downsample]):
+        print(
+            "[perf] cache_embedding_image detail: "
+            f"coords={t_coords - t_total0:.3f}s | "
+            f"coord_mode={t_coordmode - t_coords:.3f}s | "
+            f"embedding_slice={t_embed - t_coordmode:.3f}s | "
+            f"canvas={t_canvas - t_embed:.3f}s | "
+            f"scale={t_scale - t_canvas:.3f}s | "
+            f"centers={t_centers - t_scale:.3f}s | "
+            f"rasterize={t_raster - t_centers:.3f}s | "
+            f"fill={t_fill - t_raster:.3f}s | "
+            f"downsample={t_downsample - t_fill:.3f}s | "
+            f"total={t_downsample - t_total0:.3f}s"
+        )
     if show:
         try:
             show_cached_image(adata, key=key, channels=show_channels, cmap=show_cmap)
@@ -1153,6 +1258,8 @@ def _cache_embedding_image_legacy(
     imshow_tile_size_eff = imshow_tile_size
     if coord_mode == "visiumhd" and imshow_tile_size_eff is None:
         imshow_tile_size_eff = 1.0
+    user_figsize_input = figsize
+    user_fig_dpi_input = fig_dpi
     raster_canvas = _raster.resolve_raster_canvas(
         pts=spatial_coords,
         x_min=float(x_min),
@@ -1307,18 +1414,21 @@ def _cache_embedding_image_legacy(
         "closing_radius": int(max(0, int(runtime_fill_closing_radius))),
         "fill_holes": bool(runtime_fill_holes),
     }
-    if runtime_fill_from_boundary:
+    fill_active = bool(runtime_fill_from_boundary) or bool(runtime_fill_holes)
+    fill_radius = int(runtime_fill_closing_radius) if bool(runtime_fill_from_boundary) else 0
+    if fill_active:
         runtime_fill_info = _raster.fill_raster_from_boundary(
             img=img,
             occupancy_mask=paint_mask,
             seed_x=cx_seed,
             seed_y=cy_seed,
             seed_values=cols,
-            closing_radius=int(runtime_fill_closing_radius),
+            closing_radius=int(fill_radius),
             fill_holes=bool(runtime_fill_holes),
             logger=None,
             context="cache_embedding_image(legacy)",
         )
+    support_mask = np.asarray(paint_mask, dtype=bool)
 
     label_img = None
     if plot_boundaries and segment_available and segment_series is not None:
@@ -1356,7 +1466,7 @@ def _cache_embedding_image_legacy(
                     all_x = np.clip((cx0[:, None] + dx[None, :]).ravel(), 0, w - 1)
                     all_y = np.clip((cy0[:, None] + dy[None, :]).ravel(), 0, h - 1)
                     label_img[all_y, all_x] = np.repeat(seg_codes[idx], len(dx))
-        if runtime_fill_from_boundary:
+        if fill_active:
             label_img_fill = label_img.astype(np.float32, copy=True)[..., None]
             _raster.fill_raster_from_boundary(
                 img=label_img_fill,
@@ -1364,7 +1474,7 @@ def _cache_embedding_image_legacy(
                 seed_x=cx_seed,
                 seed_y=cy_seed,
                 seed_values=seg_codes.astype(np.float32, copy=False)[:, None],
-                closing_radius=int(runtime_fill_closing_radius),
+                closing_radius=int(fill_radius),
                 fill_holes=bool(runtime_fill_holes),
                 logger=None,
                 context="cache_embedding_image(label_img, legacy)",
@@ -1379,6 +1489,7 @@ def _cache_embedding_image_legacy(
         pooled = pooled.reshape(new_h, factor, new_w, factor, dims).mean(axis=(1, 3))
         img = pooled.astype(np.float32)
         h, w = img.shape[:2]
+        support_mask = _downsample_support_mask(support_mask, h, w)
         scale /= factor
         s = max(1, int(np.ceil(s_data_units * scale)))
         dpi_effective = float(dpi_in) / float(factor)
@@ -1391,6 +1502,9 @@ def _cache_embedding_image_legacy(
         new_w = max(1, label_img.shape[1] // factor)
         label_img = label_img[: new_h * factor, : new_w * factor]
         label_img = label_img.reshape(new_h, factor, new_w, factor).max(axis=(1, 3))
+    if label_img is not None and support_mask.shape == label_img.shape:
+        label_img = np.asarray(label_img, dtype=np.int32)
+        label_img[~support_mask] = -1
 
     if downsample_factor and downsample_factor > 1.0 and soft_enabled:
         cx, cy, soft_fx, soft_fy = _raster.scale_points_to_canvas_soft(
@@ -1427,6 +1541,8 @@ def _cache_embedding_image_legacy(
         "total_pixels": int(h * w),
         "channels": int(dims),
         "coordinate_mode": str(coord_mode),
+        "array_row_key": str(array_row_key),
+        "array_col_key": str(array_col_key),
         "x_min": float(x_min),
         "x_max": float(x_max),
         "y_min": float(y_min),
@@ -1443,16 +1559,18 @@ def _cache_embedding_image_legacy(
         "embedding_key": str(embedding),
         "dimensions": list(dimensions),
         "origin": bool(origin),
-        "figsize": tuple(figsize),
-        "fig_dpi": None if fig_dpi is None else int(fig_dpi),
+        "figsize": None if user_figsize_input is None else tuple(user_figsize_input),
+        "fig_dpi": None if user_fig_dpi_input is None else int(user_fig_dpi_input),
         "raster_dpi": int(dpi_in),
         "effective_dpi": float(dpi_effective),
+        "downsample_factor": float(downsample_factor),
         "cx": cx.astype(np.int32),
         "cy": cy.astype(np.int32),
         "soft_rasterization": bool(soft_enabled),
         "soft_rasterization_mode": "bilinear" if soft_enabled else None,
         "soft_fx": (soft_fx.astype(np.float16) if soft_enabled else None),
         "soft_fy": (soft_fy.astype(np.float16) if soft_enabled else None),
+        "support_mask": support_mask.astype(bool, copy=False),
         "tile_obs_indices": tile_obs_indices.astype(np.int64),
         "barcodes": coordinates_df["barcode"].astype(str).to_list(),
         "origin_flags": coordinates_df.get("origin", pd.Series(index=coordinates_df.index, data=1))
@@ -1707,14 +1825,16 @@ def rebuild_cached_image_from_obsm(
             paint_mask[all_y, all_x] = True
 
     runtime_fill_cfg = dict(cache.get("runtime_fill", {}) or {})
-    if bool(runtime_fill_cfg.get("applied", False)) or bool(plot_params.get("runtime_fill_from_boundary", False)):
+    fill_active = bool(runtime_fill_cfg.get("applied", False)) or bool(plot_params.get("runtime_fill_from_boundary", False)) or bool(plot_params.get("runtime_fill_holes", runtime_fill_cfg.get("fill_holes", False)))
+    fill_radius = int(plot_params.get("runtime_fill_closing_radius", runtime_fill_cfg.get("closing_radius", 1))) if bool(plot_params.get("runtime_fill_from_boundary", False)) else 0
+    if fill_active:
         _raster.fill_raster_from_boundary(
             img=img,
             occupancy_mask=paint_mask,
             seed_x=np.asarray(cx, dtype=np.int32),
             seed_y=np.asarray(cy, dtype=np.int32),
             seed_values=emb,
-            closing_radius=int(plot_params.get("runtime_fill_closing_radius", runtime_fill_cfg.get("closing_radius", 1))),
+            closing_radius=int(fill_radius),
             fill_holes=bool(plot_params.get("runtime_fill_holes", runtime_fill_cfg.get("fill_holes", True))),
             logger=None,
             context="rebuild_cached_image_from_obsm",
@@ -1823,6 +1943,47 @@ def list_cached_images(adata) -> List[str]:
     return keys
 
 
+def summarize_cached_overlap(
+    adata,
+    key: str = "image_plot_slic",
+) -> Dict[str, Any]:
+    """Summarize tile overlap/collision statistics for a cached raster image."""
+    if key not in adata.uns:
+        raise KeyError(f"No cached image under adata.uns['{key}']")
+    cache = adata.uns[key]
+    img = np.asarray(cache.get("img"))
+    if img.ndim != 3:
+        raise ValueError("Cached object does not contain a 3D image array.")
+    support_mask = np.asarray(cache.get("support_mask"), dtype=bool)
+    cx = np.asarray(cache.get("cx"), dtype=np.int32).ravel()
+    cy = np.asarray(cache.get("cy"), dtype=np.int32).ravel()
+    n_tiles = int(min(cx.size, cy.size))
+    if n_tiles <= 0:
+        raise ValueError("Cached image does not contain cx/cy tile centers.")
+    flat = cy.astype(np.int64, copy=False) * np.int64(max(1, img.shape[1])) + cx.astype(np.int64, copy=False)
+    unique, counts = np.unique(flat, return_counts=True)
+    unique_centers = int(unique.size)
+    collided_tiles = int(n_tiles - unique_centers)
+    support_pixels = int(np.count_nonzero(support_mask))
+    canvas_pixels = int(support_mask.size)
+    out = {
+        "key": str(key),
+        "shape": tuple(int(x) for x in img.shape),
+        "n_tiles": int(n_tiles),
+        "unique_centers": int(unique_centers),
+        "collided_tiles": int(collided_tiles),
+        "collision_fraction": float(collided_tiles / max(1, n_tiles)),
+        "max_stack": int(counts.max()) if counts.size else 1,
+        "support_pixels": int(support_pixels),
+        "canvas_pixels": int(canvas_pixels),
+        "support_fraction": float(support_pixels / max(1, canvas_pixels)),
+        "soft_rasterization": bool(cache.get("soft_rasterization", False)),
+        "tile_px": int(cache.get("tile_px", 1)),
+        "scale": float(cache.get("scale", 1.0)),
+    }
+    return out
+
+
 def show_cached_image(
     adata,
     key: str = "image_plot_slic",
@@ -1855,8 +2016,12 @@ def show_cached_image(
     if img.ndim != 3:
         raise ValueError("Cached object does not contain a 3D image array.")
 
-    if figsize is None:
-        figsize = cache.get("figsize", (8, 8))
+    figsize, fig_dpi = _resolve_cached_preview_figsize_and_dpi(
+        cache,
+        img.shape,
+        figsize=figsize,
+        fig_dpi=fig_dpi,
+    )
 
     plot_params = cache.get("image_plot_params", {}) or {}
     apply_brighten = (

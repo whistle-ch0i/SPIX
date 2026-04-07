@@ -993,3 +993,343 @@ def ranks_to_compactness_trajectory(
         label = f"{col_prefix}{format(float(comp), 'g')}"
         comp_rank[label] = rank_df[cols].mean(axis=1)
     return comp_rank
+
+
+def _fdr_bh_simple(pvalues: np.ndarray) -> np.ndarray:
+    p = np.asarray(pvalues, dtype=np.float64)
+    n = int(p.size)
+    if n == 0:
+        return p
+    order = np.argsort(p)
+    ranked = p[order]
+    q = ranked * float(n) / (np.arange(n, dtype=np.float64) + 1.0)
+    q = np.minimum.accumulate(q[::-1])[::-1]
+    q = np.clip(q, 0.0, 1.0)
+    out = np.empty_like(q)
+    out[order] = q
+    return out
+
+
+def _extract_resolution_columns(
+    res_rank: pd.DataFrame,
+    *,
+    resolution_cols: Optional[List[str]] = None,
+    prefix: str = "res_",
+) -> tuple[list[str], np.ndarray]:
+    if resolution_cols is None:
+        resolution_cols = [c for c in res_rank.columns if str(c).startswith(str(prefix))]
+    cols = [str(c) for c in resolution_cols if c in res_rank.columns]
+    if len(cols) < 3:
+        raise ValueError("Need at least 3 resolution columns to estimate continuous scale specificity.")
+    res_vals = []
+    for c in cols:
+        try:
+            res_vals.append(float(str(c)[len(prefix):]))
+        except Exception as e:
+            raise ValueError(f"Could not parse resolution value from column '{c}' with prefix '{prefix}'.") from e
+    return cols, np.asarray(res_vals, dtype=np.float64)
+
+
+def continuous_scale_specificity(
+    res_rank: pd.DataFrame,
+    *,
+    resolution_cols: Optional[List[str]] = None,
+    prefix: str = "res_",
+    fillna_worst: bool = True,
+    n_permutations: int = 2000,
+    random_state: Optional[int] = 0,
+    alpha: float = 0.05,
+    weight_power: float = 1.0,
+    min_weight_eps: float = 1e-6,
+    permutation_chunk_size: int = 512,
+) -> pd.DataFrame:
+    """Estimate continuous multiscale specificity from per-resolution ranks.
+
+    This avoids arbitrary early/mid/late bins and instead summarizes each gene by:
+    - preferred_scale_um: weighted center of preference on the log2-resolution axis
+    - breadth_log2_um: weighted spread across scales (smaller = more localized)
+    - peak_prominence: separation between best and second-best resolution preference
+    - specificity_stat: prominence divided by breadth
+    - empirical p/q-value: permutation test against randomized scale ordering
+    - leave-one-out stability metrics
+
+    Parameters
+    ----------
+    res_rank
+        Gene x resolution-rank table, typically from `ranks_to_resolution_trajectory`.
+        Lower ranks are better.
+    resolution_cols
+        Optional explicit resolution columns. If omitted, uses columns starting with `prefix`.
+    prefix
+        Prefix used to parse resolution values from columns, default `"res_"`.
+    fillna_worst
+        If True, fill missing ranks with worst rank per table before scoring.
+    n_permutations
+        Number of within-gene permutation null draws over the scale axis.
+    random_state
+        Random seed for reproducible permutation nulls.
+    alpha
+        Significance threshold used only for the `specificity_class` summary column.
+    weight_power
+        Exponent applied to preference weights `1 - rank_pct`.
+    min_weight_eps
+        Small additive constant to stabilize weighted summaries.
+    permutation_chunk_size
+        Number of genes per chunk when evaluating permutation nulls.
+    """
+    if res_rank is None or len(res_rank) == 0:
+        return pd.DataFrame(index=getattr(res_rank, "index", None))
+
+    cols, resolutions = _extract_resolution_columns(res_rank, resolution_cols=resolution_cols, prefix=prefix)
+    work = res_rank.loc[:, cols].apply(pd.to_numeric, errors="coerce")
+    if fillna_worst:
+        work = fill_missing_ranks_with_worst(work)
+    else:
+        work = work.copy()
+        max_per_col = work.max(axis=0, skipna=True)
+        for c in work.columns:
+            worst = float(max_per_col.get(c, np.nan))
+            if not np.isfinite(worst):
+                worst = 1.0
+            work[c] = work[c].fillna(worst + 1.0)
+
+    rank_mat = work.to_numpy(dtype=np.float64, copy=False)
+    col_max = np.nanmax(rank_mat, axis=0)
+    col_max = np.where(np.isfinite(col_max) & (col_max > 0), col_max, 1.0)
+    rank_pct = rank_mat / col_max[None, :]
+    pref = np.clip(1.0 - rank_pct, 0.0, 1.0)
+    if float(weight_power) != 1.0:
+        pref = np.power(pref, float(weight_power))
+
+    log_res = np.log2(np.asarray(resolutions, dtype=np.float64))
+    eps = float(max(min_weight_eps, 1e-12))
+    weights = pref + eps
+    weight_sum = np.sum(weights, axis=1)
+    preferred_log = np.sum(weights * log_res[None, :], axis=1) / np.maximum(weight_sum, eps)
+    preferred_scale = np.power(2.0, preferred_log)
+    breadth = np.sqrt(
+        np.sum(weights * (log_res[None, :] - preferred_log[:, None]) ** 2, axis=1) / np.maximum(weight_sum, eps)
+    )
+
+    best_idx = np.argmax(pref, axis=1)
+    if pref.shape[1] > 1:
+        second_pref = np.partition(pref, kth=pref.shape[1] - 2, axis=1)[:, -2]
+    else:
+        second_pref = np.zeros(pref.shape[0], dtype=np.float64)
+    best_pref = pref[np.arange(pref.shape[0]), best_idx]
+    peak_prominence = best_pref - second_pref
+    specificity_stat = peak_prominence / (breadth + 1e-6)
+    nearest_idx = np.argmin(np.abs(log_res[None, :] - preferred_log[:, None]), axis=1)
+
+    m = int(pref.shape[1])
+    rng = np.random.default_rng(random_state)
+    perms = np.empty((int(max(1, n_permutations)), m), dtype=np.int64)
+    base_idx = np.arange(m, dtype=np.int64)
+    for i in range(perms.shape[0]):
+        perms[i] = rng.permutation(base_idx)
+
+    null_ge = np.zeros(pref.shape[0], dtype=np.int32)
+    null_mean = np.zeros(pref.shape[0], dtype=np.float64)
+    null_m2 = np.zeros(pref.shape[0], dtype=np.float64)
+
+    chunk = int(max(1, permutation_chunk_size))
+    for i in range(0, pref.shape[0], chunk):
+        j = min(i + chunk, pref.shape[0])
+        pref_chunk = pref[i:j]
+        permuted = pref_chunk[:, perms]
+        perm_weights = permuted + eps
+        perm_wsum = np.sum(perm_weights, axis=2)
+        perm_pref_log = np.sum(perm_weights * log_res[None, None, :], axis=2) / np.maximum(perm_wsum, eps)
+        perm_breadth = np.sqrt(
+            np.sum(perm_weights * (log_res[None, None, :] - perm_pref_log[:, :, None]) ** 2, axis=2)
+            / np.maximum(perm_wsum, eps)
+        )
+        perm_best = np.max(permuted, axis=2)
+        if m > 1:
+            perm_second = np.partition(permuted, kth=m - 2, axis=2)[:, :, -2]
+        else:
+            perm_second = np.zeros((j - i, perms.shape[0]), dtype=np.float64)
+        perm_prom = perm_best - perm_second
+        perm_stat = perm_prom / (perm_breadth + 1e-6)
+
+        obs = specificity_stat[i:j][:, None]
+        null_ge[i:j] = np.sum(perm_stat >= obs, axis=1, dtype=np.int32)
+        null_mean[i:j] = np.mean(perm_stat, axis=1)
+        null_m2[i:j] = np.var(perm_stat, axis=1, ddof=0)
+
+    pvalue = (null_ge.astype(np.float64) + 1.0) / (float(perms.shape[0]) + 1.0)
+    qvalue = _fdr_bh_simple(pvalue)
+    zscore = (specificity_stat - null_mean) / np.sqrt(np.maximum(null_m2, 1e-12))
+
+    loo_pref = np.full((pref.shape[0], m), np.nan, dtype=np.float64)
+    loo_nearest = np.full((pref.shape[0], m), -1, dtype=np.int32)
+    for drop_idx in range(m):
+        keep = np.arange(m) != int(drop_idx)
+        pref_sub = pref[:, keep]
+        log_sub = log_res[keep]
+        w_sub = pref_sub + eps
+        wsum_sub = np.sum(w_sub, axis=1)
+        pref_log_sub = np.sum(w_sub * log_sub[None, :], axis=1) / np.maximum(wsum_sub, eps)
+        loo_pref[:, drop_idx] = pref_log_sub
+        loo_nearest[:, drop_idx] = np.argmin(np.abs(log_res[None, :] - pref_log_sub[:, None]), axis=1)
+
+    stability_abs_shift = np.abs(loo_pref - preferred_log[:, None])
+    stability_median_abs_shift = np.nanmedian(stability_abs_shift, axis=1)
+    stability_max_abs_shift = np.nanmax(stability_abs_shift, axis=1)
+    stability_fraction_same = np.mean(loo_nearest == nearest_idx[:, None], axis=1)
+
+    out = pd.DataFrame(index=res_rank.index.copy())
+    out["preferred_scale_um"] = preferred_scale
+    out["preferred_log2_scale"] = preferred_log
+    out["breadth_log2_um"] = breadth
+    out["best_resolution"] = np.asarray(cols, dtype=object)[best_idx]
+    out["nearest_resolution"] = np.asarray(cols, dtype=object)[nearest_idx]
+    out["best_resolution_pref"] = best_pref
+    out["second_resolution_pref"] = second_pref
+    out["peak_prominence"] = peak_prominence
+    out["specificity_stat"] = specificity_stat
+    out["null_mean"] = null_mean
+    out["null_sd"] = np.sqrt(np.maximum(null_m2, 0.0))
+    out["zscore"] = zscore
+    out["pvalue"] = pvalue
+    out["qvalue"] = qvalue
+    out["stability_median_abs_shift_log2_um"] = stability_median_abs_shift
+    out["stability_max_abs_shift_log2_um"] = stability_max_abs_shift
+    out["stability_fraction_same_resolution"] = stability_fraction_same
+    out["specificity_class"] = np.where(qvalue <= float(alpha), "scale_specific", "broad_or_flat")
+    return out.sort_values(
+        ["qvalue", "specificity_stat", "peak_prominence", "stability_fraction_same_resolution"],
+        ascending=[True, False, False, False],
+    )
+
+
+def classify_scale_specific_genes_quantile(
+    res_rank: pd.DataFrame,
+    *,
+    region_cols: Dict[str, List[str]],
+    fillna_worst: bool = True,
+    q_gap_abs: float = 0.50,
+    q_gap_rel: float = 0.50,
+    q_best_mean: float = 0.05,
+    q_best_std: float = 0.50,
+    q_spec: float = 0.50,
+) -> pd.DataFrame:
+    """Classify scale-specific genes from resolution-rank trajectories using quantile thresholds.
+
+    This packages the region-based notebook workflow the user had been using for
+    `early / mid / late` scale specificity, but replaces hard thresholds with
+    data-adaptive quantiles.
+
+    Parameters
+    ----------
+    res_rank
+        Gene x resolution-rank table, typically from `ranks_to_resolution_trajectory`.
+        Lower ranks are better.
+    region_cols
+        Required mapping from region name -> resolution columns.
+    fillna_worst
+        If True, fill missing ranks with the worst observed rank + 1 before scoring.
+    q_gap_abs
+        Quantile for `gap_abs`; larger is stricter because `gap_abs` should be high.
+    q_gap_rel
+        Quantile for `gap_rel`; larger is stricter because `gap_rel` should be high.
+    q_best_mean
+        Quantile for `best_mean`; smaller is stricter because `best_mean` should be low.
+    q_best_std
+        Quantile for `best_std`; smaller is stricter because `best_std` should be low.
+    q_spec
+        Quantile for `specificity_score`; larger is stricter because `specificity_score` should be high.
+
+    Returns
+    -------
+    pd.DataFrame
+        The input table augmented with region-level specificity metrics and final
+        `category`. The resolved thresholds are stored in `out.attrs["quantile_thresholds"]`.
+    """
+    if res_rank is None or len(res_rank) == 0:
+        return pd.DataFrame(index=getattr(res_rank, "index", None))
+
+    if region_cols is None:
+        raise ValueError("region_cols must be provided explicitly.")
+
+    region_cols = {
+        str(region): [str(c) for c in cols if str(c) in res_rank.columns]
+        for region, cols in region_cols.items()
+    }
+    missing = [region for region, cols in region_cols.items() if len(cols) == 0]
+    if missing:
+        raise ValueError(f"Missing columns for groups: {missing}")
+
+    rank_cols = [c for cols in region_cols.values() for c in cols]
+    rank_mat = res_rank.loc[:, rank_cols].apply(pd.to_numeric, errors="coerce")
+    if fillna_worst:
+        rank_mat = fill_missing_ranks_with_worst(rank_mat)
+
+    rank_arr = rank_mat.to_numpy(dtype=np.float64, copy=False)
+    col_max = np.nanmax(rank_arr, axis=0)
+    col_max = np.where(np.isfinite(col_max) & (col_max > 0), col_max, 1.0)
+    rank_pct = rank_mat.divide(col_max, axis=1).fillna(1.0)
+
+    out = res_rank.copy()
+
+    for region, cols in region_cols.items():
+        out[f"mean_{region}"] = rank_pct[cols].mean(axis=1)
+        out[f"std_{region}"] = rank_pct[cols].std(axis=1, ddof=0)
+
+    mean_tbl = pd.DataFrame({region: out[f"mean_{region}"] for region in region_cols})
+    std_tbl = pd.DataFrame({region: out[f"std_{region}"] for region in region_cols})
+
+    sorted_means = np.sort(mean_tbl.to_numpy(dtype=np.float64, copy=False), axis=1)
+    out["best_region"] = mean_tbl.idxmin(axis=1)
+    out["best_mean"] = sorted_means[:, 0]
+    out["second_best_mean"] = sorted_means[:, 1]
+    out["gap_abs"] = out["second_best_mean"] - out["best_mean"]
+    out["gap_rel"] = out["gap_abs"] / (out["second_best_mean"] + 1e-8)
+
+    region_to_idx = {region: i for i, region in enumerate(mean_tbl.columns)}
+    best_idx = out["best_region"].map(region_to_idx).to_numpy()
+    out["best_std"] = std_tbl.to_numpy(dtype=np.float64, copy=False)[np.arange(len(out)), best_idx]
+    out["specificity_score"] = out["gap_abs"] / (out["best_std"] + 1e-3)
+
+    rp = rank_pct.to_numpy(dtype=np.float64, copy=False)
+    others_mean = (rp.sum(axis=1, keepdims=True) - rp) / max(1, rp.shape[1] - 1)
+    res_score = others_mean - rp
+    best_res_idx = np.argmax(res_score, axis=1)
+    if res_score.shape[1] > 1:
+        second_res = np.partition(res_score, kth=res_score.shape[1] - 2, axis=1)[:, -2]
+    else:
+        second_res = np.zeros(res_score.shape[0], dtype=np.float64)
+
+    out["best_resolution"] = np.asarray(rank_cols, dtype=object)[best_res_idx]
+    out["best_resolution_score"] = res_score[np.arange(res_score.shape[0]), best_res_idx]
+    out["best_resolution_margin"] = out["best_resolution_score"] - second_res
+
+    min_gap_abs = float(out["gap_abs"].quantile(float(q_gap_abs)))
+    min_gap_rel = float(out["gap_rel"].quantile(float(q_gap_rel)))
+    max_best_mean = float(out["best_mean"].quantile(float(q_best_mean)))
+    max_best_std = float(out["best_std"].quantile(float(q_best_std)))
+    min_spec_score = float(out["specificity_score"].quantile(float(q_spec)))
+
+    is_specific = (
+        (out["gap_abs"] >= min_gap_abs) &
+        (out["gap_rel"] >= min_gap_rel) &
+        (out["best_mean"] <= max_best_mean) &
+        (out["best_std"] <= max_best_std) &
+        (out["specificity_score"] >= min_spec_score)
+    )
+
+    out["category"] = np.where(is_specific, out["best_region"], "mixed")
+    out.attrs["quantile_thresholds"] = {
+        "q_gap_abs": float(q_gap_abs),
+        "q_gap_rel": float(q_gap_rel),
+        "q_best_mean": float(q_best_mean),
+        "q_best_std": float(q_best_std),
+        "q_spec": float(q_spec),
+        "min_gap_abs": min_gap_abs,
+        "min_gap_rel": min_gap_rel,
+        "max_best_mean": max_best_mean,
+        "max_best_std": max_best_std,
+        "min_spec_score": min_spec_score,
+        "region_cols": {k: list(v) for k, v in region_cols.items()},
+    }
+    return out
