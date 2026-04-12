@@ -22,8 +22,14 @@ from shapely.validation import explain_validity
 from scipy.spatial import KDTree
 import alphashape
 from skimage.measure import find_contours
-from skimage.segmentation import find_boundaries
-from scipy.ndimage import gaussian_filter, binary_dilation
+from scipy.ndimage import (
+    gaussian_filter,
+    binary_closing,
+    binary_dilation,
+    binary_fill_holes,
+    distance_transform_edt,
+    label,
+)
 
 import logging
 from time import perf_counter
@@ -330,6 +336,196 @@ def _cap_tile_size_by_render_extent(
     )
 
 
+def _build_subpixel_boundary_mask(
+    labels: np.ndarray,
+    *,
+    include_background_interfaces: bool,
+) -> np.ndarray:
+    labels = np.asarray(labels)
+    h, w = labels.shape
+    boundary_mask = np.zeros((max(1, 2 * h - 1), max(1, 2 * w - 1)), dtype=bool)
+
+    if h >= 1 and w >= 2:
+        left = labels[:, :-1]
+        right = labels[:, 1:]
+        horiz = left != right
+        if include_background_interfaces:
+            horiz &= (left >= 0) | (right >= 0)
+        else:
+            horiz &= (left >= 0) & (right >= 0)
+        boundary_mask[0::2, 1::2] = horiz
+    else:
+        horiz = np.zeros((h, max(0, w - 1)), dtype=bool)
+
+    if h >= 2 and w >= 1:
+        top = labels[:-1, :]
+        bottom = labels[1:, :]
+        vert = top != bottom
+        if include_background_interfaces:
+            vert &= (top >= 0) | (bottom >= 0)
+        else:
+            vert &= (top >= 0) & (bottom >= 0)
+        boundary_mask[1::2, 0::2] = vert
+    else:
+        vert = np.zeros((max(0, h - 1), w), dtype=bool)
+
+    if h >= 2 and w >= 2:
+        junction = np.zeros((h - 1, w - 1), dtype=bool)
+        if horiz.size:
+            junction |= horiz[:-1, :]
+            junction |= horiz[1:, :]
+        if vert.size:
+            junction |= vert[:, :-1]
+            junction |= vert[:, 1:]
+        boundary_mask[1::2, 1::2] = junction
+
+    return boundary_mask
+
+
+def _regularize_support_mask(
+    support_mask: np.ndarray,
+    *,
+    fill_holes: bool = True,
+    closing_radius: int = 1,
+    min_component_size: int = 64,
+) -> np.ndarray:
+    support = np.asarray(support_mask, dtype=bool)
+    if fill_holes:
+        support = binary_fill_holes(support)
+    close_radius = int(max(0, closing_radius))
+    if close_radius > 0:
+        structure = np.ones((2 * close_radius + 1, 2 * close_radius + 1), dtype=bool)
+        support = binary_closing(support, structure=structure)
+        support = binary_fill_holes(support)
+    min_size = int(max(0, min_component_size))
+    if min_size > 0 and np.any(support):
+        comp_labels, n_comp = label(support)
+        if n_comp > 0:
+            counts = np.bincount(comp_labels.ravel())
+            keep = counts >= min_size
+            if keep.size:
+                keep[0] = False
+                support = keep[comp_labels]
+    return support
+
+
+def _prepare_outline_labels(
+    labels: np.ndarray,
+    *,
+    fill_holes: bool = True,
+    closing_radius: int = 1,
+    min_component_size: int = 64,
+):
+    labels_arr = np.asarray(labels, dtype=int)
+    valid_mask = labels_arr >= 0
+    support = _regularize_support_mask(
+        valid_mask,
+        fill_holes=fill_holes,
+        closing_radius=closing_radius,
+        min_component_size=min_component_size,
+    )
+    if not np.any(support):
+        return np.full_like(labels_arr, -1), support
+
+    filled = labels_arr.copy()
+    add_mask = support & ~valid_mask
+    if np.any(add_mask) and np.any(valid_mask):
+        _, nearest_idx = distance_transform_edt(~valid_mask, return_indices=True)
+        filled[add_mask] = labels_arr[
+            nearest_idx[0][add_mask],
+            nearest_idx[1][add_mask],
+        ]
+    filled = np.where(support, filled, -1)
+    return filled, support
+
+
+def _build_support_outline_mask(
+    labels: np.ndarray,
+    *,
+    fill_holes: bool = True,
+    closing_radius: int = 1,
+    min_component_size: int = 64,
+) -> np.ndarray:
+    support = _regularize_support_mask(
+        np.asarray(labels) >= 0,
+        fill_holes=fill_holes,
+        closing_radius=closing_radius,
+        min_component_size=min_component_size,
+    )
+    if not np.any(support):
+        return np.zeros((max(1, 2 * labels.shape[0] - 1), max(1, 2 * labels.shape[1] - 1)), dtype=bool)
+    support_labels = np.where(support, 1, -1)
+    return _build_subpixel_boundary_mask(
+        support_labels,
+        include_background_interfaces=True,
+    )
+
+
+def _render_boundary_mask(
+    ax,
+    boundary_mask,
+    extent,
+    boundary_color,
+    boundary_linewidth,
+    alpha,
+    linestyle,
+    smooth_sigma=0,
+    *,
+    render: str = "contour",
+    thickness_px: int = 1,
+    antialiased: bool = True,
+):
+    x_min, x_max, y_min, y_max = extent
+    render_mode = str(render or "contour").lower()
+    if render_mode not in {"contour", "raster"}:
+        render_mode = "contour"
+
+    if render_mode == "raster":
+        thick = int(max(1, thickness_px))
+        mask = np.asarray(boundary_mask, dtype=bool)
+        if thick > 1:
+            mask = binary_dilation(mask, iterations=int(thick - 1))
+
+        rgba = np.zeros((mask.shape[0], mask.shape[1], 4), dtype=np.float32)
+        col = mcolors.to_rgba(boundary_color, alpha=float(alpha))
+        rgba[mask] = col
+        ax.imshow(
+            rgba,
+            origin="lower",
+            extent=[x_min, x_max, y_min, y_max],
+            interpolation="nearest",
+        )
+        return
+
+    mask_float = np.asarray(boundary_mask, dtype=float)
+    if smooth_sigma > 0:
+        mask_float = gaussian_filter(mask_float, smooth_sigma)
+
+    contours = find_contours(mask_float, 0.5)
+    if not contours:
+        return
+
+    mh, mw = boundary_mask.shape
+    segments = [
+        np.column_stack(
+            (
+                contour[:, 1] / max(1, mw) * (x_max - x_min) + x_min,
+                contour[:, 0] / max(1, mh) * (y_max - y_min) + y_min,
+            )
+        )
+        for contour in contours
+    ]
+    lc = LineCollection(
+        segments,
+        colors=boundary_color,
+        linewidths=boundary_linewidth,
+        linestyles=linestyle,
+        alpha=alpha,
+        antialiaseds=bool(antialiased),
+    )
+    ax.add_collection(lc)
+
+
 def _plot_boundaries_from_label_image(
     ax,
     label_img,
@@ -347,80 +543,112 @@ def _plot_boundaries_from_label_image(
 ):
     """Plot boundaries extracted from a label image.
 
-    Uses skimage.segmentation.find_boundaries to locate pixel
-    transitions so curved and donut-shaped segments render correctly.
-
-    Parameters
-    ----------
-    smooth_sigma : float, optional
-        Standard deviation for Gaussian smoothing of the boundary mask.
-        ``0`` disables smoothing.
+    ``include_background`` supports three modes:
+    - ``True``: draw segment-segment and segment-background interfaces.
+    - ``False``: draw only segment-segment interfaces.
+    - ``\"outline\"``: draw segment-segment interfaces plus the outer support
+      outline, without internal background/support interfaces.
     """
-    x_min, x_max, y_min, y_max = extent
-    h, w = label_img.shape
+    labels = np.asarray(label_img)
+    include_mode = include_background
+    draw_support_outline = False
+    if isinstance(include_mode, str):
+        mode_norm = include_mode.strip().lower()
+        if mode_norm in {"outline", "outer", "support", "external"}:
+            include_mode = False
+            draw_support_outline = True
+        elif mode_norm in {"true", "all", "full", "background"}:
+            include_mode = True
+        elif mode_norm in {"false", "none", "segment_only", "segments"}:
+            include_mode = False
+        else:
+            include_mode = bool(include_background)
+    else:
+        include_mode = bool(include_background)
 
-    boundary_mask = find_boundaries(
-        label_img,
-        mode="outer",
-        background=-1,
-        connectivity=2,
-    )
-    if not include_background:
-        boundary_mask &= (np.asarray(label_img) >= 0)
-    render_mode = str(render or "contour").lower()
-    if render_mode not in {"contour", "raster"}:
-        render_mode = "contour"
-
-    if render_mode == "raster":
-        thick = int(max(1, thickness_px))
-        mask = boundary_mask
-        if thick > 1:
-            mask = binary_dilation(mask, iterations=int(thick - 1))
-
-        rgba = np.zeros((h, w, 4), dtype=np.float32)
-        col = mcolors.to_rgba(boundary_color, alpha=float(alpha))
-        rgba[mask] = col
-        ax.imshow(
-            rgba,
-            origin="lower",
-            extent=[x_min, x_max, y_min, y_max],
-            interpolation="nearest",
+    labels_for_base = labels
+    if draw_support_outline:
+        labels_for_base, _ = _prepare_outline_labels(
+            labels,
+            fill_holes=True,
+            closing_radius=1,
+            min_component_size=64,
         )
-        return
 
-    mask_float = boundary_mask.astype(float)
-    if smooth_sigma > 0:
-        mask_float = gaussian_filter(mask_float, smooth_sigma)
-
-    contours = find_contours(mask_float, 0.5)
-    if not contours:
-        return
-
-    segments = [
-        np.column_stack(
-            (
-                contour[:, 1] / w * (x_max - x_min) + x_min,
-                contour[:, 0] / h * (y_max - y_min) + y_min,
-            )
-        )
-        for contour in contours
-    ]
-
-    lc = LineCollection(
-        segments,
-        colors=boundary_color,
-        linewidths=boundary_linewidth,
-        linestyles=linestyle,
-        alpha=alpha,
-        antialiaseds=bool(antialiased),
+    base_mask = _build_subpixel_boundary_mask(
+        labels_for_base,
+        include_background_interfaces=include_mode,
     )
-    ax.add_collection(lc)
+    _render_boundary_mask(
+        ax,
+        base_mask,
+        extent,
+        boundary_color,
+        boundary_linewidth,
+        alpha,
+        linestyle,
+        smooth_sigma,
+        render=render,
+        thickness_px=thickness_px,
+        antialiased=antialiased,
+    )
+
+    if draw_support_outline:
+        support_outline_mask = _build_support_outline_mask(
+            labels,
+            fill_holes=True,
+            closing_radius=1,
+            min_component_size=64,
+        )
+        _render_boundary_mask(
+            ax,
+            support_outline_mask,
+            extent,
+            boundary_color,
+            boundary_linewidth,
+            alpha,
+            linestyle,
+            smooth_sigma,
+            render=render,
+            thickness_px=thickness_px,
+            antialiased=antialiased,
+        )
 
 
 def _sanitize_segment_key_for_uns(name: str) -> str:
     sanitized = re.sub(r"[^0-9a-zA-Z_]+", "_", str(name))
     sanitized = sanitized.strip("_")
     return sanitized or "Segment"
+
+
+def _resolve_stored_pixel_boundary_payload(
+    payload,
+    *,
+    default_extent=None,
+    extent_scale: float = 1.0,
+):
+    """Return masked label image plus plotting extent from a stored payload."""
+    if not isinstance(payload, dict):
+        return None, default_extent
+
+    label_img = np.asarray(payload.get("label_img"), dtype=int)
+    stored_support_mask = payload.get("support_mask", None)
+    if stored_support_mask is not None:
+        stored_support_mask = np.asarray(stored_support_mask, dtype=bool)
+        if stored_support_mask.shape == label_img.shape:
+            label_img = np.where(stored_support_mask, label_img, -1)
+
+    if default_extent is None:
+        default_extent = [0.0, float(label_img.shape[1]), 0.0, float(label_img.shape[0])]
+
+    scale = float(extent_scale)
+    extent = [
+        float(payload.get("x_min_eff", default_extent[0])) * scale,
+        float(payload.get("x_max_eff", default_extent[1])) * scale,
+        float(payload.get("y_min_eff", default_extent[2])) * scale,
+        float(payload.get("y_max_eff", default_extent[3])) * scale,
+    ]
+    return label_img, extent
 
 
 def _resolve_plot_raster_state(
@@ -555,6 +783,7 @@ def _rasterize_rgba_and_label_buffer(
     label_codes=None,
     runtime_fill_from_boundary: bool = False,
     runtime_fill_closing_radius: int = 1,
+    runtime_fill_external_radius: int = 0,
     runtime_fill_holes: bool = True,
     chunk_size: int = 50000,
     logger=None,
@@ -656,8 +885,10 @@ def _rasterize_rgba_and_label_buffer(
                         if label_img is not None:
                             label_img[py[mask_upd], px[mask_upd]] = label_codes_arr[i:end][mask_upd]
 
+    label_paint_mask = paint_mask.copy() if label_img is not None else None
     fill_active = bool(runtime_fill_from_boundary) or bool(runtime_fill_holes)
     fill_radius = int(runtime_fill_closing_radius) if bool(runtime_fill_from_boundary) else 0
+    external_radius = int(runtime_fill_external_radius) if bool(runtime_fill_from_boundary) else 0
     if fill_active:
         seed_rgba = np.empty((cols_arr.shape[0], 4), dtype=np.float32)
         seed_rgba[:, :3] = cols_arr
@@ -672,26 +903,16 @@ def _rasterize_rgba_and_label_buffer(
             seed_y=cy_arr,
             seed_values=seed_rgba,
             closing_radius=int(fill_radius),
+            external_radius=int(external_radius),
             fill_holes=bool(runtime_fill_holes),
             logger=logger if verbose else None,
             context=context,
         )
-        if label_img is not None:
-            label_img_fill = label_img.astype(np.float32, copy=True)[..., None]
-            _raster.fill_raster_from_boundary(
-                img=label_img_fill,
-                occupancy_mask=paint_mask.copy(),
-                seed_x=cx_arr,
-                seed_y=cy_arr,
-                seed_values=label_codes_arr.astype(np.float32, copy=False)[:, None],
-                closing_radius=int(fill_radius),
-                fill_holes=bool(runtime_fill_holes),
-                logger=logger if verbose else None,
-                context=f"{context}(label_img)",
-            )
-            label_img = np.rint(label_img_fill[..., 0]).astype(int, copy=False)
     if label_img is not None:
-        label_img[~paint_mask] = -1
+        # Keep boundary extraction anchored to observed rasterized labels only.
+        # Filling label_img from the morphological support causes synthetic labels
+        # to spill into blank/background regions, producing contour artifacts.
+        label_img[~label_paint_mask] = -1
 
     return img, label_img, paint_mask
 
@@ -744,7 +965,7 @@ def image_plot(
     pixel_boundary_render: str = "contour",  # 'contour'|'raster'
     pixel_boundary_thickness_px: int = 1,    # used when pixel_boundary_render='raster'
     pixel_boundary_antialiased: bool = True, # used when pixel_boundary_render='contour'
-    pixel_boundary_include_background: bool = False,
+    pixel_boundary_include_background: str | bool = "outline",
     use_imshow=True,  # When True, render points as an image for speed
     pixel_shape="square",  # 'square' (default) or 'circle'
     chunk_size=50000,  # Control chunking
@@ -795,6 +1016,7 @@ def image_plot(
     gapless: bool = False,  # If True, render raster-expanded tiles as a packed grid (no holes, faster)
     runtime_fill_from_boundary: bool = False,
     runtime_fill_closing_radius: int = 1,
+    runtime_fill_external_radius: int = 0,
     runtime_fill_holes: bool = True,
     soft_rasterization: bool = False,
     resolve_center_collisions: bool = False,
@@ -1242,6 +1464,7 @@ def image_plot(
 
         fill_active = bool(runtime_fill_from_boundary) or bool(runtime_fill_holes)
         fill_radius = int(runtime_fill_closing_radius) if bool(runtime_fill_from_boundary) else 0
+        external_radius = int(runtime_fill_external_radius) if bool(runtime_fill_from_boundary) else 0
         if fill_active:
             seed_rgba = np.empty((cols.shape[0], 4), dtype=np.float32)
             seed_rgba[:, :3] = cols.astype(np.float32, copy=False)
@@ -1253,6 +1476,7 @@ def image_plot(
                 seed_y=cy,
                 seed_values=seed_rgba,
                 closing_radius=int(fill_radius),
+                external_radius=int(external_radius),
                 fill_holes=bool(runtime_fill_holes),
                 logger=logger if verbose else None,
                 context="image_plot",
@@ -1908,12 +2132,10 @@ def image_plot(
         use_stored_boundary_labels = stored_pixel_boundary is not None
         label_img = None
         if use_stored_boundary_labels:
-            label_img = np.asarray(stored_pixel_boundary.get("label_img"), dtype=int)
-            stored_support_mask = stored_pixel_boundary.get("support_mask", None)
-            if stored_support_mask is not None:
-                stored_support_mask = np.asarray(stored_support_mask, dtype=bool)
-                if stored_support_mask.shape == label_img.shape:
-                    label_img = np.where(stored_support_mask, label_img, -1)
+            label_img, _ = _resolve_stored_pixel_boundary_payload(
+                stored_pixel_boundary,
+                default_extent=[x_min_eff, x_max_eff, y_min_eff, y_max_eff],
+            )
         elif plot_boundaries and boundary_method == "pixel" and segment_available:
             label_img = np.full((h, w), -1, dtype=int)
             seg_codes = pd.Categorical(coordinates_df["Segment"]).codes
@@ -2000,8 +2222,10 @@ def image_plot(
                             if label_img is not None and (not use_stored_boundary_labels):
                                 label_img[py[mask_upd], px[mask_upd]] = seg_codes[i:end][mask_upd]
 
+        label_paint_mask = paint_mask.copy() if (label_img is not None and (not use_stored_boundary_labels)) else None
         fill_active = bool(runtime_fill_from_boundary) or bool(runtime_fill_holes)
         fill_radius = int(runtime_fill_closing_radius) if bool(runtime_fill_from_boundary) else 0
+        external_radius = int(runtime_fill_external_radius) if bool(runtime_fill_from_boundary) else 0
         if fill_active:
             seed_rgba = np.empty((cols.shape[0], 4), dtype=np.float32)
             seed_rgba[:, :3] = cols.astype(np.float32, copy=False)
@@ -2016,26 +2240,13 @@ def image_plot(
                 seed_y=cy,
                 seed_values=seed_rgba,
                 closing_radius=int(fill_radius),
+                external_radius=int(external_radius),
                 fill_holes=bool(runtime_fill_holes),
                 logger=logger if verbose else None,
                 context="image_plot",
             )
-            if label_img is not None and (not use_stored_boundary_labels):
-                label_img_fill = label_img.astype(np.float32, copy=True)[..., None]
-                _raster.fill_raster_from_boundary(
-                    img=label_img_fill,
-                    occupancy_mask=paint_mask.copy(),
-                    seed_x=cx,
-                    seed_y=cy,
-                    seed_values=seg_codes.astype(np.float32, copy=False)[:, None],
-                    closing_radius=int(fill_radius),
-                    fill_holes=bool(runtime_fill_holes),
-                    logger=logger if verbose else None,
-                    context="image_plot(label_img)",
-                )
-                label_img = np.rint(label_img_fill[..., 0]).astype(int, copy=False)
         if label_img is not None and (not use_stored_boundary_labels):
-            label_img[~paint_mask] = -1
+            label_img[~label_paint_mask] = -1
         if verbose and collision_info is not None:
             logger.info(
                 "image_plot: center collision fraction %.4f -> %.4f.",
@@ -2160,16 +2371,13 @@ def image_plot(
                     angle += theta
 
         if label_img is not None:
-            boundary_extent = (
-                [
-                    float(stored_pixel_boundary.get("x_min_eff", x_min_eff)),
-                    float(stored_pixel_boundary.get("x_max_eff", x_max_eff)),
-                    float(stored_pixel_boundary.get("y_min_eff", y_min_eff)),
-                    float(stored_pixel_boundary.get("y_max_eff", y_max_eff)),
-                ]
-                if stored_pixel_boundary is not None
-                else [x_min_eff, x_max_eff, y_min_eff, y_max_eff]
-            )
+            if stored_pixel_boundary is not None:
+                _, boundary_extent = _resolve_stored_pixel_boundary_payload(
+                    stored_pixel_boundary,
+                    default_extent=[x_min_eff, x_max_eff, y_min_eff, y_max_eff],
+                )
+            else:
+                boundary_extent = [x_min_eff, x_max_eff, y_min_eff, y_max_eff]
             _plot_boundaries_from_label_image(
                 ax,
                 label_img,
@@ -2182,7 +2390,7 @@ def image_plot(
                 render=pixel_boundary_render,
                 thickness_px=pixel_boundary_thickness_px,
                 antialiased=pixel_boundary_antialiased,
-                include_background=bool(pixel_boundary_include_background),
+                include_background=pixel_boundary_include_background,
             )
             if highlight_segments:
                 categories = pd.Categorical(coordinates_df["Segment"]).categories
@@ -2216,7 +2424,7 @@ def image_plot(
                             render=pixel_boundary_render,
                             thickness_px=pixel_boundary_thickness_px,
                             antialiased=pixel_boundary_antialiased,
-                            include_background=bool(pixel_boundary_include_background),
+                            include_background=pixel_boundary_include_background,
                         )
 
     else:
@@ -2371,7 +2579,7 @@ def image_plot(
                 render=pixel_boundary_render,
                 thickness_px=pixel_boundary_thickness_px,
                 antialiased=pixel_boundary_antialiased,
-                include_background=bool(pixel_boundary_include_background),
+                include_background=pixel_boundary_include_background,
             )
 
             if highlight_segments:
@@ -2406,7 +2614,7 @@ def image_plot(
                             render=pixel_boundary_render,
                             thickness_px=pixel_boundary_thickness_px,
                             antialiased=pixel_boundary_antialiased,
-                            include_background=bool(pixel_boundary_include_background),
+                            include_background=pixel_boundary_include_background,
                         )
 
     ax.set_aspect("equal")
@@ -2838,7 +3046,7 @@ def image_plot_with_spatial_image(
     pixel_boundary_render: str = "contour",  # 'contour'|'raster'
     pixel_boundary_thickness_px: int = 1,    # used when pixel_boundary_render='raster'
     pixel_boundary_antialiased: bool = True, # used when pixel_boundary_render='contour'
-    pixel_boundary_include_background: bool = False,
+    pixel_boundary_include_background: str | bool = "outline",
     use_imshow=True,
     pixel_shape="square",
     chunk_size=50000,
@@ -2876,6 +3084,9 @@ def image_plot_with_spatial_image(
     alpha_range=(0.1, 1.0),
     alpha_clip=None,
     alpha_invert=False,
+    # Brightness / mixing controls for continuous (3D) embeddings
+    brighten_continuous=False,   # If True, brighten 3D continuous colors
+    continuous_gamma=0.8,        # Gamma < 1 brightens mid-tones
     # Visium/VisiumHD grid rendering
     coordinate_mode: str = "spatial",  # 'spatial'|'array'|'visium'|'visiumhd'|'auto'
     array_row_key: str = "array_row",
@@ -2884,6 +3095,7 @@ def image_plot_with_spatial_image(
     gapless: bool = False,  # If True, render raster-expanded tiles as a packed grid (no holes, faster)
     runtime_fill_from_boundary: bool = False,
     runtime_fill_closing_radius: int = 1,
+    runtime_fill_external_radius: int = 0,
     runtime_fill_holes: bool = True,
     soft_rasterization: bool = False,
     resolve_center_collisions: bool = False,
@@ -3299,6 +3511,18 @@ def image_plot_with_spatial_image(
                 color_norm_vmin, color_norm_vmax = float(np.nanmin(raw_vals)), float(np.nanmax(raw_vals))
         if len(dimensions) == 3:
             cols = coordinates[["R", "G", "B"]].values
+
+            # Match image_plot() behavior for continuous 3D embeddings.
+            if brighten_continuous:
+                max_per_pixel = cols.max(axis=1, keepdims=True)
+                scale = np.where(max_per_pixel > 0, 1.0 / max_per_pixel, 0.0)
+                cols = np.clip(cols * scale, 0.0, 1.0)
+                try:
+                    gamma = float(continuous_gamma)
+                    if gamma > 0 and gamma != 1.0:
+                        cols = np.clip(np.power(cols, gamma), 0.0, 1.0)
+                except Exception:
+                    pass
         else:
             grey_vals = coordinates["Grey"].values
             if cmap is None:
@@ -3632,6 +3856,7 @@ def image_plot_with_spatial_image(
             label_codes=seg_codes,
             runtime_fill_from_boundary=bool(runtime_fill_from_boundary),
             runtime_fill_closing_radius=int(runtime_fill_closing_radius),
+            runtime_fill_external_radius=int(runtime_fill_external_radius),
             runtime_fill_holes=bool(runtime_fill_holes),
             chunk_size=int(chunk_size),
             logger=logger,
@@ -3639,12 +3864,11 @@ def image_plot_with_spatial_image(
             context="image_plot_with_spatial_image",
         )
         if use_stored_boundary_labels:
-            label_img = np.asarray(stored_pixel_boundary.get("label_img"), dtype=int)
-            stored_support_mask = stored_pixel_boundary.get("support_mask", None)
-            if stored_support_mask is not None:
-                stored_support_mask = np.asarray(stored_support_mask, dtype=bool)
-                if stored_support_mask.shape == label_img.shape:
-                    label_img = np.where(stored_support_mask, label_img, -1)
+            label_img, _ = _resolve_stored_pixel_boundary_payload(
+                stored_pixel_boundary,
+                default_extent=[x_min_eff, x_max_eff, y_min_eff, y_max_eff],
+                extent_scale=float(img_scaling_factor_adjusted),
+            )
         if verbose and raster_state["collision_info"] is not None:
             logger.info(
                 "image_plot_with_spatial_image: center collision fraction %.4f -> %.4f.",
@@ -3661,16 +3885,14 @@ def image_plot_with_spatial_image(
         if verbose:
             logger.info("image_plot_with_spatial_image total time: %.3fs", perf_counter() - t_all)
         if label_img is not None:
-            boundary_extent = (
-                [
-                    float(stored_pixel_boundary.get("x_min_eff", x_min_eff)),
-                    float(stored_pixel_boundary.get("x_max_eff", x_max_eff)),
-                    float(stored_pixel_boundary.get("y_min_eff", y_min_eff)),
-                    float(stored_pixel_boundary.get("y_max_eff", y_max_eff)),
-                ]
-                if stored_pixel_boundary is not None
-                else [x_min_eff, x_max_eff, y_min_eff, y_max_eff]
-            )
+            if stored_pixel_boundary is not None:
+                _, boundary_extent = _resolve_stored_pixel_boundary_payload(
+                    stored_pixel_boundary,
+                    default_extent=[x_min_eff, x_max_eff, y_min_eff, y_max_eff],
+                    extent_scale=float(img_scaling_factor_adjusted),
+                )
+            else:
+                boundary_extent = [x_min_eff, x_max_eff, y_min_eff, y_max_eff]
             _plot_boundaries_from_label_image(
                 ax,
                 label_img,
@@ -3683,7 +3905,7 @@ def image_plot_with_spatial_image(
                 render=pixel_boundary_render,
                 thickness_px=pixel_boundary_thickness_px,
                 antialiased=pixel_boundary_antialiased,
-                include_background=bool(pixel_boundary_include_background),
+                include_background=pixel_boundary_include_background,
             )
 
     else:
@@ -3764,18 +3986,11 @@ def image_plot_with_spatial_image(
         # Pixel boundary extraction for scatter
         if plot_boundaries and boundary_method == "pixel" and segment_available:
             if stored_pixel_boundary is not None:
-                label_img = np.asarray(stored_pixel_boundary.get("label_img"), dtype=int)
-                stored_support_mask = stored_pixel_boundary.get("support_mask", None)
-                if stored_support_mask is not None:
-                    stored_support_mask = np.asarray(stored_support_mask, dtype=bool)
-                    if stored_support_mask.shape == label_img.shape:
-                        label_img = np.where(stored_support_mask, label_img, -1)
-                boundary_extent = [
-                    float(stored_pixel_boundary.get("x_min_eff", x_min)),
-                    float(stored_pixel_boundary.get("x_max_eff", x_max)),
-                    float(stored_pixel_boundary.get("y_min_eff", y_min)),
-                    float(stored_pixel_boundary.get("y_max_eff", y_max)),
-                ]
+                label_img, boundary_extent = _resolve_stored_pixel_boundary_payload(
+                    stored_pixel_boundary,
+                    default_extent=[x_min, x_max, y_min, y_max],
+                    extent_scale=float(img_scaling_factor_adjusted),
+                )
                 _plot_boundaries_from_label_image(
                     ax,
                     label_img,
@@ -3788,7 +4003,7 @@ def image_plot_with_spatial_image(
                     render=pixel_boundary_render,
                     thickness_px=pixel_boundary_thickness_px,
                     antialiased=pixel_boundary_antialiased,
-                    include_background=bool(pixel_boundary_include_background),
+                    include_background=pixel_boundary_include_background,
                 )
             else:
                 pts = coordinates[["x", "y"]].values
@@ -3851,6 +4066,7 @@ def image_plot_with_spatial_image(
                     label_codes=seg_codes,
                     runtime_fill_from_boundary=bool(runtime_fill_from_boundary),
                     runtime_fill_closing_radius=int(runtime_fill_closing_radius),
+                    runtime_fill_external_radius=int(runtime_fill_external_radius),
                     runtime_fill_holes=bool(runtime_fill_holes),
                     chunk_size=int(chunk_size),
                     logger=logger,
@@ -3875,7 +4091,7 @@ def image_plot_with_spatial_image(
                     render=pixel_boundary_render,
                     thickness_px=pixel_boundary_thickness_px,
                     antialiased=pixel_boundary_antialiased,
-                    include_background=bool(pixel_boundary_include_background),
+                    include_background=pixel_boundary_include_background,
                 )
 
     # Non-pixel boundary methods (parity with `image_plot`)

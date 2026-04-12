@@ -325,6 +325,7 @@ def image_plot_slic_segmentation(
     pixel_shape: str = "square",
     runtime_fill_from_boundary: bool = False,
     runtime_fill_closing_radius: int = 1,
+    runtime_fill_external_radius: int = 0,
     runtime_fill_holes: bool = True,
     soft_rasterization: bool = False,
     resolve_center_collisions: bool = False,
@@ -504,6 +505,7 @@ def image_plot_slic_segmentation(
 
     fill_active = bool(runtime_fill_from_boundary) or bool(runtime_fill_holes)
     fill_radius = int(runtime_fill_closing_radius) if bool(runtime_fill_from_boundary) else 0
+    external_radius = int(runtime_fill_external_radius) if bool(runtime_fill_from_boundary) else 0
     if fill_active:
         _raster.fill_raster_from_boundary(
             img=img,
@@ -512,6 +514,7 @@ def image_plot_slic_segmentation(
             seed_y=cy_seed,
             seed_values=cols,
             closing_radius=int(fill_radius),
+            external_radius=int(external_radius),
             fill_holes=bool(runtime_fill_holes),
             logger=log,
             context="image_plot_slic_segmentation",
@@ -700,6 +703,7 @@ def image_plot_slic_segmentation(
         "mask_background": bool(mask_background),
         "runtime_fill_from_boundary": bool(runtime_fill_from_boundary),
         "runtime_fill_closing_radius": int(runtime_fill_closing_radius),
+        "runtime_fill_external_radius": int(runtime_fill_external_radius),
         "runtime_fill_holes": bool(runtime_fill_holes),
         "resolve_center_collisions": bool(resolve_center_collisions),
         "center_collision_radius": int(center_collision_radius),
@@ -921,6 +925,7 @@ def slic_segmentation_from_cached_image(
         "mask_background": bool(mask_background),
         "runtime_fill_from_boundary": bool((cache.get("image_plot_params", {}) or {}).get("runtime_fill_from_boundary", False)),
         "runtime_fill_closing_radius": int((cache.get("image_plot_params", {}) or {}).get("runtime_fill_closing_radius", 0)),
+        "runtime_fill_external_radius": int((cache.get("image_plot_params", {}) or {}).get("runtime_fill_external_radius", 0)),
         "runtime_fill_holes": bool((cache.get("image_plot_params", {}) or {}).get("runtime_fill_holes", False)),
         "resolve_center_collisions": bool((cache.get("image_plot_params", {}) or {}).get("resolve_center_collisions", False)),
         "center_collision_radius": int((cache.get("image_plot_params", {}) or {}).get("center_collision_radius", 0)),

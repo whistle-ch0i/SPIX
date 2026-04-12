@@ -163,7 +163,18 @@ def estimate_tile_size_units(
 
     s_data_units *= float(imshow_scale_factor)
     s_data_units *= float(imshow_tile_size_shrink)
-    s_data_units = max(0.1, float(s_data_units))
+    # Keep very small but valid pitches for normalized/continuous coordinate systems
+    # (for example Squidpy MERFISH `obsm["spatial"]`). A hard 0.1 floor turns those
+    # into oversized display tiles and collapses the raster canvas.
+    finite_pts = pts[np.isfinite(pts).all(axis=1)]
+    if finite_pts.shape[0] >= 2:
+        x_span = float(np.ptp(finite_pts[:, 0]))
+        y_span = float(np.ptp(finite_pts[:, 1]))
+        span = max(x_span, y_span, 1.0)
+    else:
+        span = 1.0
+    min_pitch = max(np.finfo(float).eps, span * 1e-9)
+    s_data_units = max(float(min_pitch), float(s_data_units))
     return float(s_data_units)
 
 
@@ -783,6 +794,182 @@ def _binary_disk(radius: int) -> np.ndarray:
     return ((xx * xx + yy * yy) <= (radius * radius)).astype(bool)
 
 
+def _infer_regular_grid_step_1d(values: np.ndarray, *, q: float = 0.05, max_samples: int = 200_000) -> Optional[int]:
+    vals = np.asarray(values, dtype=float).ravel()
+    if vals.size < 2:
+        return None
+    vals = vals[np.isfinite(vals)]
+    if vals.size < 2:
+        return None
+    if vals.size > int(max_samples):
+        try:
+            idx = np.random.choice(vals.size, int(max_samples), replace=False)
+            vals = vals[idx]
+        except Exception:
+            vals = vals[: int(max_samples)]
+
+    try:
+        frac = np.abs(vals - np.rint(vals))
+        if float(np.nanmax(frac)) > 1e-3:
+            return None
+    except Exception:
+        return None
+
+    vals_i = np.rint(vals).astype(np.int64, copy=False)
+    uniq = np.unique(vals_i)
+    if uniq.size < 2:
+        return None
+    uniq.sort()
+    diffs = np.diff(uniq)
+    diffs = diffs[diffs > 0]
+    if diffs.size == 0:
+        return None
+    try:
+        qq = float(q)
+        if not (0.0 < qq <= 1.0):
+            qq = 0.05
+    except Exception:
+        qq = 0.05
+    step = int(np.quantile(diffs, qq))
+    if step <= 0:
+        step = int(np.min(diffs))
+    return int(step) if step > 0 else None
+
+
+def _infer_grid_support_mask(
+    *,
+    occupancy_mask: np.ndarray,
+    seed_x: np.ndarray,
+    seed_y: np.ndarray,
+    closing_radius: int,
+    fill_holes: bool,
+) -> Optional[dict]:
+    """Infer a dense support mask from lattice-like seed centers.
+
+    This is more stable than applying morphology directly to expanded tile
+    pixels, especially for sparse `origin=True` coordinates. We synthesize
+    support on the center lattice, then dilate it back to an approximate tile
+    footprint in pixel space.
+    """
+    occ = np.asarray(occupancy_mask, dtype=bool)
+    sx = np.asarray(seed_x, dtype=float).ravel()
+    sy = np.asarray(seed_y, dtype=float).ravel()
+    valid = (
+        np.isfinite(sx)
+        & np.isfinite(sy)
+        & (sx >= 0)
+        & (sy >= 0)
+        & (sx < occ.shape[1])
+        & (sy < occ.shape[0])
+    )
+    if not np.any(valid):
+        return None
+
+    sx = np.rint(sx[valid]).astype(np.int64, copy=False)
+    sy = np.rint(sy[valid]).astype(np.int64, copy=False)
+    centers = np.unique(np.column_stack([sx, sy]), axis=0)
+    if centers.shape[0] < 4:
+        return None
+
+    step_x = _infer_regular_grid_step_1d(centers[:, 0])
+    step_y = _infer_regular_grid_step_1d(centers[:, 1])
+    if step_x is None and step_y is None:
+        return None
+    if step_x is None:
+        step_x = step_y
+    if step_y is None:
+        step_y = step_x
+    step_x = int(max(1, step_x))
+    step_y = int(max(1, step_y))
+
+    x0 = int(centers[:, 0].min())
+    y0 = int(centers[:, 1].min())
+    xi = np.floor((centers[:, 0] - x0) / float(step_x) + 0.5).astype(np.int64, copy=False)
+    yi = np.floor((centers[:, 1] - y0) / float(step_y) + 0.5).astype(np.int64, copy=False)
+    w0 = int(xi.max(initial=0)) + 1
+    h0 = int(yi.max(initial=0)) + 1
+    total_cells = int(w0) * int(h0)
+    if total_cells <= 0 or total_cells > max(int(occ.size) * 4, 2_000_000):
+        return None
+
+    observed = np.zeros((h0, w0), dtype=bool)
+    observed[yi, xi] = True
+    observed_cells = int(observed.sum())
+    if observed_cells <= 0:
+        return None
+
+    # Estimate the rendered tile footprint from occupied pixels per unique seed.
+    tile_area_est = float(max(1.0, float(occ.sum()) / float(max(1, centers.shape[0]))))
+    tile_radius = int(max(0, np.ceil(np.sqrt(tile_area_est) / 2.0) - 1))
+
+    # Interpret closing_radius in raster pixels, but account for the existing
+    # tile footprint when mapping that radius back to the center lattice.
+    # Without this, `closing_radius=5` on ~7 px tiles collapses to grid_radius=1
+    # and under-fills the obvious one-cell gaps users expect to close.
+    step_eff = float(max(1, min(step_x, step_y)))
+    effective_radius_px = float(max(0, closing_radius)) + float(max(0, tile_radius))
+    grid_radius = int(max(1, np.ceil(effective_radius_px / step_eff)))
+    support = observed.copy()
+    if grid_radius > 0:
+        counts = ndi.convolve(observed.astype(np.int16), _binary_disk(grid_radius).astype(np.int16), mode="constant", cval=0)
+        min_support_neighbors = 2 if grid_radius <= 2 else 3
+        support = counts >= int(min_support_neighbors)
+        support |= observed
+        close_radius = int(max(1, grid_radius))
+        if close_radius > 0:
+            support = ndi.binary_closing(support, structure=_binary_disk(close_radius))
+
+    # `runtime_fill_from_boundary=True` should recover the interior support
+    # enclosed by the observed boundary even when `fill_holes=False`.
+    support = ndi.binary_fill_holes(support)
+    support |= observed
+
+    gy, gx = np.nonzero(support)
+    center_x = x0 + gx.astype(np.int64, copy=False) * int(step_x)
+    center_y = y0 + gy.astype(np.int64, copy=False) * int(step_y)
+    inside = (
+        (center_x >= 0)
+        & (center_y >= 0)
+        & (center_x < occ.shape[1])
+        & (center_y < occ.shape[0])
+    )
+    center_x = center_x[inside]
+    center_y = center_y[inside]
+    if center_x.size == 0:
+        return None
+
+    center_mask = np.zeros_like(occ, dtype=bool)
+    center_mask[center_y, center_x] = True
+
+    if tile_radius > 0:
+        support_mask = ndi.binary_dilation(center_mask, structure=_binary_disk(tile_radius))
+    else:
+        support_mask = center_mask
+
+    if tile_radius > 0:
+        support_mask = ndi.binary_closing(support_mask, structure=_binary_disk(tile_radius))
+
+    if fill_holes:
+        support_mask = ndi.binary_fill_holes(support_mask)
+    support_mask |= occ
+
+    support_pixels = int(support_mask.sum())
+    if support_pixels <= int(occ.sum()):
+        return None
+    if support_pixels >= int(occ.size):
+        return None
+
+    return {
+        "support_mask": support_mask,
+        "mode": "grid_support",
+        "grid_step_x": int(step_x),
+        "grid_step_y": int(step_y),
+        "grid_radius": int(grid_radius),
+        "tile_radius": int(tile_radius),
+        "support_centers": int(center_x.size),
+    }
+
+
 def fill_raster_from_boundary(
     *,
     img: np.ndarray,
@@ -791,6 +978,7 @@ def fill_raster_from_boundary(
     seed_y: np.ndarray,
     seed_values: np.ndarray,
     closing_radius: int = 1,
+    external_radius: int = 0,
     fill_holes: bool = True,
     logger=None,
     context: str = "",
@@ -811,16 +999,33 @@ def fill_raster_from_boundary(
             "filled_pixels": 0,
             "support_pixels": 0,
             "closing_radius": int(max(0, closing_radius)),
+            "external_radius": int(max(0, external_radius)),
             "fill_holes": bool(fill_holes),
         }
 
-    support_mask = occ.copy()
     radius = int(max(0, closing_radius))
+    external = int(max(0, external_radius))
+    support_info = None
+    support_mask = occ.copy()
     if radius > 0:
-        support_mask = ndi.binary_closing(support_mask, structure=_binary_disk(radius))
-    if fill_holes:
+        support_info = _infer_grid_support_mask(
+            occupancy_mask=occ,
+            seed_x=seed_x,
+            seed_y=seed_y,
+            closing_radius=radius,
+            fill_holes=bool(fill_holes),
+        )
+        if support_info is not None:
+            support_mask = np.asarray(support_info["support_mask"], dtype=bool)
+        else:
+            support_mask = ndi.binary_closing(support_mask, structure=_binary_disk(radius))
+            support_mask = ndi.binary_fill_holes(support_mask)
+    elif fill_holes:
         support_mask = ndi.binary_fill_holes(support_mask)
     support_mask |= occ
+    if external > 0:
+        support_mask = ndi.binary_dilation(support_mask, structure=_binary_disk(external))
+        support_mask |= occ
 
     fill_mask = support_mask & ~occ
     filled_pixels = int(fill_mask.sum())
@@ -855,20 +1060,36 @@ def fill_raster_from_boundary(
 
     if logger is not None and filled_pixels > 0:
         msg = f"{context}: " if context else ""
-        logger.info(
-            "%sApplied raster boundary fill with closing_radius=%d, fill_holes=%s; filled %d pixels.",
-            msg,
-            int(radius),
-            bool(fill_holes),
-            int(filled_pixels),
-        )
+        if support_info is not None:
+            logger.info(
+                "%sApplied raster boundary fill with closing_radius=%d, fill_holes=%s using %s (step=%dx%d, grid_radius=%d, tile_radius=%d); filled %d pixels.",
+                msg,
+                int(radius),
+                bool(fill_holes),
+                str(support_info.get("mode", "grid_support")),
+                int(support_info.get("grid_step_x", 1)),
+                int(support_info.get("grid_step_y", 1)),
+                int(support_info.get("grid_radius", 0)),
+                int(support_info.get("tile_radius", 0)),
+                int(filled_pixels),
+            )
+        else:
+            logger.info(
+                "%sApplied raster boundary fill with closing_radius=%d, fill_holes=%s; filled %d pixels.",
+                msg,
+                int(radius),
+                bool(fill_holes),
+                int(filled_pixels),
+            )
 
     return {
         "applied": bool(filled_pixels > 0),
         "filled_pixels": int(filled_pixels),
         "support_pixels": int(support_mask.sum()),
         "closing_radius": int(radius),
+        "external_radius": int(external),
         "fill_holes": bool(fill_holes),
+        "mode": str((support_info or {}).get("mode", "pixel")),
     }
 
 

@@ -166,6 +166,7 @@ def _cache_matches_segmentation_raster_config(
     pixel_shape: str,
     runtime_fill_from_boundary: bool,
     runtime_fill_closing_radius: int,
+    runtime_fill_external_radius: int = 0,
     runtime_fill_holes: bool,
     soft_rasterization: bool,
     resolve_center_collisions: bool,
@@ -206,6 +207,11 @@ def _cache_matches_segmentation_raster_config(
         int(max(0, int(runtime_fill_closing_radius))),
     )
     _compare(
+        "runtime_fill_external_radius",
+        params.get("runtime_fill_external_radius", None),
+        int(max(0, int(runtime_fill_external_radius))),
+    )
+    _compare(
         "runtime_fill_holes",
         params.get("runtime_fill_holes", None),
         bool(runtime_fill_holes),
@@ -222,6 +228,72 @@ def _cache_matches_segmentation_raster_config(
         int(center_collision_radius),
     )
     return (len(mismatches) == 0), mismatches
+
+
+def _resolve_compactness_search_raster_options(
+    adata: AnnData,
+    *,
+    coordinate_mode: str,
+    origin: bool,
+    array_row_key: str,
+    array_col_key: str,
+    pixel_perfect: bool,
+    pixel_shape: str,
+    soft_rasterization: bool,
+    resolve_center_collisions: bool,
+    center_collision_radius: int,
+    compactness_search_downsample_factor: float,
+    compactness_search_raster_mode: str,
+    verbose: bool,
+) -> dict[str, Any]:
+    requested_coord_mode = _resolve_requested_coordinate_mode(
+        adata,
+        coordinate_mode=str(coordinate_mode),
+        origin=bool(origin),
+        array_row_key=str(array_row_key),
+        array_col_key=str(array_col_key),
+    )
+    mode = str(compactness_search_raster_mode or "auto").lower()
+    effective_pixel_perfect = bool(pixel_perfect)
+    effective_pixel_shape = str(pixel_shape)
+    effective_soft = bool(soft_rasterization)
+    effective_resolve = bool(resolve_center_collisions)
+    reason = "requested"
+
+    auto_dense_origin_soft = bool(
+        bool(origin)
+        and str(requested_coord_mode) == "spatial"
+        and float(compactness_search_downsample_factor) > 1.0
+    )
+    if mode in {"auto", "dense_origin_soft"} and (mode == "dense_origin_soft" or auto_dense_origin_soft):
+        effective_pixel_perfect = True
+        effective_pixel_shape = "square"
+        effective_soft = True
+        effective_resolve = False
+        reason = "dense_origin_soft"
+    elif mode in {"legacy", "hard"}:
+        reason = "legacy"
+
+    result = {
+        "requested_coordinate_mode": str(requested_coord_mode),
+        "mode": mode,
+        "reason": reason,
+        "pixel_perfect": bool(effective_pixel_perfect),
+        "pixel_shape": str(effective_pixel_shape),
+        "soft_rasterization": bool(effective_soft),
+        "resolve_center_collisions": bool(effective_resolve),
+        "center_collision_radius": int(center_collision_radius),
+        "downsample_factor": float(compactness_search_downsample_factor),
+    }
+    if verbose and reason == "dense_origin_soft":
+        print(
+            "[perf] compactness search raster mode: "
+            "auto -> dense_origin_soft | "
+            f"coord={str(requested_coord_mode)} | "
+            f"origin={int(bool(origin))} | "
+            f"ds={float(compactness_search_downsample_factor):.4g}"
+        )
+    return result
 
 
 def _aggregate_labels_majority(
@@ -524,12 +596,14 @@ def _compactness_search_cache_key(
     coordinate_mode: str,
     array_row_key: str,
     array_col_key: str,
+    pixel_perfect: bool,
     pixel_shape: str,
     soft_rasterization: bool,
     resolve_center_collisions: bool,
     center_collision_radius: int,
     runtime_fill_from_boundary: bool,
     runtime_fill_closing_radius: int,
+    runtime_fill_external_radius: int,
     runtime_fill_holes: bool,
     downsample_factor: float,
 ) -> str:
@@ -542,12 +616,14 @@ def _compactness_search_cache_key(
             f"coord={coordinate_mode}",
             f"row={array_row_key}",
             f"col={array_col_key}",
+            f"pp={int(bool(pixel_perfect))}",
             f"pixel={pixel_shape}",
             f"soft={int(bool(soft_rasterization))}",
             f"collide={int(bool(resolve_center_collisions))}",
             f"cr={int(center_collision_radius)}",
             f"fillb={int(bool(runtime_fill_from_boundary))}",
             f"fillr={int(runtime_fill_closing_radius)}",
+            f"fille={int(runtime_fill_external_radius)}",
             f"fillh={int(bool(runtime_fill_holes))}",
             f"ds={float(downsample_factor):.6g}",
         ]
@@ -1152,6 +1228,7 @@ def select_compactness(
     pixel_shape: str = "square",
     runtime_fill_from_boundary: bool = False,
     runtime_fill_closing_radius: int = 1,
+    runtime_fill_external_radius: int = 0,
     runtime_fill_holes: bool = True,
     soft_rasterization: bool = False,
     resolve_center_collisions: bool = False,
@@ -1166,12 +1243,32 @@ def select_compactness(
     compactness_search_jobs: int = 1,
     compactness_metric_sample_size: int | None = 12000,
     compactness_search_downsample_factor: float = 1.0,
+    compactness_search_raster_mode: str = "auto",
     compactness_search_resolution_cap: int | None = None,
     use_cached_image: bool = True,
     image_cache_key: str = "image_plot_slic",
     verbose: bool = True,
 ) -> dict[str, Any]:
     effective_dimensions = list(dimensions if search_dimensions is None else search_dimensions)
+    search_raster_options = _resolve_compactness_search_raster_options(
+        adata,
+        coordinate_mode=str(coordinate_mode),
+        origin=bool(origin),
+        array_row_key=str(array_row_key),
+        array_col_key=str(array_col_key),
+        pixel_perfect=bool(pixel_perfect),
+        pixel_shape=str(pixel_shape),
+        soft_rasterization=bool(soft_rasterization),
+        resolve_center_collisions=bool(resolve_center_collisions),
+        center_collision_radius=int(center_collision_radius),
+        compactness_search_downsample_factor=float(compactness_search_downsample_factor),
+        compactness_search_raster_mode=str(compactness_search_raster_mode),
+        verbose=bool(verbose),
+    )
+    effective_pixel_perfect = bool(search_raster_options["pixel_perfect"])
+    effective_pixel_shape = str(search_raster_options["pixel_shape"])
+    effective_soft_rasterization = bool(search_raster_options["soft_rasterization"])
+    effective_resolve_center_collisions = bool(search_raster_options["resolve_center_collisions"])
     t_prepare0 = time.perf_counter()
     prepared = _prepare_image_plot_compactness_inputs(
         adata,
@@ -1224,19 +1321,21 @@ def select_compactness(
     reusable_cache_key = image_cache_key
     if use_cached_image:
         reusable_cache_key = _compactness_search_cache_key(
-            base_key=str(image_cache_key),
-            embedding=str(embedding),
-            dimensions=list(effective_dimensions),
-            origin=bool(origin),
-            coordinate_mode=str(coordinate_mode),
-            array_row_key=str(array_row_key),
-            array_col_key=str(array_col_key),
-            pixel_shape=str(pixel_shape),
-            soft_rasterization=bool(soft_rasterization),
-            resolve_center_collisions=bool(resolve_center_collisions),
-            center_collision_radius=int(center_collision_radius),
-            runtime_fill_from_boundary=bool(runtime_fill_from_boundary),
-            runtime_fill_closing_radius=int(runtime_fill_closing_radius),
+                base_key=str(image_cache_key),
+                embedding=str(embedding),
+                dimensions=list(effective_dimensions),
+                origin=bool(origin),
+                coordinate_mode=str(coordinate_mode),
+                array_row_key=str(array_row_key),
+                array_col_key=str(array_col_key),
+                pixel_perfect=bool(effective_pixel_perfect),
+                pixel_shape=str(effective_pixel_shape),
+                soft_rasterization=bool(effective_soft_rasterization),
+                resolve_center_collisions=bool(effective_resolve_center_collisions),
+                center_collision_radius=int(center_collision_radius),
+                runtime_fill_from_boundary=bool(runtime_fill_from_boundary),
+                runtime_fill_closing_radius=int(runtime_fill_closing_radius),
+            runtime_fill_external_radius=int(runtime_fill_external_radius),
             runtime_fill_holes=bool(runtime_fill_holes),
             downsample_factor=float(compactness_search_downsample_factor),
         )
@@ -1277,15 +1376,16 @@ def select_compactness(
             fig_dpi=fig_dpi,
             imshow_tile_size=imshow_tile_size,
             imshow_scale_factor=imshow_scale_factor,
-            pixel_perfect=pixel_perfect,
-            pixel_shape=pixel_shape,
+            pixel_perfect=effective_pixel_perfect,
+            pixel_shape=effective_pixel_shape,
             verbose=False,
             show=False,
             runtime_fill_from_boundary=runtime_fill_from_boundary,
             runtime_fill_closing_radius=runtime_fill_closing_radius,
+            runtime_fill_external_radius=runtime_fill_external_radius,
             runtime_fill_holes=runtime_fill_holes,
-            soft_rasterization=soft_rasterization,
-            resolve_center_collisions=resolve_center_collisions,
+            soft_rasterization=effective_soft_rasterization,
+            resolve_center_collisions=effective_resolve_center_collisions,
             center_collision_radius=center_collision_radius,
             downsample_factor=float(compactness_search_downsample_factor),
         )
@@ -1454,6 +1554,7 @@ def select_compactness(
             "search_dimensions": effective_dimensions,
             "compactness_search_downsample_factor": float(compactness_search_downsample_factor),
             "compactness_metric_sample_size": None if compactness_metric_sample_size is None else int(compactness_metric_sample_size),
+            "compactness_search_raster_options": search_raster_options,
             "mask_background": bool(mask_background),
             "range": range_info,
             "coarse_search": coarse_detail,
@@ -1488,6 +1589,7 @@ def fast_select_compactness(
     compactness_search_jobs: int = 4,
     compactness_metric_sample_size: int | None = 12000,
     compactness_search_downsample_factor: float = 2.0,
+    compactness_search_raster_mode: str = "auto",
     compactness_search_resolution_cap: int | None = None,
     search_target_segment_um: float | None = None,
     compactness_scale_power: float = 0.3,
@@ -1549,6 +1651,7 @@ def fast_select_compactness(
         compactness_search_jobs=compactness_search_jobs,
         compactness_metric_sample_size=compactness_metric_sample_size,
         compactness_search_downsample_factor=compactness_search_downsample_factor,
+        compactness_search_raster_mode=compactness_search_raster_mode,
         compactness_search_resolution_cap=compactness_search_resolution_cap,
         verbose=verbose,
         **kwargs,
@@ -1668,6 +1771,7 @@ def evaluate_compactness_sweep(
     pixel_shape: str = "square",
     runtime_fill_from_boundary: bool = False,
     runtime_fill_closing_radius: int = 1,
+    runtime_fill_external_radius: int = 0,
     runtime_fill_holes: bool = True,
     soft_rasterization: bool = False,
     resolve_center_collisions: bool = False,
@@ -1682,6 +1786,7 @@ def evaluate_compactness_sweep(
     compactness_search_jobs: int = 1,
     compactness_metric_sample_size: int | None = 12000,
     compactness_search_downsample_factor: float = 1.0,
+    compactness_search_raster_mode: str = "auto",
     use_cached_image: bool = True,
     image_cache_key: str = "image_plot_slic",
     verbose: bool = True,
@@ -1709,6 +1814,7 @@ def evaluate_compactness_sweep(
         pixel_shape=pixel_shape,
         runtime_fill_from_boundary=runtime_fill_from_boundary,
         runtime_fill_closing_radius=runtime_fill_closing_radius,
+        runtime_fill_external_radius=runtime_fill_external_radius,
         runtime_fill_holes=runtime_fill_holes,
         soft_rasterization=soft_rasterization,
         resolve_center_collisions=resolve_center_collisions,
@@ -1722,6 +1828,7 @@ def evaluate_compactness_sweep(
         compactness_search_jobs=compactness_search_jobs,
         compactness_metric_sample_size=compactness_metric_sample_size,
         compactness_search_downsample_factor=compactness_search_downsample_factor,
+        compactness_search_raster_mode=compactness_search_raster_mode,
         use_cached_image=use_cached_image,
         image_cache_key=image_cache_key,
         verbose=verbose,
@@ -1753,6 +1860,7 @@ def plot_compactness_sweep(
     pixel_shape: str = "square",
     runtime_fill_from_boundary: bool = False,
     runtime_fill_closing_radius: int = 1,
+    runtime_fill_external_radius: int = 0,
     runtime_fill_holes: bool = True,
     soft_rasterization: bool = False,
     resolve_center_collisions: bool = False,
@@ -1767,6 +1875,7 @@ def plot_compactness_sweep(
     compactness_search_jobs: int = 1,
     compactness_metric_sample_size: int | None = None,
     compactness_search_downsample_factor: float = 1.0,
+    compactness_search_raster_mode: str = "auto",
     use_cached_image: bool = True,
     image_cache_key: str = "image_plot_slic",
     metrics: list[str] | None = None,
@@ -1800,6 +1909,7 @@ def plot_compactness_sweep(
             pixel_shape=pixel_shape,
             runtime_fill_from_boundary=runtime_fill_from_boundary,
             runtime_fill_closing_radius=runtime_fill_closing_radius,
+            runtime_fill_external_radius=runtime_fill_external_radius,
             runtime_fill_holes=runtime_fill_holes,
             soft_rasterization=soft_rasterization,
             resolve_center_collisions=resolve_center_collisions,
@@ -1813,6 +1923,7 @@ def plot_compactness_sweep(
             compactness_search_jobs=compactness_search_jobs,
             compactness_metric_sample_size=compactness_metric_sample_size,
             compactness_search_downsample_factor=compactness_search_downsample_factor,
+            compactness_search_raster_mode=compactness_search_raster_mode,
             use_cached_image=use_cached_image,
             image_cache_key=image_cache_key,
             verbose=verbose,
@@ -2133,6 +2244,7 @@ def segment_image(
     pixel_shape: str = "square",
     runtime_fill_from_boundary: bool = False,
     runtime_fill_closing_radius: int = 1,
+    runtime_fill_external_radius: int = 0,
     runtime_fill_holes: bool = True,
     soft_rasterization: bool = False,
     resolve_center_collisions: bool = False,
@@ -2223,6 +2335,9 @@ def segment_image(
     runtime_fill_closing_radius : int, optional (default ``1``)
         Pixel-radius used for binary closing of the observed raster support
         when ``runtime_fill_from_boundary=True``.
+    runtime_fill_external_radius : int, optional (default ``0``)
+        Additional pixel-radius used to slightly expand the recovered support
+        outward after internal filling when ``runtime_fill_from_boundary=True``.
     runtime_fill_holes : bool, optional (default ``True``)
         Whether to fill enclosed holes in the raster support when
         ``runtime_fill_from_boundary=True``.
@@ -2403,6 +2518,7 @@ def segment_image(
             pixel_shape=pixel_shape,
             runtime_fill_from_boundary=runtime_fill_from_boundary,
             runtime_fill_closing_radius=runtime_fill_closing_radius,
+            runtime_fill_external_radius=runtime_fill_external_radius,
             runtime_fill_holes=runtime_fill_holes,
             soft_rasterization=soft_rasterization,
             resolve_center_collisions=resolve_center_collisions,
@@ -2810,6 +2926,7 @@ def segment_image(
                         pixel_shape=pixel_shape,
                         runtime_fill_from_boundary=runtime_fill_from_boundary,
                         runtime_fill_closing_radius=runtime_fill_closing_radius,
+                        runtime_fill_external_radius=runtime_fill_external_radius,
                         runtime_fill_holes=runtime_fill_holes,
                         soft_rasterization=soft_rasterization,
                         resolve_center_collisions=resolve_center_collisions,
@@ -2835,6 +2952,7 @@ def segment_image(
                     pixel_shape=pixel_shape,
                     runtime_fill_from_boundary=runtime_fill_from_boundary,
                     runtime_fill_closing_radius=runtime_fill_closing_radius,
+                    runtime_fill_external_radius=runtime_fill_external_radius,
                     runtime_fill_holes=runtime_fill_holes,
                     soft_rasterization=soft_rasterization,
                     resolve_center_collisions=resolve_center_collisions,
@@ -3010,6 +3128,7 @@ def segment_image(
                     show=False,
                     runtime_fill_from_boundary=runtime_fill_from_boundary,
                     runtime_fill_closing_radius=runtime_fill_closing_radius,
+                    runtime_fill_external_radius=runtime_fill_external_radius,
                     runtime_fill_holes=runtime_fill_holes,
                     soft_rasterization=soft_rasterization,
                     resolve_center_collisions=resolve_center_collisions,
@@ -3035,6 +3154,7 @@ def segment_image(
                     pixel_shape=pixel_shape,
                     runtime_fill_from_boundary=runtime_fill_from_boundary,
                     runtime_fill_closing_radius=runtime_fill_closing_radius,
+                    runtime_fill_external_radius=runtime_fill_external_radius,
                     runtime_fill_holes=runtime_fill_holes,
                     soft_rasterization=soft_rasterization,
                     resolve_center_collisions=resolve_center_collisions,
@@ -3209,6 +3329,7 @@ def segment_image(
                             pixel_shape=pixel_shape,
                             runtime_fill_from_boundary=runtime_fill_from_boundary,
                             runtime_fill_closing_radius=runtime_fill_closing_radius,
+                            runtime_fill_external_radius=runtime_fill_external_radius,
                             runtime_fill_holes=runtime_fill_holes,
                             soft_rasterization=soft_rasterization,
                             resolve_center_collisions=resolve_center_collisions,
@@ -3235,6 +3356,7 @@ def segment_image(
                         pixel_shape=pixel_shape,
                         runtime_fill_from_boundary=runtime_fill_from_boundary,
                         runtime_fill_closing_radius=runtime_fill_closing_radius,
+                        runtime_fill_external_radius=runtime_fill_external_radius,
                         runtime_fill_holes=runtime_fill_holes,
                         soft_rasterization=soft_rasterization,
                         resolve_center_collisions=resolve_center_collisions,
@@ -3317,6 +3439,7 @@ def segment_image(
                         pixel_shape=pixel_shape,
                         runtime_fill_from_boundary=runtime_fill_from_boundary,
                         runtime_fill_closing_radius=runtime_fill_closing_radius,
+                        runtime_fill_external_radius=runtime_fill_external_radius,
                         runtime_fill_holes=runtime_fill_holes,
                         soft_rasterization=soft_rasterization,
                         resolve_center_collisions=resolve_center_collisions,
@@ -3343,6 +3466,7 @@ def segment_image(
                     pixel_shape=pixel_shape,
                     runtime_fill_from_boundary=runtime_fill_from_boundary,
                     runtime_fill_closing_radius=runtime_fill_closing_radius,
+                    runtime_fill_external_radius=runtime_fill_external_radius,
                     runtime_fill_holes=runtime_fill_holes,
                     soft_rasterization=soft_rasterization,
                     resolve_center_collisions=resolve_center_collisions,
@@ -3557,6 +3681,7 @@ def segment_image_inner(
     pixel_shape: str = "square",
     runtime_fill_from_boundary: bool = False,
     runtime_fill_closing_radius: int = 1,
+    runtime_fill_external_radius: int = 0,
     runtime_fill_holes: bool = True,
     soft_rasterization: bool = False,
     resolve_center_collisions: bool = False,
@@ -3624,6 +3749,9 @@ def segment_image_inner(
     runtime_fill_closing_radius : int, optional
         Pixel-radius used for binary closing of the observed raster support
         when ``runtime_fill_from_boundary=True``.
+    runtime_fill_external_radius : int, optional
+        Additional pixel-radius used to slightly expand the recovered support
+        outward after internal filling when ``runtime_fill_from_boundary=True``.
     runtime_fill_holes : bool, optional
         Whether to fill enclosed holes in the raster support when
         ``runtime_fill_from_boundary=True``.
@@ -3697,6 +3825,7 @@ def segment_image_inner(
             pixel_shape=pixel_shape,
             runtime_fill_from_boundary=runtime_fill_from_boundary,
             runtime_fill_closing_radius=runtime_fill_closing_radius,
+            runtime_fill_external_radius=runtime_fill_external_radius,
             runtime_fill_holes=runtime_fill_holes,
             soft_rasterization=soft_rasterization,
             resolve_center_collisions=resolve_center_collisions,

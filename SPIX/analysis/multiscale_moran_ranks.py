@@ -93,6 +93,28 @@ def _autocorr_metric_config(mode: str) -> Tuple[str, bool]:
     return "I", False
 
 
+def _normalize_size_residualize(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    key = str(value).strip().lower()
+    if key in {"", "none", "false", "off", "no"}:
+        return None
+    aliases = {
+        "log_n_spots": "log_n_spots",
+        "n_spots": "log_n_spots",
+        "segment_size": "log_n_spots",
+        "log_segment_size": "log_n_spots",
+        "log_total_counts": "log_total_counts",
+        "total_counts": "log_total_counts",
+        "library_size": "log_total_counts",
+        "log_library_size": "log_total_counts",
+    }
+    if key not in aliases:
+        allowed = sorted(set(aliases.values()))
+        raise ValueError(f"Unsupported size_residualize='{value}'. Use one of {allowed} or None.")
+    return aliases[key]
+
+
 def _extract_autocorr_metric(
     df: pd.DataFrame,
     *,
@@ -127,6 +149,7 @@ def _compute_moranI_fallback(
     W,
     var_names,
     chunk_size: int = 256,
+    residualize_covariate: Optional[np.ndarray] = None,
 ) -> pd.DataFrame:
     """
     Fallback Moran's I for when `squidpy.gr.spatial_autocorr` returns empty/missing results.
@@ -157,6 +180,31 @@ def _compute_moranI_fallback(
 
     I = np.full(X.shape[1], np.nan, dtype=np.float64)
 
+    z = None
+    inv00 = inv01 = inv11 = 0.0
+    wz = None
+    wtz = None
+    c00 = c01 = c10 = c11 = 0.0
+    if residualize_covariate is not None:
+        z = np.asarray(residualize_covariate, dtype=np.float64).reshape(-1)
+        if z.shape[0] != n:
+            raise ValueError("residualize_covariate length must match X rows")
+        sum_z = float(z.sum())
+        sum_z2 = float(np.dot(z, z))
+        det = float(n) * sum_z2 - sum_z * sum_z
+        if det <= 1e-12:
+            z = None
+        else:
+            inv00 = sum_z2 / det
+            inv01 = -sum_z / det
+            inv11 = float(n) / det
+            wz = np.asarray(W.dot(z)).reshape(-1)
+            wtz = np.asarray(W.T.dot(z)).reshape(-1)
+            c00 = wsum
+            c01 = float(np.dot(col_sums, z))
+            c10 = float(np.dot(row_sums, z))
+            c11 = float(np.dot(z, wz))
+
     if issparse(X):
         X = X.tocsr()
 
@@ -173,8 +221,22 @@ def _compute_moranI_fallback(
             xTr = np.asarray(Xc.T.dot(row_sums)).reshape(-1)
             xTc = np.asarray(Xc.T.dot(col_sums)).reshape(-1)
 
-            num = s1 - mean_x * (xTr + xTc) + (mean_x * mean_x) * wsum
-            den = sum_x2 - float(n) * (mean_x * mean_x)
+            if z is None:
+                num = s1 - mean_x * (xTr + xTc) + (mean_x * mean_x) * wsum
+                den = sum_x2 - float(n) * (mean_x * mean_x)
+            else:
+                zTx = np.asarray(Xc.T.dot(z)).reshape(-1)
+                beta0 = inv00 * sum_x + inv01 * zTx
+                beta1 = inv01 * sum_x + inv11 * zTx
+                left1 = np.asarray(Xc.T.dot(wtz)).reshape(-1)
+                right1 = np.asarray(Xc.T.dot(wz)).reshape(-1)
+                quad = (
+                    c00 * beta0 * beta0
+                    + (c01 + c10) * beta0 * beta1
+                    + c11 * beta1 * beta1
+                )
+                num = s1 - (beta0 * xTc + beta1 * left1) - (beta0 * xTr + beta1 * right1) + quad
+                den = sum_x2 - (beta0 * sum_x + beta1 * zTx)
 
             valid = den > 0
             out = np.full(j1 - j0, np.nan, dtype=np.float64)
@@ -182,11 +244,31 @@ def _compute_moranI_fallback(
             I[j0:j1] = out
     else:
         X = np.asarray(X, dtype=np.float64)
-        mean_x = X.mean(axis=0)
-        Xc = X - mean_x
-        WX = W.dot(Xc)
-        num = np.sum(Xc * WX, axis=0)
-        den = np.sum(Xc * Xc, axis=0)
+        if z is None:
+            mean_x = X.mean(axis=0)
+            Xc = X - mean_x
+            WX = W.dot(Xc)
+            num = np.sum(Xc * WX, axis=0)
+            den = np.sum(Xc * Xc, axis=0)
+        else:
+            sum_x = X.sum(axis=0)
+            sum_x2 = np.sum(X * X, axis=0)
+            zTx = z @ X
+            beta0 = inv00 * sum_x + inv01 * zTx
+            beta1 = inv01 * sum_x + inv11 * zTx
+            WX = W.dot(X)
+            num = np.sum(X * WX, axis=0)
+            num = (
+                num
+                - (beta0 * (col_sums @ X) + beta1 * (wtz @ X))
+                - (beta0 * (row_sums @ X) + beta1 * (wz @ X))
+                + (
+                    c00 * beta0 * beta0
+                    + (c01 + c10) * beta0 * beta1
+                    + c11 * beta1 * beta1
+                )
+            )
+            den = sum_x2 - (beta0 * sum_x + beta1 * zTx)
         valid = den > 0
         I[valid] = (float(n) / wsum) * (num[valid] / den[valid])
 
@@ -510,6 +592,7 @@ def _moran_rank_fast_thread(
         normalize_total = bool(pseudo_bulk_kwargs.get("normalize_total", True))
         log_transform = bool(pseudo_bulk_kwargs.get("log_transform", True))
         min_genes_in_segment = int(pseudo_bulk_kwargs.get("min_genes_in_segment", 1))
+        size_residualize = _normalize_size_residualize(pseudo_bulk_kwargs.get("size_residualize", None))
 
         collapse_make_binary = bool(pseudo_bulk_kwargs.get("collapse_make_binary", False))
         collapse_topk_per_segment = pseudo_bulk_kwargs.get("collapse_topk_per_segment", None)
@@ -521,6 +604,7 @@ def _moran_rank_fast_thread(
             weights_transform = None
 
         X_bulk = _aggregate_X_to_segments(adata.X, seg_codes, n_segs, expr_agg=str(expr_agg))
+        seg_sizes = np.bincount(seg_codes[valid], minlength=n_segs).astype(np.float64, copy=False)
 
         if min_genes_in_segment > 1:
             nnz_per_gene = np.asarray(X_bulk.getnnz(axis=0)).reshape(-1)
@@ -533,8 +617,10 @@ def _moran_rank_fast_thread(
         else:
             var_names = np.asarray(adata.var_names).astype(str)
 
+        raw_row_sums = np.asarray(X_bulk.sum(axis=1)).reshape(-1).astype(np.float64, copy=False)
+
         if normalize_total:
-            row_sums = np.asarray(X_bulk.sum(axis=1)).reshape(-1).astype(np.float64, copy=False)
+            row_sums = raw_row_sums
             nz = row_sums > 0
             scale = np.ones_like(row_sums, dtype=np.float64)
             scale[nz] = 1e4 / row_sums[nz]
@@ -546,6 +632,12 @@ def _moran_rank_fast_thread(
 
         if log_transform:
             X_bulk.data = np.log1p(X_bulk.data)
+
+        residualize_covariate = None
+        if size_residualize == "log_n_spots":
+            residualize_covariate = np.log1p(seg_sizes)
+        elif size_residualize == "log_total_counts":
+            residualize_covariate = np.log1p(raw_row_sums)
 
         W = _collapse_edges_to_segments(
             n_cells=int(adata.n_obs),
@@ -559,7 +651,12 @@ def _moran_rank_fast_thread(
         # Match squidpy/libpysal default behavior more closely: apply weights transformation (default row-standardized).
         W = _weights_transform_csr(W, weights_transform)
 
-        moran = _compute_moranI_fallback(X_bulk, W, var_names)
+        moran = _compute_moranI_fallback(
+            X_bulk,
+            W,
+            var_names,
+            residualize_covariate=residualize_covariate,
+        )
         i_vals = moran["I"].to_numpy(dtype=np.float64, copy=False)
         moran_index = moran.index.astype(str)
 
@@ -688,9 +785,12 @@ def multiscale_moran_ranks(
     To speed up further, consider:
     - `backend="process"` (if your environment can safely `fork()`), since threads can be GIL-limited.
     - Passing `pseudo_bulk_kwargs={"collapse_topk_per_segment": 10}` to sparsify the segment graph.
-    - Setting `engine="fast"` to bypass `perform_pseudo_bulk_analysis`/`squidpy.gr.spatial_autocorr` and compute Moran's I
+    - Setting `engine="fast"` bypasses `perform_pseudo_bulk_analysis`/`squidpy.gr.spatial_autocorr` and computes Moran's I
       directly on a segment-collapsed graph (usually much faster and less memory, but should match the default
       `segment_graph_strategy="collapsed"` semantics).
+    - `pseudo_bulk_kwargs["size_residualize"]` is available only for `engine="fast"` and currently supports
+      `"log_n_spots"` and `"log_total_counts"`. It residualizes each gene against the chosen segment-size covariate
+      before Moran ranking, which is useful as a lightweight sensitivity analysis for size-driven SVG ranks.
     """
 
     if sq_neighbors_kwargs is None:
@@ -768,6 +868,11 @@ def multiscale_moran_ranks(
     engine = str(engine).lower()
     if engine not in {"squidpy", "fast"}:
         raise ValueError("engine must be one of: 'squidpy', 'fast'")
+    size_residualize = _normalize_size_residualize(pseudo_bulk_kwargs.get("size_residualize", None))
+    if size_residualize is not None:
+        pseudo_bulk_kwargs["size_residualize"] = size_residualize
+        if engine != "fast":
+            raise ValueError("pseudo_bulk_kwargs['size_residualize'] currently requires engine='fast'")
     mode = str(pseudo_bulk_kwargs.get("mode", "moran")).lower()
     if engine == "fast" and mode != "moran":
         raise ValueError("engine='fast' currently supports only mode='moran'")
@@ -893,6 +998,60 @@ def multiscale_moran_ranks(
         )
     rank_df.to_csv(out_csv)
     return rank_df
+
+
+def compare_rank_tables(
+    baseline_rank_df: pd.DataFrame,
+    adjusted_rank_df: pd.DataFrame,
+    *,
+    top_n: int = 100,
+) -> pd.DataFrame:
+    """
+    Summarize how much SVG ranks shift between two rank tables, per shared scale column.
+
+    Parameters
+    ----------
+    baseline_rank_df
+        Reference rank table, typically the unadjusted `multiscale_moran_ranks` output.
+    adjusted_rank_df
+        Comparison rank table, typically produced with `size_residualize`.
+    top_n
+        Top-ranked genes used for overlap summaries.
+    """
+
+    if int(top_n) < 1:
+        raise ValueError("top_n must be >= 1")
+
+    shared_cols = [c for c in baseline_rank_df.columns if c in adjusted_rank_df.columns]
+    rows: List[Dict[str, Any]] = []
+    for col in shared_cols:
+        base = pd.to_numeric(baseline_rank_df[col], errors="coerce")
+        adj = pd.to_numeric(adjusted_rank_df[col], errors="coerce")
+        common = base.notna() & adj.notna()
+        base_valid = base.dropna()
+        adj_valid = adj.dropna()
+        base_top = set(base_valid.nsmallest(int(top_n)).index.astype(str))
+        adj_top = set(adj_valid.nsmallest(int(top_n)).index.astype(str))
+        overlap = len(base_top & adj_top)
+        delta = (adj[common] - base[common]).astype(np.float64, copy=False)
+        rows.append(
+            {
+                "scale_id": str(col)[len("rank_") :] if str(col).startswith("rank_") else str(col),
+                "rank_column": str(col),
+                "n_common_genes": int(common.sum()),
+                "spearman_rho": float(base[common].corr(adj[common], method="spearman")) if int(common.sum()) >= 2 else np.nan,
+                "median_abs_rank_delta": float(np.median(np.abs(delta))) if delta.size else np.nan,
+                "mean_rank_delta": float(delta.mean()) if delta.size else np.nan,
+                "max_abs_rank_delta": float(np.max(np.abs(delta))) if delta.size else np.nan,
+                "top_n": int(top_n),
+                "top_n_overlap": int(overlap),
+                "top_n_overlap_fraction": float(overlap / max(1, min(len(base_top), len(adj_top), int(top_n)))),
+            }
+        )
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values(["scale_id", "rank_column"]).reset_index(drop=True)
+    return out
 
 
 def fill_missing_ranks_with_worst(rank_df: pd.DataFrame) -> pd.DataFrame:

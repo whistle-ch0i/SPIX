@@ -1870,3 +1870,1181 @@ def block_permutation_test(
         results.append((ct, observed, pval, zscore))
 
     return pd.DataFrame(results, columns=['cell_type', 'observed', 'pval', 'zscore'])
+
+
+def detect_spatial_coordinates(
+    adata: AnnData,
+    *,
+    prefer_obs_um: bool = True,
+) -> tuple[np.ndarray, str]:
+    """
+    Resolve 2D spatial coordinates from an AnnData object.
+
+    Parameters
+    ----------
+    adata
+        AnnData with spatial coordinates stored in ``.obs`` or ``.obsm``.
+    prefer_obs_um
+        When True, prioritize micron-like coordinates from ``.obs`` before
+        normalized coordinates in ``.obsm['spatial']``.
+
+    Returns
+    -------
+    (coords, source)
+        ``coords`` is an ``(n_obs, 2)`` float array and ``source`` describes
+        the chosen field.
+    """
+    obs_candidates = [
+        ("Centroid_X", "Centroid_Y"),
+        ("center_x", "center_y"),
+        ("x_centroid", "y_centroid"),
+        ("x", "y"),
+        ("X", "Y"),
+    ]
+    obsm_candidates = ["spatial", "X_spatial", "spatial3d"]
+
+    def _from_obs() -> tuple[np.ndarray, str] | None:
+        for x_col, y_col in obs_candidates:
+            if x_col in adata.obs.columns and y_col in adata.obs.columns:
+                arr = adata.obs[[x_col, y_col]].to_numpy(dtype=float, copy=True)
+                if arr.ndim == 2 and arr.shape[1] == 2 and np.isfinite(arr).any():
+                    return arr, f"obs:{x_col},{y_col}"
+        return None
+
+    def _from_obsm() -> tuple[np.ndarray, str] | None:
+        for key in obsm_candidates:
+            if key not in adata.obsm:
+                continue
+            arr = np.asarray(adata.obsm[key], dtype=float)
+            if arr.ndim == 2 and arr.shape[1] >= 2 and np.isfinite(arr).any():
+                return np.asarray(arr[:, :2], dtype=float), f"obsm:{key}"
+        return None
+
+    ordered = (_from_obs, _from_obsm) if prefer_obs_um else (_from_obsm, _from_obs)
+    for resolver in ordered:
+        out = resolver()
+        if out is not None:
+            coords, source = out
+            valid = np.isfinite(coords).all(axis=1)
+            if not np.any(valid):
+                raise ValueError("Resolved spatial coordinates but none are finite.")
+            return coords[valid], source
+
+    raise ValueError("Could not locate 2D spatial coordinates in AnnData.")
+
+
+def estimate_effective_pitch_um(
+    adata: Optional[AnnData] = None,
+    *,
+    coords: Optional[np.ndarray] = None,
+    support_method: str = "occupancy_grid",
+    grid_size_um: Optional[float] = None,
+    alpha: Optional[float] = None,
+    sample_size: int = 50000,
+    prefer_obs_um: bool = True,
+    return_details: bool = False,
+) -> float | dict:
+    """
+    Estimate an effective pitch for cell-based spatial data such as MERFISH/Xenium.
+
+    The effective pitch is defined as ``sqrt(A_support / N)``, where ``A_support``
+    is an estimated tissue support area in square microns and ``N`` is the number
+    of spatial observations. This is useful when observations are cells rather
+    than regular lattice spots.
+
+    Parameters
+    ----------
+    adata
+        AnnData containing spatial coordinates. Required when ``coords`` is not
+        provided.
+    coords
+        Optional explicit ``(n_obs, 2)`` coordinate array in microns.
+    support_method
+        One of ``'occupancy_grid'``, ``'convex_hull'``, ``'alpha_shape'``,
+        or ``'bbox'``.
+    grid_size_um
+        Grid size for ``support_method='occupancy_grid'``. If omitted, the median
+        nearest-neighbor distance is used.
+    alpha
+        Alpha parameter for ``support_method='alpha_shape'``. When omitted, a
+        heuristic ``1 / median_nn`` is used.
+    sample_size
+        Maximum number of points used for nearest-neighbor estimation.
+    prefer_obs_um
+        Passed to :func:`detect_spatial_coordinates` when ``coords`` is not given.
+    return_details
+        When True, return a dictionary with intermediate estimates.
+
+    Returns
+    -------
+    float or dict
+        Effective pitch in microns, or a detailed result dictionary.
+    """
+    if coords is None:
+        if adata is None:
+            raise ValueError("Provide either `adata` or `coords`.")
+        coords, coord_source = detect_spatial_coordinates(adata, prefer_obs_um=prefer_obs_um)
+    else:
+        coords = np.asarray(coords, dtype=float)
+        if coords.ndim != 2 or coords.shape[1] < 2:
+            raise ValueError("`coords` must be a 2D array with at least two columns.")
+        coords = np.asarray(coords[:, :2], dtype=float)
+        coords = coords[np.isfinite(coords).all(axis=1)]
+        coord_source = "coords"
+
+    n_obs = int(coords.shape[0])
+    if n_obs < 2:
+        raise ValueError("Need at least two spatial observations to estimate effective pitch.")
+
+    coords_nn = coords
+    if coords_nn.shape[0] > int(sample_size):
+        rng = np.random.default_rng(42)
+        idx = rng.choice(coords_nn.shape[0], size=int(sample_size), replace=False)
+        coords_nn = coords_nn[idx]
+
+    tree = KDTree(coords_nn)
+    dists, _ = tree.query(coords_nn, k=2)
+    nn = np.asarray(dists[:, 1], dtype=float)
+    nn = nn[np.isfinite(nn) & (nn > 0)]
+    if nn.size == 0:
+        raise ValueError("Could not compute a positive nearest-neighbor distance.")
+
+    median_nn_um = float(np.median(nn))
+    mean_nn_um = float(np.mean(nn))
+
+    method = str(support_method).lower()
+    support_area_um2 = None
+    support_meta = {}
+
+    if method == "occupancy_grid":
+        cell_um = float(grid_size_um) if grid_size_um is not None else float(median_nn_um)
+        cell_um = max(cell_um, 1e-9)
+        gx = np.floor(coords[:, 0] / cell_um).astype(np.int64)
+        gy = np.floor(coords[:, 1] / cell_um).astype(np.int64)
+        occupied = pd.DataFrame({"gx": gx, "gy": gy}).drop_duplicates().shape[0]
+        support_area_um2 = float(occupied) * float(cell_um ** 2)
+        support_meta = {"grid_size_um": cell_um, "occupied_bins": int(occupied)}
+    elif method == "convex_hull":
+        hull = MultiPoint(coords).convex_hull
+        support_area_um2 = float(hull.area)
+    elif method == "alpha_shape":
+        alpha_eff = float(alpha) if alpha is not None else float(1.0 / max(median_nn_um, 1e-9))
+        poly = alphashape.alphashape(coords, alpha_eff)
+        if poly is None or getattr(poly, "is_empty", False):
+            raise ValueError("Alpha-shape support area estimation failed.")
+        support_area_um2 = float(poly.area)
+        support_meta = {"alpha": alpha_eff}
+    elif method == "bbox":
+        xmin, ymin = np.min(coords, axis=0)
+        xmax, ymax = np.max(coords, axis=0)
+        support_area_um2 = float(max(xmax - xmin, 0.0) * max(ymax - ymin, 0.0))
+    else:
+        raise ValueError(
+            "Unknown support_method. Use one of: "
+            "'occupancy_grid', 'convex_hull', 'alpha_shape', 'bbox'."
+        )
+
+    if not np.isfinite(support_area_um2) or support_area_um2 <= 0:
+        raise ValueError("Estimated support area is non-positive.")
+
+    effective_pitch_um = float(np.sqrt(support_area_um2 / float(n_obs)))
+    density_cells_per_um2 = float(n_obs / support_area_um2)
+
+    details = {
+        "effective_pitch_um": effective_pitch_um,
+        "support_area_um2": float(support_area_um2),
+        "density_cells_per_um2": density_cells_per_um2,
+        "n_obs": int(n_obs),
+        "median_nn_um": median_nn_um,
+        "mean_nn_um": mean_nn_um,
+        "support_method": method,
+        "coord_source": coord_source,
+        **support_meta,
+    }
+
+    return details if return_details else effective_pitch_um
+
+
+def estimate_median_nn_pitch_um(
+    adata: Optional[AnnData] = None,
+    *,
+    coords: Optional[np.ndarray] = None,
+    sample_size: int = 50000,
+    prefer_obs_um: bool = True,
+    return_details: bool = False,
+) -> float | dict:
+    """
+    Estimate pitch from the median nearest-neighbor distance.
+
+    This is most appropriate for grid-like spatial data such as VisiumHD or
+    Stereo-seq binned coordinates.
+    """
+    if coords is None:
+        if adata is None:
+            raise ValueError("Provide either `adata` or `coords`.")
+        coords, coord_source = detect_spatial_coordinates(adata, prefer_obs_um=prefer_obs_um)
+    else:
+        coords = np.asarray(coords, dtype=float)
+        if coords.ndim != 2 or coords.shape[1] < 2:
+            raise ValueError("`coords` must be a 2D array with at least two columns.")
+        coords = np.asarray(coords[:, :2], dtype=float)
+        coords = coords[np.isfinite(coords).all(axis=1)]
+        coord_source = "coords"
+
+    if coords.shape[0] < 2:
+        raise ValueError("Need at least two spatial observations to estimate pitch.")
+
+    coords_nn = coords
+    if coords_nn.shape[0] > int(sample_size):
+        rng = np.random.default_rng(42)
+        idx = rng.choice(coords_nn.shape[0], size=int(sample_size), replace=False)
+        coords_nn = coords_nn[idx]
+
+    tree = KDTree(coords_nn)
+    dists, _ = tree.query(coords_nn, k=2)
+    nn = np.asarray(dists[:, 1], dtype=float)
+    nn = nn[np.isfinite(nn) & (nn > 0)]
+    if nn.size == 0:
+        raise ValueError("Could not compute a positive nearest-neighbor distance.")
+
+    median_nn_um = float(np.median(nn))
+    mean_nn_um = float(np.mean(nn))
+    nn_cv = float(np.std(nn) / max(mean_nn_um, 1e-12))
+
+    details = {
+        "pitch_um": median_nn_um,
+        "median_nn_um": median_nn_um,
+        "mean_nn_um": mean_nn_um,
+        "nn_cv": nn_cv,
+        "n_obs": int(coords.shape[0]),
+        "coord_source": coord_source,
+    }
+    return details if return_details else median_nn_um
+
+
+def infer_spatial_sampling_kind(
+    adata: Optional[AnnData] = None,
+    *,
+    coords: Optional[np.ndarray] = None,
+    sample_size: int = 50000,
+    prefer_obs_um: bool = True,
+    return_details: bool = False,
+) -> str | dict:
+    """
+    Infer whether a spatial dataset is more grid-like or cell-like.
+
+    Heuristics:
+    - centroid-style obs columns strongly indicate cell-based data
+    - array row/col style columns strongly indicate grid-like data
+    - otherwise fall back to nearest-neighbor regularity
+    """
+    obs_columns = set()
+    if adata is not None:
+        obs_columns = set(map(str, adata.obs.columns))
+
+    centroid_pairs = {
+        ("Centroid_X", "Centroid_Y"),
+        ("center_x", "center_y"),
+        ("x_centroid", "y_centroid"),
+    }
+    grid_markers = {
+        "array_row",
+        "array_col",
+        "pxl_row_in_fullres",
+        "pxl_col_in_fullres",
+        "in_tissue",
+    }
+
+    for x_col, y_col in centroid_pairs:
+        if x_col in obs_columns and y_col in obs_columns:
+            details = {"kind": "cell", "reason": f"obs centroid columns: {x_col},{y_col}"}
+            return details if return_details else "cell"
+
+    if any(marker in obs_columns for marker in grid_markers):
+        hit = sorted(marker for marker in grid_markers if marker in obs_columns)
+        details = {"kind": "grid", "reason": f"grid marker columns: {','.join(hit)}"}
+        return details if return_details else "grid"
+
+    nn_details = estimate_median_nn_pitch_um(
+        adata,
+        coords=coords,
+        sample_size=sample_size,
+        prefer_obs_um=prefer_obs_um,
+        return_details=True,
+    )
+    nn_cv = float(nn_details["nn_cv"])
+    kind = "grid" if nn_cv <= 0.25 else "cell"
+    details = {
+        "kind": kind,
+        "reason": f"nearest-neighbor regularity heuristic (nn_cv={nn_cv:.4f})",
+        **nn_details,
+    }
+    return details if return_details else kind
+
+
+def resolve_pitch_um(
+    adata: Optional[AnnData] = None,
+    *,
+    coords: Optional[np.ndarray] = None,
+    platform: Optional[str] = "auto",
+    grid_pitch_um: Optional[float] = None,
+    support_method: str = "occupancy_grid",
+    grid_size_um: Optional[float] = None,
+    alpha: Optional[float] = None,
+    sample_size: int = 50000,
+    prefer_obs_um: bool = True,
+    return_details: bool = False,
+) -> float | dict:
+    """
+    Convenience wrapper to resolve a usable ``pitch_um`` for cell-based platforms.
+
+    Recommended usage
+    -----------------
+    - MERFISH / Xenium / CosMx: ``platform='merfish'`` / ``'xenium'`` / ``'cosmx'``
+    - Unsure: ``platform='auto'``
+
+    Rules
+    -----
+    - cell-like data -> effective pitch from support area
+    - grid-like platforms are intentionally not handled here; pass explicit pitch
+      for VisiumHD / Stereo-seq instead of using this helper.
+    """
+    platform_key = "auto" if platform is None else str(platform).strip().lower()
+    aliases = {
+        "merfish": "merfish",
+        "merscope": "merfish",
+        "xenium": "xenium",
+        "cosmx": "cosmx",
+        "cell": "cell",
+        "auto": "auto",
+    }
+    platform_key = aliases.get(platform_key, platform_key)
+
+    cell_platforms = {"merfish", "xenium", "cosmx", "cell"}
+    unsupported_grid_platforms = {"visiumhd", "stereo-seq", "grid", "visium hd", "stereo seq", "stereoseq"}
+
+    if platform_key in unsupported_grid_platforms:
+        raise ValueError(
+            "resolve_pitch_um() is now cell-platform-only. "
+            "For VisiumHD / Stereo-seq, pass the known assay pitch explicitly."
+        )
+    elif platform_key in cell_platforms:
+        kind = "cell"
+        kind_reason = f"platform={platform_key}"
+    elif platform_key == "auto":
+        inferred = infer_spatial_sampling_kind(
+            adata,
+            coords=coords,
+            sample_size=sample_size,
+            prefer_obs_um=prefer_obs_um,
+            return_details=True,
+        )
+        kind = str(inferred["kind"])
+        kind_reason = str(inferred["reason"])
+        if kind != "cell":
+            raise ValueError(
+                "resolve_pitch_um(auto) inferred grid-like sampling. "
+                "For grid platforms such as VisiumHD / Stereo-seq, use the known assay pitch directly."
+            )
+    else:
+        raise ValueError(
+            "Unknown platform. Use one of: "
+            "'auto', 'merfish', 'xenium', 'cosmx', 'cell'."
+        )
+
+    eff_details = estimate_effective_pitch_um(
+        adata,
+        coords=coords,
+        support_method=support_method,
+        grid_size_um=grid_size_um,
+        alpha=alpha,
+        sample_size=sample_size,
+        prefer_obs_um=prefer_obs_um,
+        return_details=True,
+    )
+    details = {
+        "pitch_um": float(eff_details["effective_pitch_um"]),
+        "kind": kind,
+        "strategy": "effective_pitch",
+        "platform": platform_key,
+        "reason": kind_reason,
+        **eff_details,
+    }
+    return details if return_details else float(eff_details["effective_pitch_um"])
+
+
+def resolve_cell_target_segment_um(
+    adata: Optional[AnnData] = None,
+    *,
+    coords: Optional[np.ndarray] = None,
+    target_cells_per_segment: float,
+    platform: Optional[str] = "auto",
+    support_method: str = "occupancy_grid",
+    grid_size_um: Optional[float] = None,
+    alpha: Optional[float] = None,
+    sample_size: int = 50000,
+    prefer_obs_um: bool = True,
+    return_details: bool = False,
+) -> float | dict:
+    """
+    Convert a desired number of cells per segment into an approximate target size in microns.
+    """
+    target_cells = float(target_cells_per_segment)
+    if not np.isfinite(target_cells) or target_cells <= 0:
+        raise ValueError("target_cells_per_segment must be positive.")
+
+    pitch_details = resolve_pitch_um(
+        adata,
+        coords=coords,
+        platform=platform,
+        support_method=support_method,
+        grid_size_um=grid_size_um,
+        alpha=alpha,
+        sample_size=sample_size,
+        prefer_obs_um=prefer_obs_um,
+        return_details=True,
+    )
+    pitch_um = float(pitch_details["pitch_um"])
+    target_segment_um = float(np.sqrt(target_cells) * pitch_um)
+
+    details = {
+        "target_segment_um": target_segment_um,
+        "target_cells_per_segment": target_cells,
+        **pitch_details,
+    }
+    return details if return_details else target_segment_um
+
+
+def select_compactness_cells(
+    adata: AnnData,
+    *,
+    target_cells_per_segment: Optional[float] = None,
+    target_segment_um: Optional[float] = None,
+    pitch_um: Optional[float] = None,
+    platform: Optional[str] = "auto",
+    support_method: str = "occupancy_grid",
+    grid_size_um: Optional[float] = None,
+    alpha: Optional[float] = None,
+    lock_reference_target: bool = True,
+    dimensions: Optional[list[int]] = None,
+    search_dimensions: Optional[list[int]] = None,
+    embedding: str = "X_embedding",
+    origin: bool = True,
+    compactness_candidates: Optional[list[float]] = None,
+    compactness_search_jobs: int = 4,
+    compactness_search_downsample_factor: float = 1.0,
+    compactness_scale_power: float = 0.3,
+    verbose: bool = True,
+    **kwargs,
+) -> dict:
+    """
+    Cell-platform convenience wrapper around ``SPIX.sp.fast_select_compactness``.
+
+    Differences from the raw SPIX API:
+    - can take ``target_cells_per_segment`` directly
+    - resolves ``pitch_um`` automatically for Xenium/MERFISH-style data
+    - by default locks ``search_target_segment_um`` to ``target_segment_um`` to
+      avoid the auto-reference behavior that can collapse many scales to one
+      reference target
+    """
+    import SPIX
+
+    if (target_cells_per_segment is None) == (target_segment_um is None):
+        raise ValueError("Provide exactly one of `target_cells_per_segment` or `target_segment_um`.")
+
+    dims = list(range(30)) if dimensions is None else list(dimensions)
+
+    pitch_details = None
+    if pitch_um is None:
+        pitch_details = resolve_pitch_um(
+            adata,
+            platform=platform,
+            support_method=support_method,
+            grid_size_um=grid_size_um,
+            alpha=alpha,
+            return_details=True,
+        )
+        pitch_um = float(pitch_details["pitch_um"])
+    else:
+        pitch_um = float(pitch_um)
+
+    target_details = None
+    if target_segment_um is None:
+        target_details = resolve_cell_target_segment_um(
+            adata,
+            target_cells_per_segment=float(target_cells_per_segment),
+            platform=platform,
+            support_method=support_method,
+            grid_size_um=grid_size_um,
+            alpha=alpha,
+            return_details=True,
+        )
+        target_segment_um = float(target_details["target_segment_um"])
+    else:
+        target_segment_um = float(target_segment_um)
+
+    result = SPIX.sp.fast_select_compactness(
+        adata,
+        dimensions=dims,
+        search_dimensions=search_dimensions,
+        embedding=embedding,
+        target_segment_um=float(target_segment_um),
+        pitch_um=float(pitch_um),
+        origin=origin,
+        compactness_candidates=compactness_candidates,
+        compactness_search_jobs=int(compactness_search_jobs),
+        compactness_search_downsample_factor=float(compactness_search_downsample_factor),
+        search_target_segment_um=float(target_segment_um) if lock_reference_target else None,
+        compactness_scale_power=float(compactness_scale_power),
+        verbose=verbose,
+        **kwargs,
+    )
+
+    result = dict(result)
+    result["pitch_um"] = float(pitch_um)
+    result["target_segment_um"] = float(target_segment_um)
+    result["target_cells_per_segment"] = None if target_cells_per_segment is None else float(target_cells_per_segment)
+    result["lock_reference_target"] = bool(lock_reference_target)
+    if pitch_details is not None:
+        result["pitch_details"] = pitch_details
+    if target_details is not None:
+        result["target_details"] = target_details
+    return result
+
+
+def _cell_compactness_candidate_frame(selection_result: dict) -> pd.DataFrame:
+    import SPIX
+
+    frame = SPIX.sp.compactness_search_frame(selection_result)
+    if frame.empty:
+        return frame
+
+    stage = frame["search_stage"].astype(str)
+    refine_mask = stage.str.contains("refine", case=False, na=False)
+    if bool(refine_mask.any()):
+        frame = frame.loc[refine_mask].copy()
+    else:
+        coarse_mask = stage.str.contains("coarse", case=False, na=False)
+        if bool(coarse_mask.any()):
+            frame = frame.loc[coarse_mask].copy()
+        else:
+            frame = frame.copy()
+
+    for col in (
+        "compactness",
+        "score",
+        "fidelity_cost",
+        "regularity_cost",
+        "tradeoff_gain",
+        "mean_log_aspect",
+        "size_cv",
+        "neighbor_disagreement",
+    ):
+        if col in frame.columns:
+            frame[col] = pd.to_numeric(frame[col], errors="coerce")
+
+    return frame.sort_values("compactness", kind="mergesort").reset_index(drop=True)
+
+
+def reselect_compactness_for_cells(
+    selection_result: dict,
+    *,
+    score_relax: float = 0.15,
+    fidelity_relax: float = 0.15,
+    regularity_relax: float = 0.35,
+    compactness_cap: Optional[float] = None,
+    verbose: bool = True,
+) -> dict:
+    """
+    Re-select a compactness value from an existing sweep using a cell-based rule.
+
+    Logic:
+    - keep candidates whose original score is near-best
+    - keep candidates whose fidelity cost is near-best
+    - allow some regularity degradation to avoid over-penalizing sparse cell centroids
+    - among the remaining candidates, choose the smallest compactness
+
+    This is intended for Xenium/MERFISH/CosMx-style cell centroids where the
+    default tradeoff often drifts toward overly compact, rounded segments.
+    """
+    frame = _cell_compactness_candidate_frame(selection_result)
+    if frame.empty:
+        result = dict(selection_result)
+        result["cell_reselection"] = {
+            "applied": False,
+            "reason": "empty_candidate_frame",
+        }
+        return result
+
+    work = frame.copy()
+    work["eligible"] = True
+
+    def _slack(values: np.ndarray, frac: float, floor: float) -> float:
+        finite = values[np.isfinite(values)]
+        if finite.size <= 1:
+            return float(floor)
+        span = float(np.nanmax(finite) - np.nanmin(finite))
+        return float(max(floor, float(frac) * span))
+
+    score_vals = work["score"].to_numpy(dtype=float)
+    if np.isfinite(score_vals).any():
+        score_min = float(np.nanmin(score_vals))
+        score_slack = _slack(score_vals, score_relax, 0.02)
+        work["eligible"] &= work["score"] <= (score_min + score_slack)
+    else:
+        score_min = None
+        score_slack = None
+
+    fidelity_vals = work["fidelity_cost"].to_numpy(dtype=float) if "fidelity_cost" in work else np.array([], dtype=float)
+    if fidelity_vals.size and np.isfinite(fidelity_vals).any():
+        fidelity_min = float(np.nanmin(fidelity_vals))
+        fidelity_slack = _slack(fidelity_vals, fidelity_relax, 0.02)
+        work["eligible"] &= work["fidelity_cost"] <= (fidelity_min + fidelity_slack)
+    else:
+        fidelity_min = None
+        fidelity_slack = None
+
+    regularity_vals = work["regularity_cost"].to_numpy(dtype=float) if "regularity_cost" in work else np.array([], dtype=float)
+    if regularity_vals.size and np.isfinite(regularity_vals).any():
+        regularity_min = float(np.nanmin(regularity_vals))
+        regularity_slack = _slack(regularity_vals, regularity_relax, 0.05)
+        work["eligible"] &= work["regularity_cost"] <= (regularity_min + regularity_slack)
+    else:
+        regularity_min = None
+        regularity_slack = None
+
+    if compactness_cap is not None and np.isfinite(float(compactness_cap)):
+        capped = work["compactness"] <= float(compactness_cap)
+        if bool((work["eligible"] & capped).any()):
+            work["eligible"] &= capped
+
+    eligible = work.loc[work["eligible"]].copy()
+    if eligible.empty:
+        eligible = work.copy()
+
+    chosen = eligible.sort_values(["compactness", "score"], kind="mergesort").iloc[0]
+    selected_compactness = float(chosen["compactness"])
+    selected_stage = str(chosen.get("search_stage", ""))
+
+    result = dict(selection_result)
+    result["base_selected_compactness"] = float(selection_result.get("selected_compactness", selected_compactness))
+    result["selected_compactness"] = selected_compactness
+    if "search_selected_compactness" in result:
+        result["search_selected_compactness"] = selected_compactness
+    for stage_key in ("coarse_search", "refine_search"):
+        stage_detail = result.get(stage_key, None)
+        if not isinstance(stage_detail, dict):
+            continue
+        if str(stage_detail.get("mode", stage_key)) == selected_stage:
+            updated_stage = dict(stage_detail)
+            updated_stage["base_selected_compactness"] = float(stage_detail.get("selected_compactness", selected_compactness))
+            updated_stage["selected_compactness"] = float(selected_compactness)
+            result[stage_key] = updated_stage
+    result["cell_reselection"] = {
+        "applied": True,
+        "strategy": "prefer_smallest_near_best",
+        "score_relax": float(score_relax),
+        "fidelity_relax": float(fidelity_relax),
+        "regularity_relax": float(regularity_relax),
+        "compactness_cap": None if compactness_cap is None else float(compactness_cap),
+        "candidate_count": int(len(work)),
+        "eligible_count": int(len(eligible)),
+        "selected_compactness": float(selected_compactness),
+        "selected_stage": selected_stage,
+        "base_selected_compactness": float(selection_result.get("selected_compactness", selected_compactness)),
+        "selected_candidate": {
+            "compactness": float(chosen["compactness"]),
+            "score": None if not np.isfinite(float(chosen.get("score", np.nan))) else float(chosen["score"]),
+            "fidelity_cost": None if not np.isfinite(float(chosen.get("fidelity_cost", np.nan))) else float(chosen["fidelity_cost"]),
+            "regularity_cost": None if not np.isfinite(float(chosen.get("regularity_cost", np.nan))) else float(chosen["regularity_cost"]),
+            "tradeoff_gain": None if not np.isfinite(float(chosen.get("tradeoff_gain", np.nan))) else float(chosen["tradeoff_gain"]),
+            "mean_log_aspect": None if not np.isfinite(float(chosen.get("mean_log_aspect", np.nan))) else float(chosen["mean_log_aspect"]),
+            "size_cv": None if not np.isfinite(float(chosen.get("size_cv", np.nan))) else float(chosen["size_cv"]),
+            "neighbor_disagreement": None if not np.isfinite(float(chosen.get("neighbor_disagreement", np.nan))) else float(chosen["neighbor_disagreement"]),
+        },
+        "thresholds": {
+            "score_min": score_min,
+            "score_slack": score_slack,
+            "fidelity_min": fidelity_min,
+            "fidelity_slack": fidelity_slack,
+            "regularity_min": regularity_min,
+            "regularity_slack": regularity_slack,
+        },
+    }
+    if verbose:
+        base = float(selection_result.get("selected_compactness", selected_compactness))
+        print(
+            "[cell-compactness] reselection: "
+            f"base={base:.6g} -> selected={selected_compactness:.6g} | "
+            f"eligible={int(len(eligible))}/{int(len(work))}"
+        )
+    return result
+
+
+def select_compactness_cells_robust(
+    adata: AnnData,
+    *,
+    target_cells_per_segment: Optional[float] = None,
+    target_segment_um: Optional[float] = None,
+    pitch_um: Optional[float] = None,
+    platform: Optional[str] = "auto",
+    support_method: str = "occupancy_grid",
+    grid_size_um: Optional[float] = None,
+    alpha: Optional[float] = None,
+    dimensions: Optional[list[int]] = None,
+    search_dimensions: Optional[list[int]] = None,
+    embedding: str = "X_embedding",
+    origin: bool = True,
+    compactness_candidates: Optional[list[float]] = None,
+    compactness_search_jobs: int = 4,
+    compactness_search_downsample_factor: float = 1.0,
+    score_relax: float = 0.15,
+    fidelity_relax: float = 0.15,
+    regularity_relax: float = 0.35,
+    compactness_cap: Optional[float] = None,
+    verbose: bool = True,
+    **kwargs,
+) -> dict:
+    """
+    Exact compactness selection for cell-based platforms with a lower-compactness
+    re-selection pass.
+
+    This wrapper is intended for Xenium/MERFISH/CosMx where the default search
+    often over-rewards geometric regularity after rasterization.
+    """
+    import SPIX
+
+    if (target_cells_per_segment is None) == (target_segment_um is None):
+        raise ValueError("Provide exactly one of `target_cells_per_segment` or `target_segment_um`.")
+
+    dims = list(range(30)) if dimensions is None else list(dimensions)
+
+    pitch_details = None
+    if pitch_um is None:
+        pitch_details = resolve_pitch_um(
+            adata,
+            platform=platform,
+            support_method=support_method,
+            grid_size_um=grid_size_um,
+            alpha=alpha,
+            return_details=True,
+        )
+        pitch_um = float(pitch_details["pitch_um"])
+    else:
+        pitch_um = float(pitch_um)
+
+    target_details = None
+    if target_segment_um is None:
+        target_details = resolve_cell_target_segment_um(
+            adata,
+            target_cells_per_segment=float(target_cells_per_segment),
+            platform=platform,
+            support_method=support_method,
+            grid_size_um=grid_size_um,
+            alpha=alpha,
+            return_details=True,
+        )
+        target_segment_um = float(target_details["target_segment_um"])
+    else:
+        target_segment_um = float(target_segment_um)
+
+    base_result = SPIX.sp.select_compactness(
+        adata,
+        dimensions=dims,
+        search_dimensions=search_dimensions,
+        embedding=embedding,
+        target_segment_um=float(target_segment_um),
+        pitch_um=float(pitch_um),
+        origin=origin,
+        compactness_candidates=compactness_candidates,
+        compactness_search_jobs=int(compactness_search_jobs),
+        compactness_search_downsample_factor=float(compactness_search_downsample_factor),
+        verbose=verbose,
+        **kwargs,
+    )
+
+    result = reselect_compactness_for_cells(
+        base_result,
+        score_relax=float(score_relax),
+        fidelity_relax=float(fidelity_relax),
+        regularity_relax=float(regularity_relax),
+        compactness_cap=compactness_cap,
+        verbose=verbose,
+    )
+    result["pitch_um"] = float(pitch_um)
+    result["target_segment_um"] = float(target_segment_um)
+    result["target_cells_per_segment"] = None if target_cells_per_segment is None else float(target_cells_per_segment)
+    if pitch_details is not None:
+        result["pitch_details"] = pitch_details
+    if target_details is not None:
+        result["target_details"] = target_details
+    return result
+
+
+def reselect_compactness_for_stereo_seq(
+    selection_result: dict,
+    *,
+    score_relax: float = 0.12,
+    fidelity_relax: float = 0.20,
+    regularity_relax: float = 0.15,
+    compactness_floor: Optional[float] = None,
+    compactness_cap: Optional[float] = None,
+    prefer_higher_compactness: bool = True,
+    verbose: bool = True,
+) -> dict:
+    """
+    Re-select a compactness value from an existing sweep using a Stereo-seq rule.
+
+    Logic:
+    - keep candidates whose original score is near-best
+    - keep candidates whose fidelity cost is near-best
+    - keep candidates whose regularity cost is near-best
+    - if possible, enforce a monotone lower bound from the previous scale
+    - among the remaining candidates, prefer the most regular candidate and
+      break ties toward larger compactness
+
+    This is intended for dense spot lattices where the default selector can
+    drift toward overly low compactness at coarse scales.
+    """
+    frame = _cell_compactness_candidate_frame(selection_result)
+    if frame.empty:
+        result = dict(selection_result)
+        result["stereo_seq_reselection"] = {
+            "applied": False,
+            "reason": "empty_candidate_frame",
+        }
+        return result
+
+    work = frame.copy()
+    work["eligible"] = True
+
+    def _slack(values: np.ndarray, frac: float, floor: float) -> float:
+        finite = values[np.isfinite(values)]
+        if finite.size <= 1:
+            return float(floor)
+        span = float(np.nanmax(finite) - np.nanmin(finite))
+        return float(max(floor, float(frac) * span))
+
+    score_vals = work["score"].to_numpy(dtype=float)
+    if np.isfinite(score_vals).any():
+        score_min = float(np.nanmin(score_vals))
+        score_slack = _slack(score_vals, score_relax, 0.02)
+        work["eligible"] &= work["score"] <= (score_min + score_slack)
+    else:
+        score_min = None
+        score_slack = None
+
+    fidelity_vals = (
+        work["fidelity_cost"].to_numpy(dtype=float)
+        if "fidelity_cost" in work
+        else np.array([], dtype=float)
+    )
+    if fidelity_vals.size and np.isfinite(fidelity_vals).any():
+        fidelity_min = float(np.nanmin(fidelity_vals))
+        fidelity_slack = _slack(fidelity_vals, fidelity_relax, 0.03)
+        work["eligible"] &= work["fidelity_cost"] <= (fidelity_min + fidelity_slack)
+    else:
+        fidelity_min = None
+        fidelity_slack = None
+
+    regularity_vals = (
+        work["regularity_cost"].to_numpy(dtype=float)
+        if "regularity_cost" in work
+        else np.array([], dtype=float)
+    )
+    if regularity_vals.size and np.isfinite(regularity_vals).any():
+        regularity_min = float(np.nanmin(regularity_vals))
+        regularity_slack = _slack(regularity_vals, regularity_relax, 0.03)
+        work["eligible"] &= work["regularity_cost"] <= (regularity_min + regularity_slack)
+    else:
+        regularity_min = None
+        regularity_slack = None
+
+    floor_applied = False
+    if compactness_floor is not None and np.isfinite(float(compactness_floor)):
+        floor_value = float(compactness_floor)
+        above_floor = work["compactness"] >= (floor_value - 1e-8)
+        if bool((work["eligible"] & above_floor).any()):
+            work["eligible"] &= above_floor
+            floor_applied = True
+
+    cap_applied = False
+    if compactness_cap is not None and np.isfinite(float(compactness_cap)):
+        below_cap = work["compactness"] <= float(compactness_cap)
+        if bool((work["eligible"] & below_cap).any()):
+            work["eligible"] &= below_cap
+            cap_applied = True
+
+    eligible = work.loc[work["eligible"]].copy()
+    if eligible.empty:
+        eligible = work.copy()
+
+    chosen = eligible.sort_values(
+        ["score", "fidelity_cost", "regularity_cost", "compactness"],
+        ascending=[True, True, True, not bool(prefer_higher_compactness)],
+        kind="mergesort",
+    ).iloc[0]
+
+    selected_search_compactness = float(chosen["compactness"])
+    selected_stage = str(chosen.get("search_stage", ""))
+    observed_segment_count = None
+    if "n_segments" in chosen and np.isfinite(float(chosen["n_segments"])):
+        observed_segment_count = int(round(float(chosen["n_segments"])))
+
+    result = dict(selection_result)
+    base_selected = float(selection_result.get("selected_compactness", selected_search_compactness))
+    result["base_selected_compactness"] = base_selected
+    result["selected_observed_segment_count"] = observed_segment_count
+
+    scaled_from_reference = bool(result.get("scaled_from_search_target_um", False))
+    if scaled_from_reference and ("search_target_segment_um" in result) and ("target_segment_um" in result):
+        import SPIX
+
+        search_target_um = float(result["search_target_segment_um"])
+        target_um = float(result["target_segment_um"])
+        scale_power = float(result.get("compactness_scale_power", 0.3))
+        selected_compactness = float(
+            SPIX.sp.scale_compactness(
+                selected_search_compactness,
+                from_um=search_target_um,
+                to_um=target_um,
+                power=scale_power,
+            )
+        )
+        result["search_selected_compactness"] = selected_search_compactness
+        result["selected_compactness"] = selected_compactness
+    else:
+        result["selected_compactness"] = selected_search_compactness
+        if "search_selected_compactness" in result:
+            result["search_selected_compactness"] = selected_search_compactness
+
+    for stage_key in ("coarse_search", "refine_search"):
+        stage_detail = result.get(stage_key, None)
+        if not isinstance(stage_detail, dict):
+            continue
+        if str(stage_detail.get("mode", stage_key)) == selected_stage:
+            updated_stage = dict(stage_detail)
+            updated_stage["base_selected_compactness"] = float(
+                stage_detail.get("selected_compactness", selected_search_compactness)
+            )
+            updated_stage["selected_compactness"] = selected_search_compactness
+            result[stage_key] = updated_stage
+
+    result["stereo_seq_reselection"] = {
+        "applied": True,
+        "strategy": "prefer_regular_near_best_with_monotone_floor",
+        "score_relax": float(score_relax),
+        "fidelity_relax": float(fidelity_relax),
+        "regularity_relax": float(regularity_relax),
+        "compactness_floor": None if compactness_floor is None else float(compactness_floor),
+        "compactness_cap": None if compactness_cap is None else float(compactness_cap),
+        "floor_applied": bool(floor_applied),
+        "cap_applied": bool(cap_applied),
+        "prefer_higher_compactness": bool(prefer_higher_compactness),
+        "candidate_count": int(len(work)),
+        "eligible_count": int(len(eligible)),
+        "selected_compactness": float(result["selected_compactness"]),
+        "selected_search_compactness": float(selected_search_compactness),
+        "selected_stage": selected_stage,
+        "base_selected_compactness": float(base_selected),
+        "selected_candidate": {
+            "compactness": float(chosen["compactness"]),
+            "score": None if not np.isfinite(float(chosen.get("score", np.nan))) else float(chosen["score"]),
+            "fidelity_cost": None if not np.isfinite(float(chosen.get("fidelity_cost", np.nan))) else float(chosen["fidelity_cost"]),
+            "regularity_cost": None if not np.isfinite(float(chosen.get("regularity_cost", np.nan))) else float(chosen["regularity_cost"]),
+            "tradeoff_gain": None if not np.isfinite(float(chosen.get("tradeoff_gain", np.nan))) else float(chosen["tradeoff_gain"]),
+            "mean_log_aspect": None if not np.isfinite(float(chosen.get("mean_log_aspect", np.nan))) else float(chosen["mean_log_aspect"]),
+            "size_cv": None if not np.isfinite(float(chosen.get("size_cv", np.nan))) else float(chosen["size_cv"]),
+            "neighbor_disagreement": None if not np.isfinite(float(chosen.get("neighbor_disagreement", np.nan))) else float(chosen["neighbor_disagreement"]),
+            "n_segments": observed_segment_count,
+        },
+        "thresholds": {
+            "score_min": score_min,
+            "score_slack": score_slack,
+            "fidelity_min": fidelity_min,
+            "fidelity_slack": fidelity_slack,
+            "regularity_min": regularity_min,
+            "regularity_slack": regularity_slack,
+        },
+    }
+    if verbose:
+        print(
+            "[stereo-seq-compactness] reselection: "
+            f"base={base_selected:.6g} -> selected={float(result['selected_compactness']):.6g} "
+            f"(search={selected_search_compactness:.6g}) | "
+            f"eligible={int(len(eligible))}/{int(len(work))}"
+        )
+    return result
+
+
+def select_compactness_stereo_seq_robust(
+    adata: AnnData,
+    *,
+    target_segment_um: float,
+    pitch_um: float = 2.0,
+    dimensions: Optional[list[int]] = None,
+    search_dimensions: Optional[list[int]] = None,
+    embedding: str = "X_embedding",
+    origin: bool = True,
+    compactness_candidates: Optional[list[float]] = None,
+    compactness_search_jobs: int = 4,
+    compactness_search_downsample_factor: float = 2.0,
+    lock_reference_target: bool = True,
+    search_target_segment_um: Optional[float] = None,
+    score_relax: float = 0.12,
+    fidelity_relax: float = 0.20,
+    regularity_relax: float = 0.15,
+    compactness_floor: Optional[float] = None,
+    compactness_cap: Optional[float] = None,
+    prefer_higher_compactness: bool = True,
+    verbose: bool = True,
+    **kwargs,
+) -> dict:
+    """
+    Exact compactness selection for Stereo-seq-style dense spot lattices with a
+    robust reselection pass that prefers regular coarse segments.
+    """
+    import SPIX
+
+    dims = list(range(30)) if dimensions is None else list(dimensions)
+    target_um = float(target_segment_um)
+    search_target = (
+        float(target_um)
+        if lock_reference_target and search_target_segment_um is None
+        else (
+            None
+            if search_target_segment_um is None
+            else float(search_target_segment_um)
+        )
+    )
+
+    base_result = SPIX.sp.fast_select_compactness(
+        adata,
+        dimensions=dims,
+        search_dimensions=search_dimensions,
+        embedding=embedding,
+        target_segment_um=target_um,
+        pitch_um=float(pitch_um),
+        origin=origin,
+        compactness_candidates=compactness_candidates,
+        compactness_search_jobs=int(compactness_search_jobs),
+        compactness_search_downsample_factor=float(compactness_search_downsample_factor),
+        search_target_segment_um=search_target,
+        verbose=verbose,
+        **kwargs,
+    )
+
+    result = reselect_compactness_for_stereo_seq(
+        base_result,
+        score_relax=float(score_relax),
+        fidelity_relax=float(fidelity_relax),
+        regularity_relax=float(regularity_relax),
+        compactness_floor=compactness_floor,
+        compactness_cap=compactness_cap,
+        prefer_higher_compactness=bool(prefer_higher_compactness),
+        verbose=verbose,
+    )
+    result["pitch_um"] = float(pitch_um)
+    result["target_segment_um"] = float(target_um)
+    result["lock_reference_target"] = bool(lock_reference_target)
+    result["search_target_segment_um"] = (
+        float(search_target)
+        if search_target is not None
+        else result.get("search_target_segment_um", None)
+    )
+    return result
+
+
+def select_compactness_stereo_seq_multiscale_robust(
+    adata: AnnData,
+    *,
+    target_segment_ums: List[float],
+    pitch_um: float = 2.0,
+    dimensions: Optional[list[int]] = None,
+    search_dimensions: Optional[list[int]] = None,
+    embedding: str = "X_embedding",
+    origin: bool = True,
+    compactness_candidates: Optional[list[float]] = None,
+    compactness_search_jobs: int = 4,
+    compactness_search_downsample_factor: float = 2.0,
+    lock_reference_target: bool = True,
+    monotone_non_decreasing: bool = True,
+    score_relax: float = 0.12,
+    fidelity_relax: float = 0.20,
+    regularity_relax: float = 0.15,
+    compactness_cap: Optional[float] = None,
+    prefer_higher_compactness: bool = True,
+    verbose: bool = True,
+    **kwargs,
+) -> dict:
+    """
+    Run Stereo-seq robust compactness selection across multiple target sizes.
+
+    The previous selected compactness is optionally used as a lower bound for
+    the next scale so coarse resolutions do not collapse to a smaller value.
+    """
+    targets = [float(x) for x in target_segment_ums]
+    if len(targets) == 0:
+        raise ValueError("`target_segment_ums` must contain at least one target size.")
+
+    ordered_targets = sorted(targets)
+    results_by_target = {}
+    summary_rows = []
+    previous_selected = None
+
+    for target_um in ordered_targets:
+        floor_value = float(previous_selected) if (monotone_non_decreasing and previous_selected is not None) else None
+        result = select_compactness_stereo_seq_robust(
+            adata,
+            target_segment_um=float(target_um),
+            pitch_um=float(pitch_um),
+            dimensions=dimensions,
+            search_dimensions=search_dimensions,
+            embedding=embedding,
+            origin=origin,
+            compactness_candidates=compactness_candidates,
+            compactness_search_jobs=int(compactness_search_jobs),
+            compactness_search_downsample_factor=float(compactness_search_downsample_factor),
+            lock_reference_target=bool(lock_reference_target),
+            score_relax=float(score_relax),
+            fidelity_relax=float(fidelity_relax),
+            regularity_relax=float(regularity_relax),
+            compactness_floor=floor_value,
+            compactness_cap=compactness_cap,
+            prefer_higher_compactness=bool(prefer_higher_compactness),
+            verbose=verbose,
+            **kwargs,
+        )
+        reselection = result.get("stereo_seq_reselection", {})
+        search_selected = float(result.get("search_selected_compactness", result["selected_compactness"]))
+        previous_selected = search_selected
+        results_by_target[float(target_um)] = result
+        summary_rows.append(
+            {
+                "target_segment_um": float(target_um),
+                "search_target_segment_um": result.get("search_target_segment_um", None),
+                "base_selected_compactness": result.get("base_selected_compactness", None),
+                "selected_compactness": result.get("selected_compactness", None),
+                "selected_search_compactness": search_selected,
+                "compactness_floor": reselection.get("compactness_floor", floor_value),
+                "floor_applied": reselection.get("floor_applied", False),
+                "eligible_count": reselection.get("eligible_count", None),
+                "candidate_count": reselection.get("candidate_count", None),
+                "requested_n_segments": result.get("requested_n_segments", None),
+                "search_n_segments": result.get("search_n_segments", None),
+                "observed_n_segments": result.get("selected_observed_segment_count", None),
+            }
+        )
+
+    summary = pd.DataFrame(summary_rows)
+    return {
+        "targets_um": ordered_targets,
+        "results_by_target_um": results_by_target,
+        "summary": summary,
+        "pitch_um": float(pitch_um),
+        "lock_reference_target": bool(lock_reference_target),
+        "monotone_non_decreasing": bool(monotone_non_decreasing),
+        "score_relax": float(score_relax),
+        "fidelity_relax": float(fidelity_relax),
+        "regularity_relax": float(regularity_relax),
+    }

@@ -253,6 +253,7 @@ def cache_embedding_image(
     segment_key: Optional[str] = "Segment",
     runtime_fill_from_boundary: bool = False,
     runtime_fill_closing_radius: int = 1,
+    runtime_fill_external_radius: int = 0,
     runtime_fill_holes: bool = True,
     soft_rasterization: bool = False,
     resolve_center_collisions: bool = False,
@@ -334,6 +335,7 @@ def cache_embedding_image(
             segment_key=segment_key,
             runtime_fill_from_boundary=runtime_fill_from_boundary,
             runtime_fill_closing_radius=runtime_fill_closing_radius,
+            runtime_fill_external_radius=runtime_fill_external_radius,
             runtime_fill_holes=runtime_fill_holes,
             soft_rasterization=soft_rasterization,
             resolve_center_collisions=resolve_center_collisions,
@@ -735,10 +737,13 @@ def cache_embedding_image(
         "filled_pixels": 0,
         "support_pixels": int(paint_mask.sum()),
         "closing_radius": int(max(0, int(runtime_fill_closing_radius))),
+        "external_radius": int(max(0, int(runtime_fill_external_radius))),
         "fill_holes": bool(runtime_fill_holes),
     }
     fill_active = bool(runtime_fill_from_boundary) or bool(runtime_fill_holes)
     fill_radius = int(runtime_fill_closing_radius) if bool(runtime_fill_from_boundary) else 0
+    external_radius = int(runtime_fill_external_radius) if bool(runtime_fill_from_boundary) else 0
+    label_paint_mask = paint_mask.copy()
     if fill_active:
         runtime_fill_info = _raster.fill_raster_from_boundary(
             img=img,
@@ -747,6 +752,7 @@ def cache_embedding_image(
             seed_y=cy_seed,
             seed_values=cols,
             closing_radius=int(fill_radius),
+            external_radius=int(external_radius),
             fill_holes=bool(runtime_fill_holes),
             logger=None,
             context="cache_embedding_image",
@@ -794,20 +800,7 @@ def cache_embedding_image(
                     all_x = np.clip((cx0[:, None] + dx[None, :]).ravel(), 0, w - 1)
                     all_y = np.clip((cy0[:, None] + dy[None, :]).ravel(), 0, h - 1)
                     label_img[all_y, all_x] = np.repeat(seg_codes[idx], len(dx))
-        if fill_active:
-            label_img_fill = label_img.astype(np.float32, copy=True)[..., None]
-            _raster.fill_raster_from_boundary(
-                img=label_img_fill,
-                occupancy_mask=paint_mask.copy(),
-                seed_x=cx_seed,
-                seed_y=cy_seed,
-                seed_values=seg_codes.astype(np.float32, copy=False)[:, None],
-                closing_radius=int(fill_radius),
-                fill_holes=bool(runtime_fill_holes),
-                logger=None,
-                context="cache_embedding_image(label_img)",
-            )
-            label_img = np.rint(label_img_fill[..., 0]).astype(int, copy=False)
+        label_img[~label_paint_mask] = -1
 
     if downsample_factor and downsample_factor > 1.0:
         # Simple average pooling downsample to avoid extra deps
@@ -985,6 +978,7 @@ def cache_embedding_image(
             "segment_key_requested": segment_key,
             "runtime_fill_from_boundary": bool(runtime_fill_from_boundary),
             "runtime_fill_closing_radius": int(max(0, int(runtime_fill_closing_radius))),
+            "runtime_fill_external_radius": int(max(0, int(runtime_fill_external_radius))),
             "runtime_fill_holes": bool(runtime_fill_holes),
             "soft_rasterization": bool(soft_enabled),
             "resolve_center_collisions": bool(resolve_center_collisions),
@@ -1117,6 +1111,7 @@ def _cache_embedding_image_legacy(
     segment_key: Optional[str],
     runtime_fill_from_boundary: bool,
     runtime_fill_closing_radius: int,
+    runtime_fill_external_radius: int,
     runtime_fill_holes: bool,
     soft_rasterization: bool,
     resolve_center_collisions: bool,
@@ -1412,10 +1407,13 @@ def _cache_embedding_image_legacy(
         "filled_pixels": 0,
         "support_pixels": int(paint_mask.sum()),
         "closing_radius": int(max(0, int(runtime_fill_closing_radius))),
+        "external_radius": int(max(0, int(runtime_fill_external_radius))),
         "fill_holes": bool(runtime_fill_holes),
     }
     fill_active = bool(runtime_fill_from_boundary) or bool(runtime_fill_holes)
     fill_radius = int(runtime_fill_closing_radius) if bool(runtime_fill_from_boundary) else 0
+    external_radius = int(runtime_fill_external_radius) if bool(runtime_fill_from_boundary) else 0
+    label_paint_mask = paint_mask.copy()
     if fill_active:
         runtime_fill_info = _raster.fill_raster_from_boundary(
             img=img,
@@ -1424,6 +1422,7 @@ def _cache_embedding_image_legacy(
             seed_y=cy_seed,
             seed_values=cols,
             closing_radius=int(fill_radius),
+            external_radius=int(external_radius),
             fill_holes=bool(runtime_fill_holes),
             logger=None,
             context="cache_embedding_image(legacy)",
@@ -1466,20 +1465,7 @@ def _cache_embedding_image_legacy(
                     all_x = np.clip((cx0[:, None] + dx[None, :]).ravel(), 0, w - 1)
                     all_y = np.clip((cy0[:, None] + dy[None, :]).ravel(), 0, h - 1)
                     label_img[all_y, all_x] = np.repeat(seg_codes[idx], len(dx))
-        if fill_active:
-            label_img_fill = label_img.astype(np.float32, copy=True)[..., None]
-            _raster.fill_raster_from_boundary(
-                img=label_img_fill,
-                occupancy_mask=paint_mask.copy(),
-                seed_x=cx_seed,
-                seed_y=cy_seed,
-                seed_values=seg_codes.astype(np.float32, copy=False)[:, None],
-                closing_radius=int(fill_radius),
-                fill_holes=bool(runtime_fill_holes),
-                logger=None,
-                context="cache_embedding_image(label_img, legacy)",
-            )
-            label_img = np.rint(label_img_fill[..., 0]).astype(int, copy=False)
+        label_img[~label_paint_mask] = -1
 
     if downsample_factor and downsample_factor > 1.0:
         factor = int(downsample_factor)
@@ -1640,6 +1626,7 @@ def _cache_embedding_image_legacy(
             "segment_key_requested": segment_key,
             "runtime_fill_from_boundary": bool(runtime_fill_from_boundary),
             "runtime_fill_closing_radius": int(max(0, int(runtime_fill_closing_radius))),
+            "runtime_fill_external_radius": int(max(0, int(runtime_fill_external_radius))),
             "runtime_fill_holes": bool(runtime_fill_holes),
             "soft_rasterization": bool(soft_enabled),
             "resolve_center_collisions": bool(resolve_center_collisions),
@@ -1827,6 +1814,7 @@ def rebuild_cached_image_from_obsm(
     runtime_fill_cfg = dict(cache.get("runtime_fill", {}) or {})
     fill_active = bool(runtime_fill_cfg.get("applied", False)) or bool(plot_params.get("runtime_fill_from_boundary", False)) or bool(plot_params.get("runtime_fill_holes", runtime_fill_cfg.get("fill_holes", False)))
     fill_radius = int(plot_params.get("runtime_fill_closing_radius", runtime_fill_cfg.get("closing_radius", 1))) if bool(plot_params.get("runtime_fill_from_boundary", False)) else 0
+    external_radius = int(plot_params.get("runtime_fill_external_radius", runtime_fill_cfg.get("external_radius", 0))) if bool(plot_params.get("runtime_fill_from_boundary", False)) else 0
     if fill_active:
         _raster.fill_raster_from_boundary(
             img=img,
@@ -1835,6 +1823,7 @@ def rebuild_cached_image_from_obsm(
             seed_y=np.asarray(cy, dtype=np.int32),
             seed_values=emb,
             closing_radius=int(fill_radius),
+            external_radius=int(external_radius),
             fill_holes=bool(plot_params.get("runtime_fill_holes", runtime_fill_cfg.get("fill_holes", True))),
             logger=None,
             context="rebuild_cached_image_from_obsm",

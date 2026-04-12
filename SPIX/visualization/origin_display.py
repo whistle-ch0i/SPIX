@@ -9,7 +9,6 @@ from matplotlib import colors as mcolors
 import numpy as np
 import pandas as pd
 from pandas.api.types import is_numeric_dtype
-from scipy.ndimage import binary_dilation, distance_transform_edt
 
 from SPIX.utils.utils import _check_img, _check_scale_factor, _check_spatial_data, rebalance_colors
 from SPIX.visualization import raster as _raster
@@ -21,6 +20,7 @@ from .plotting import (
     _rasterize_rgba_and_label_buffer,
     _rebalance_color_array,
     _resolve_plot_raster_state,
+    _resolve_stored_pixel_boundary_payload,
     _sanitize_segment_key_for_uns,
     _string_array_no_copy,
     _string_index_no_copy,
@@ -259,7 +259,7 @@ def overlay_segment_boundaries_on_display(
     pixel_boundary_render: str = "contour",
     pixel_boundary_thickness_px: int = 1,
     pixel_boundary_antialiased: bool = True,
-    pixel_boundary_include_background: bool = False,
+    pixel_boundary_include_background: str | bool = "outline",
     figsize=(10, 10),
     fig_dpi: float = 100.0,
     imshow_tile_size=None,
@@ -274,6 +274,7 @@ def overlay_segment_boundaries_on_display(
     neighborhood_fill_px: int | None = None,
     runtime_fill_from_boundary: bool = False,
     runtime_fill_closing_radius: int = 1,
+    runtime_fill_external_radius: int = 0,
     runtime_fill_holes: bool = True,
     soft_rasterization: bool = False,
     resolve_center_collisions: bool = False,
@@ -282,18 +283,10 @@ def overlay_segment_boundaries_on_display(
     ylim=None,
 ):
     if stored_boundary_payload is not None:
-        label_img = np.asarray(stored_boundary_payload.get("label_img"), dtype=np.int32)
-        stored_support_mask = stored_boundary_payload.get("support_mask", None)
-        if stored_support_mask is not None:
-            stored_support_mask = np.asarray(stored_support_mask, dtype=bool)
-            if stored_support_mask.shape == label_img.shape:
-                label_img = np.where(stored_support_mask, label_img, -1)
-        extent = [
-            float(stored_boundary_payload.get("x_min_eff", 0.0)) * float(stored_boundary_scale),
-            float(stored_boundary_payload.get("x_max_eff", float(label_img.shape[1]))) * float(stored_boundary_scale),
-            float(stored_boundary_payload.get("y_min_eff", 0.0)) * float(stored_boundary_scale),
-            float(stored_boundary_payload.get("y_max_eff", float(label_img.shape[0]))) * float(stored_boundary_scale),
-        ]
+        label_img, extent = _resolve_stored_pixel_boundary_payload(
+            stored_boundary_payload,
+            extent_scale=float(stored_boundary_scale),
+        )
         linestyle = {"solid": "-", "dashed": "--", "dotted": ":"}.get(boundary_style, "-")
         _plot_boundaries_from_label_image(
             ax,
@@ -307,7 +300,7 @@ def overlay_segment_boundaries_on_display(
             render=pixel_boundary_render,
             thickness_px=pixel_boundary_thickness_px,
             antialiased=pixel_boundary_antialiased,
-            include_background=bool(pixel_boundary_include_background),
+            include_background=pixel_boundary_include_background,
         )
         _apply_axis_crop(ax, xlim=xlim, ylim=ylim)
         return
@@ -388,6 +381,7 @@ def overlay_segment_boundaries_on_display(
         label_codes=pd.Categorical(coordinates_df[segment_key]).codes.astype(np.int32),
         runtime_fill_from_boundary=bool(runtime_fill_from_boundary),
         runtime_fill_closing_radius=int(runtime_fill_closing_radius),
+        runtime_fill_external_radius=int(runtime_fill_external_radius),
         runtime_fill_holes=bool(runtime_fill_holes),
         chunk_size=int(chunk_size),
         logger=None,
@@ -395,48 +389,26 @@ def overlay_segment_boundaries_on_display(
         context="overlay_segment_boundaries_on_display",
     )
 
-    occupied = label_img >= 0
-    fill_active = bool(runtime_fill_from_boundary) or bool(runtime_fill_holes)
-    if neighborhood_fill_px is None:
-        fill_px = 0 if fill_active else max(2, int(np.ceil(max(1, int(raster_state["s"])) * 0.75)))
-    else:
-        fill_px = int(max(0, neighborhood_fill_px))
-    if (not fill_active) and fill_px > 0 and np.any(occupied):
-        neighborhood = binary_dilation(occupied, iterations=fill_px)
-        missing = neighborhood & (label_img < 0)
-        if np.any(missing):
-            _, nearest = distance_transform_edt(label_img < 0, return_indices=True)
-            filled = label_img.copy()
-            filled[missing] = label_img[nearest[0][missing], nearest[1][missing]]
-            label_img = filled
-        else:
-            neighborhood = occupied
-    else:
-        neighborhood = occupied
-
     linestyle = {"solid": "-", "dashed": "--", "dotted": ":"}.get(boundary_style, "-")
-    if np.any(neighborhood):
-        boundary_only = label_img.copy()
-        boundary_only[~neighborhood] = -1
-        _plot_boundaries_from_label_image(
-            ax,
-            boundary_only,
-            [
-                float(raster_state["x_min_eff"]),
-                float(raster_state["x_max_eff"]),
-                float(raster_state["y_min_eff"]),
-                float(raster_state["y_max_eff"]),
-            ],
-            boundary_color,
-            boundary_linewidth,
-            boundary_alpha,
-            linestyle,
-            pixel_smoothing_sigma,
-            render=pixel_boundary_render,
-            thickness_px=pixel_boundary_thickness_px,
-            antialiased=pixel_boundary_antialiased,
-            include_background=bool(pixel_boundary_include_background),
-        )
+    _plot_boundaries_from_label_image(
+        ax,
+        label_img,
+        [
+            float(raster_state["x_min_eff"]),
+            float(raster_state["x_max_eff"]),
+            float(raster_state["y_min_eff"]),
+            float(raster_state["y_max_eff"]),
+        ],
+        boundary_color,
+        boundary_linewidth,
+        boundary_alpha,
+        linestyle,
+        pixel_smoothing_sigma,
+        render=pixel_boundary_render,
+        thickness_px=pixel_boundary_thickness_px,
+        antialiased=pixel_boundary_antialiased,
+        include_background=pixel_boundary_include_background,
+    )
     _apply_axis_crop(ax, xlim=xlim, ylim=ylim)
 
 
@@ -484,7 +456,7 @@ def image_plot_with_spatial_image_display_boundaries(
     pixel_boundary_render: str = "contour",
     pixel_boundary_thickness_px: int = 1,
     pixel_boundary_antialiased: bool = True,
-    pixel_boundary_include_background: bool = False,
+    pixel_boundary_include_background: str | bool = "outline",
     use_imshow=True,
     pixel_shape="square",
     chunk_size=50000,
@@ -511,6 +483,7 @@ def image_plot_with_spatial_image_display_boundaries(
     array_col_key: str = "array_col",
     runtime_fill_from_boundary: bool = False,
     runtime_fill_closing_radius: int = 1,
+    runtime_fill_external_radius: int = 0,
     runtime_fill_holes: bool = True,
     soft_rasterization: bool = False,
     resolve_center_collisions: bool = False,
@@ -610,6 +583,7 @@ def image_plot_with_spatial_image_display_boundaries(
             array_col_key=array_col_key,
             runtime_fill_from_boundary=runtime_fill_from_boundary,
             runtime_fill_closing_radius=runtime_fill_closing_radius,
+            runtime_fill_external_radius=runtime_fill_external_radius,
             runtime_fill_holes=runtime_fill_holes,
             soft_rasterization=soft_rasterization,
             resolve_center_collisions=resolve_center_collisions,
@@ -807,6 +781,7 @@ def image_plot_with_spatial_image_display_boundaries(
             label_codes=None,
             runtime_fill_from_boundary=bool(runtime_fill_from_boundary),
             runtime_fill_closing_radius=int(runtime_fill_closing_radius),
+            runtime_fill_external_radius=int(runtime_fill_external_radius),
             runtime_fill_holes=bool(runtime_fill_holes),
             chunk_size=int(chunk_size),
             logger=logger,
@@ -853,6 +828,7 @@ def image_plot_with_spatial_image_display_boundaries(
             chunk_size=chunk_size,
             runtime_fill_from_boundary=runtime_fill_from_boundary,
             runtime_fill_closing_radius=runtime_fill_closing_radius,
+            runtime_fill_external_radius=runtime_fill_external_radius,
             runtime_fill_holes=runtime_fill_holes,
             soft_rasterization=soft_rasterization,
             resolve_center_collisions=resolve_center_collisions,
