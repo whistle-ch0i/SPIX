@@ -488,6 +488,10 @@ def image_plot_with_spatial_image_display_boundaries(
     soft_rasterization: bool = False,
     resolve_center_collisions: bool = False,
     center_collision_radius: int = 2,
+    cache_image: bool = False,
+    image_cache_key: str | None = None,
+    refresh_image_cache: bool = False,
+    show_axes: bool = False,
 ):
     """
     Plot display coordinates and overlay segment boundaries re-rasterized on the displayed tiles.
@@ -588,9 +592,76 @@ def image_plot_with_spatial_image_display_boundaries(
             soft_rasterization=soft_rasterization,
             resolve_center_collisions=resolve_center_collisions,
             center_collision_radius=center_collision_radius,
+            cache_image=cache_image,
+            image_cache_key=image_cache_key,
+            refresh_image_cache=refresh_image_cache,
+            show_axes=show_axes,
             xlim=xlim,
             ylim=ylim,
         )
+
+    from .plotting import (
+        _can_render_plot_cache_fast,
+        _prepare_plot_image_cache,
+        _render_plot_cache_fast,
+    )
+
+    plot_cache = _prepare_plot_image_cache(
+        adata,
+        cache_image=cache_image,
+        image_cache_key=image_cache_key,
+        refresh_image_cache=refresh_image_cache,
+        verbose=bool(verbose),
+        embedding=embedding,
+        dimensions=dimensions,
+        origin=origin,
+        coordinate_mode=coordinate_mode,
+        array_row_key=array_row_key,
+        array_col_key=array_col_key,
+        color_by=color_by,
+        palette=palette,
+        alpha_by=alpha_by,
+        alpha_range=alpha_range,
+        alpha_clip=alpha_clip,
+        alpha_invert=alpha_invert,
+        prioritize_high_values=prioritize_high_values,
+        overlap_priority="few_front",
+        segment_color_by_major=False,
+        title=title,
+        use_imshow=use_imshow,
+        brighten_continuous=brighten_continuous,
+        continuous_gamma=continuous_gamma,
+        plot_boundaries=True,
+        boundary_method="pixel",
+        boundary_color=boundary_color,
+        boundary_linewidth=boundary_linewidth,
+        boundary_style=boundary_style,
+        boundary_alpha=boundary_alpha,
+        pixel_smoothing_sigma=pixel_smoothing_sigma,
+        highlight_segments=None,
+        highlight_boundary_color=None,
+        highlight_linewidth=None,
+        highlight_brighten_factor=1.2,
+        dim_other_segments=0.3,
+        dim_to_grey=True,
+        segment_key=segment_key,
+        imshow_tile_size=imshow_tile_size,
+        imshow_scale_factor=imshow_scale_factor,
+        imshow_tile_size_mode=imshow_tile_size_mode,
+        imshow_tile_size_quantile=imshow_tile_size_quantile,
+        imshow_tile_size_rounding=imshow_tile_size_rounding,
+        imshow_tile_size_shrink=imshow_tile_size_shrink,
+        pixel_perfect=pixel_perfect,
+        pixel_shape=pixel_shape,
+        chunk_size=chunk_size,
+        runtime_fill_from_boundary=runtime_fill_from_boundary,
+        runtime_fill_closing_radius=runtime_fill_closing_radius,
+        runtime_fill_external_radius=runtime_fill_external_radius,
+        runtime_fill_holes=runtime_fill_holes,
+        soft_rasterization=soft_rasterization,
+        resolve_center_collisions=resolve_center_collisions,
+        center_collision_radius=center_collision_radius,
+    )
 
     library_id, spatial_data = _check_spatial_data(adata.uns, library_id)
     if suppress_img:
@@ -602,6 +673,51 @@ def image_plot_with_spatial_image_display_boundaries(
     if img_scaling_factor is None:
         img_scaling_factor = _check_scale_factor(spatial_data, img_key, img_scaling_factor)
     img_scaling_factor_adjusted = img_scaling_factor / tensor_resolution if img_scaling_factor else 1.0
+
+    if _can_render_plot_cache_fast(
+        cache=plot_cache,
+        requested_dimensions=dimensions,
+        show_colorbar=bool(show_colorbar),
+        show_legend=bool(show_legend),
+        segment_show_pie=False,
+        fill_boundaries=False,
+        plot_boundaries=True,
+        boundary_method="pixel",
+        use_imshow=bool(use_imshow),
+    ):
+        background_extent = None
+        background_origin = None
+        orientation = str(display_orientation or "image").lower()
+        if orientation not in {"image", "cartesian"}:
+            orientation = "image"
+        if img is not None:
+            y_max_img, x_max_img = img.shape[:2]
+            if orientation == "cartesian":
+                background_extent = [0, x_max_img, 0, y_max_img]
+                background_origin = "lower"
+            else:
+                background_extent = [0, x_max_img, y_max_img, 0]
+                background_origin = None
+        title_text = title if title is not None else f"{embedding} - display boundaries"
+        if verbose:
+            logger.info(
+                "image_plot_with_spatial_image_display_boundaries: rendering directly from cached image."
+            )
+        _render_plot_cache_fast(
+            cache=plot_cache,
+            requested_dimensions=dimensions,
+            title=title_text,
+            figsize=figsize,
+            fig_dpi=fig_dpi,
+            xlim=xlim,
+            ylim=ylim,
+            show_axes=bool(show_axes),
+            background_img=img,
+            background_extent=background_extent,
+            background_origin=background_origin,
+            background_alpha=alpha_img,
+        )
+        return
 
     coordinates_df = _resolve_display_coordinates(
         adata,
@@ -789,8 +905,12 @@ def image_plot_with_spatial_image_display_boundaries(
             context="image_plot_with_spatial_image_display_boundaries",
         )
 
+        img_rgba_show = img_rgba
+        if isinstance(img_rgba, np.ndarray) and img_rgba.ndim == 3 and img_rgba.shape[-1] in (3, 4):
+            img_rgba_show = np.rint(np.clip(img_rgba, 0.0, 1.0) * 255.0).astype(np.uint8, copy=False)
+
         ax.imshow(
-            img_rgba,
+            img_rgba_show,
             origin="lower",
             extent=[
                 float(raster_state["x_min_eff"]),
@@ -913,7 +1033,8 @@ def image_plot_with_spatial_image_display_boundaries(
         fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.04)
 
     ax.set_aspect("equal")
-    ax.axis("off")
+    if not show_axes:
+        ax.axis("off")
     ax.set_title(title if title is not None else f"{embedding} - display boundaries", fontsize=figsize[0] * 1.5)
     if verbose:
         logger.info("image_plot_with_spatial_image_display_boundaries total time: %.3fs", perf_counter() - t_all)

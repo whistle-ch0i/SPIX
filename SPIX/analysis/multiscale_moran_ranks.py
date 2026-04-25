@@ -121,7 +121,21 @@ def _extract_autocorr_metric(
     mode: str,
     thresh: float,
 ) -> Tuple[np.ndarray, pd.Index]:
-    metric_col, ascending = _autocorr_metric_config(mode)
+    score_series, rank_series = _extract_autocorr_metric_series(
+        df,
+        mode=mode,
+        thresh=thresh,
+    )
+    return rank_series.to_numpy(dtype=np.int32, copy=False), rank_series.index
+
+
+def _extract_autocorr_metric_series(
+    df: pd.DataFrame,
+    *,
+    mode: str,
+    thresh: float,
+) -> Tuple[pd.Series, pd.Series]:
+    metric_col, _ascending = _autocorr_metric_config(mode)
     if metric_col not in df.columns:
         raise KeyError(f"Expected autocorrelation column '{metric_col}' for mode='{mode}'")
 
@@ -141,7 +155,11 @@ def _extract_autocorr_metric(
             keep &= vals > float(thresh)
         ranker = _rank_min_desc
 
-    return ranker(vals[keep]), index[keep]
+    kept_vals = vals[keep]
+    kept_index = index[keep]
+    score_series = pd.Series(kept_vals, index=kept_index, name=metric_col, dtype=np.float64)
+    rank_series = pd.Series(ranker(kept_vals), index=kept_index, name="rank", dtype=np.int32)
+    return score_series, rank_series
 
 
 def _compute_moranI_fallback(
@@ -295,7 +313,7 @@ def _resolve_segment_path(raw_path: str, base_dir: Path) -> Path:
 
 def _moran_rank_worker(
     task: Tuple[str, str, float, str, Dict[str, Any], int]
-) -> Tuple[str, Optional[pd.Series], Optional[str]]:
+) -> Tuple[str, Optional[pd.Series], Optional[pd.Series], Optional[str]]:
     sid, npz_path, moran_thresh, segment_key, pseudo_bulk_kwargs, threads_per_process = task
     try:
         with _scoped_thread_limits(int(threads_per_process)):
@@ -315,7 +333,7 @@ def _moran_rank_worker(
 
             max_code = int(seg_codes.max(initial=-1))
             if max_code < 0:
-                return sid, None, f"{sid}: no valid segments"
+                return sid, None, None, f"{sid}: no valid segments"
 
             new_adata, moran = perform_pseudo_bulk_analysis(
                 adata,
@@ -341,22 +359,24 @@ def _moran_rank_worker(
                     if W is None or getattr(W, "nnz", 0) == 0:
                         available = list(new_adata.uns.keys())
                         del new_adata
-                        return sid, None, f"{sid}: empty MoranI (uns keys: {available})"
+                        return sid, None, None, f"{sid}: empty MoranI (uns keys: {available})"
                     if mode != "moran":
                         del new_adata
-                        return sid, None, f"{sid}: fallback autocorr only supports mode='moran' (got mode='{mode}')"
+                        return sid, None, None, f"{sid}: fallback autocorr only supports mode='moran' (got mode='{mode}')"
                     moran = _compute_moranI_fallback(new_adata.X, W, new_adata.var_names)
             del new_adata
 
-            ranks, rank_index = _extract_autocorr_metric(
+            score_series, rank_series = _extract_autocorr_metric_series(
                 moran,
                 mode=mode,
                 thresh=float(moran_thresh),
             )
-            series = pd.Series(ranks, index=rank_index, name=f"rank_{sid}")
-            return sid, series, None
+            metric_col, _ = _autocorr_metric_config(mode)
+            rank_series.name = f"rank_{sid}"
+            score_series.name = f"{metric_col}_{sid}"
+            return sid, rank_series, score_series, None
     except Exception as e:
-        return sid, None, f"{sid}: {type(e).__name__}: {e}"
+        return sid, None, None, f"{sid}: {type(e).__name__}: {e}"
     finally:
         gc.collect()
 
@@ -565,7 +585,7 @@ def _moran_rank_fast_thread(
     adata: sc.AnnData,
     task: Tuple[str, str, float, str, Dict[str, Any], int],
     edges: Tuple[np.ndarray, np.ndarray, np.ndarray],
-) -> Tuple[str, Optional[pd.Series], Optional[str]]:
+) -> Tuple[str, Optional[pd.Series], Optional[pd.Series], Optional[str]]:
     sid, npz_path, moran_thresh, _segment_key, pseudo_bulk_kwargs, threads_per_process = task
     try:
         with np.load(npz_path, allow_pickle=False) as z:
@@ -578,8 +598,9 @@ def _moran_rank_fast_thread(
 
         valid = seg_codes_raw >= 0
         if not np.any(valid):
-            series = pd.Series(np.zeros(0, dtype=np.int32), index=pd.Index([], dtype=str), name=f"rank_{sid}")
-            return sid, series, None
+            rank_series = pd.Series(np.zeros(0, dtype=np.int32), index=pd.Index([], dtype=str), name=f"rank_{sid}")
+            score_series = pd.Series(np.zeros(0, dtype=np.float64), index=pd.Index([], dtype=str), name=f"I_{sid}")
+            return sid, rank_series, score_series, None
 
         # Compact segment ids to 0..n_segs-1 (saves memory if codes are sparse)
         raw_ids = seg_codes_raw[valid].astype(np.int64, copy=False)
@@ -589,6 +610,7 @@ def _moran_rank_fast_thread(
         seg_codes[np.flatnonzero(valid)] = inv.astype(np.int32, copy=False)
 
         expr_agg = pseudo_bulk_kwargs.get("expr_agg", "sum")
+        mode = str(pseudo_bulk_kwargs.get("mode", "moran")).lower()
         normalize_total = bool(pseudo_bulk_kwargs.get("normalize_total", True))
         log_transform = bool(pseudo_bulk_kwargs.get("log_transform", True))
         min_genes_in_segment = int(pseudo_bulk_kwargs.get("min_genes_in_segment", 1))
@@ -610,8 +632,9 @@ def _moran_rank_fast_thread(
             nnz_per_gene = np.asarray(X_bulk.getnnz(axis=0)).reshape(-1)
             keep = nnz_per_gene >= min_genes_in_segment
             if not np.any(keep):
-                series = pd.Series(np.zeros(0, dtype=np.int32), index=pd.Index([], dtype=str), name=f"rank_{sid}")
-                return sid, series, None
+                rank_series = pd.Series(np.zeros(0, dtype=np.int32), index=pd.Index([], dtype=str), name=f"rank_{sid}")
+                score_series = pd.Series(np.zeros(0, dtype=np.float64), index=pd.Index([], dtype=str), name=f"I_{sid}")
+                return sid, rank_series, score_series, None
             X_bulk = X_bulk[:, keep]
             var_names = np.asarray(adata.var_names).astype(str)[keep]
         else:
@@ -657,34 +680,29 @@ def _moran_rank_fast_thread(
             var_names,
             residualize_covariate=residualize_covariate,
         )
-        i_vals = moran["I"].to_numpy(dtype=np.float64, copy=False)
-        moran_index = moran.index.astype(str)
-
-        finite = np.isfinite(i_vals)
-        if float(moran_thresh) != -np.inf:
-            finite = finite & (i_vals > float(moran_thresh))
-
-        if not np.any(finite):
-            series = pd.Series(np.zeros(0, dtype=np.int32), index=pd.Index([], dtype=str), name=f"rank_{sid}")
-            return sid, series, None
-
-        ranks = _rank_min_desc(i_vals[finite])
-        series = pd.Series(ranks, index=moran_index[finite], name=f"rank_{sid}")
-        return sid, series, None
+        score_series, rank_series = _extract_autocorr_metric_series(
+            moran,
+            mode=mode,
+            thresh=float(moran_thresh),
+        )
+        metric_col, _ = _autocorr_metric_config(mode)
+        rank_series.name = f"rank_{sid}"
+        score_series.name = f"{metric_col}_{sid}"
+        return sid, rank_series, score_series, None
     except Exception as e:
-        return sid, None, f"{sid}: {type(e).__name__}: {e}"
+        return sid, None, None, f"{sid}: {type(e).__name__}: {e}"
     finally:
         gc.collect()
 
 
 def _moran_rank_fast_worker(
     task: Tuple[str, str, float, str, Dict[str, Any], int]
-) -> Tuple[str, Optional[pd.Series], Optional[str]]:
+) -> Tuple[str, Optional[pd.Series], Optional[pd.Series], Optional[str]]:
     global _GLOBAL_A_EDGES
     if _GLOBAL_A_EDGES is None:
-        return task[0], None, f"{task[0]}: Global edges are not set"
+        return task[0], None, None, f"{task[0]}: Global edges are not set"
     if _GLOBAL_ADATA is None:
-        return task[0], None, f"{task[0]}: Global adata is not set"
+        return task[0], None, None, f"{task[0]}: Global adata is not set"
     threads_per_process = task[5]
     with _scoped_thread_limits(int(threads_per_process)):
         return _moran_rank_fast_thread(_GLOBAL_ADATA, task, _GLOBAL_A_EDGES)
@@ -693,7 +711,7 @@ def _moran_rank_fast_worker(
 def _moran_rank_thread(
     adata: sc.AnnData,
     task: Tuple[str, str, float, str, Dict[str, Any], int],
-) -> Tuple[str, Optional[pd.Series], Optional[str]]:
+) -> Tuple[str, Optional[pd.Series], Optional[pd.Series], Optional[str]]:
     sid, npz_path, moran_thresh, segment_key, pseudo_bulk_kwargs, _threads_per_process = task
     try:
         with np.load(npz_path, allow_pickle=False) as z:
@@ -706,7 +724,7 @@ def _moran_rank_thread(
 
         max_code = int(seg_codes.max(initial=-1))
         if max_code < 0:
-            return sid, None, f"{sid}: no valid segments"
+            return sid, None, None, f"{sid}: no valid segments"
 
         new_adata, moran = perform_pseudo_bulk_analysis(
             adata,
@@ -732,22 +750,24 @@ def _moran_rank_thread(
                 if W is None or getattr(W, "nnz", 0) == 0:
                     available = list(new_adata.uns.keys())
                     del new_adata
-                    return sid, None, f"{sid}: empty MoranI (uns keys: {available})"
+                    return sid, None, None, f"{sid}: empty MoranI (uns keys: {available})"
                 if mode != "moran":
                     del new_adata
-                    return sid, None, f"{sid}: fallback autocorr only supports mode='moran' (got mode='{mode}')"
+                    return sid, None, None, f"{sid}: fallback autocorr only supports mode='moran' (got mode='{mode}')"
                 moran = _compute_moranI_fallback(new_adata.X, W, new_adata.var_names)
         del new_adata
 
-        ranks, rank_index = _extract_autocorr_metric(
+        score_series, rank_series = _extract_autocorr_metric_series(
             moran,
             mode=mode,
             thresh=float(moran_thresh),
         )
-        series = pd.Series(ranks, index=rank_index, name=f"rank_{sid}")
-        return sid, series, None
+        metric_col, _ = _autocorr_metric_config(mode)
+        rank_series.name = f"rank_{sid}"
+        score_series.name = f"{metric_col}_{sid}"
+        return sid, rank_series, score_series, None
     except Exception as e:
-        return sid, None, f"{sid}: {type(e).__name__}: {e}"
+        return sid, None, None, f"{sid}: {type(e).__name__}: {e}"
     finally:
         gc.collect()
 
@@ -756,6 +776,7 @@ def multiscale_moran_ranks(
     adata: sc.AnnData,
     segments_index_csv: str,
     out_csv: Optional[str] = None,
+    out_score_csv: Optional[str] = None,
     moran_thresh: float = 0.0,
     backend: str = "threads",  # "threads" | "process" | "sequential"
     n_jobs: Optional[int] = None,
@@ -769,7 +790,8 @@ def multiscale_moran_ranks(
     pseudo_bulk_kwargs: Optional[Dict[str, Any]] = None,
     quiet: bool = False,
     engine: str = "squidpy",  # "squidpy" | "fast"
-) -> pd.DataFrame:
+    return_scores: bool = False,
+) -> pd.DataFrame | Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Compute Moran's I ranks for every multiscale segmentation (in parallel across scales).
 
@@ -791,6 +813,8 @@ def multiscale_moran_ranks(
     - `pseudo_bulk_kwargs["size_residualize"]` is available only for `engine="fast"` and currently supports
       `"log_n_spots"` and `"log_total_counts"`. It residualizes each gene against the chosen segment-size covariate
       before Moran ranking, which is useful as a lightweight sensitivity analysis for size-driven SVG ranks.
+    - If `out_score_csv` is provided, the raw autocorrelation metric table is also written with columns like
+      `I_<scale_id>` for Moran's I or `C_<scale_id>` for Geary's C.
     """
 
     if sq_neighbors_kwargs is None:
@@ -852,7 +876,12 @@ def multiscale_moran_ranks(
 
     if not tasks:
         rank_df = pd.DataFrame()
+        score_df = pd.DataFrame()
         rank_df.to_csv(out_csv)
+        if out_score_csv is not None:
+            score_df.to_csv(out_score_csv)
+        if return_scores:
+            return rank_df, score_df
         return rank_df
 
     if n_jobs is None:
@@ -860,6 +889,7 @@ def multiscale_moran_ranks(
     n_jobs = max(1, int(n_jobs))
 
     series_by_sid: Dict[str, pd.Series] = {}
+    score_series_by_sid: Dict[str, pd.Series] = {}
 
     backend = str(backend).lower()
     if backend not in {"threads", "process", "sequential"}:
@@ -888,6 +918,10 @@ def multiscale_moran_ranks(
             raise RuntimeError(f"scipy is required for engine='fast': {e}") from e
         if not issparse(A):
             raise ValueError("adata.obsp['spatial_connectivities'] must be a scipy sparse matrix for engine='fast'")
+        # Squidpy's generic spatial graph can be directed. Moran ranking uses an
+        # undirected segment-contact graph, so preserve either-direction contacts
+        # before taking the upper triangle.
+        A = A.maximum(A.T)
         A_coo = A.tocoo()
         mask = A_coo.row < A_coo.col
         edges = (
@@ -903,16 +937,18 @@ def multiscale_moran_ranks(
                 if engine == "fast":
                     if edges is None:
                         raise RuntimeError("Fast engine edges were not initialized")
-                    sid, series, err = _moran_rank_fast_thread(adata, task, edges)
+                    sid, rank_series, score_series, err = _moran_rank_fast_thread(adata, task, edges)
                 else:
-                    sid, series, err = _moran_rank_thread(adata, task)
+                    sid, rank_series, score_series, err = _moran_rank_thread(adata, task)
                 if not quiet:
                     print(f"[{i}/{len(tasks)}] MoranI ranks for {sid}", flush=True)
                 if err is not None:
                     warnings.warn(err)
                     continue
-                if series is not None:
-                    series_by_sid[sid] = series
+                if rank_series is not None:
+                    series_by_sid[sid] = rank_series
+                if score_series is not None:
+                    score_series_by_sid[sid] = score_series
 
         elif backend == "threads":
             if not quiet:
@@ -926,13 +962,15 @@ def multiscale_moran_ranks(
                     futures = [ex.submit(_moran_rank_thread, adata, task) for task in tasks]
                 done_n = 0
                 for fut in as_completed(futures):
-                    sid, series, err = fut.result()
+                    sid, rank_series, score_series, err = fut.result()
                     done_n += 1
                     if err is not None:
                         warnings.warn(err)
                         continue
-                    if series is not None:
-                        series_by_sid[sid] = series
+                    if rank_series is not None:
+                        series_by_sid[sid] = rank_series
+                    if score_series is not None:
+                        score_series_by_sid[sid] = score_series
                     if not quiet:
                         print(f"[{done_n}/{len(tasks)}] done: {sid}", flush=True)
 
@@ -947,6 +985,7 @@ def multiscale_moran_ranks(
                     adata,
                     segments_index_csv,
                     out_csv=out_csv,
+                    out_score_csv=out_score_csv,
                     moran_thresh=moran_thresh,
                     backend="threads",
                     n_jobs=n_jobs,
@@ -958,6 +997,7 @@ def multiscale_moran_ranks(
                     pseudo_bulk_kwargs=pseudo_bulk_kwargs,
                     quiet=quiet,
                     engine=engine,
+                    return_scores=return_scores,
                 )
 
             global _GLOBAL_ADATA
@@ -973,7 +1013,7 @@ def multiscale_moran_ranks(
             if not quiet:
                 print(f"[process] n_jobs={n_jobs}, maxtasksperchild={maxtasksperchild}", flush=True)
             with ctx.Pool(processes=n_jobs, maxtasksperchild=maxtasksperchild) as pool:
-                for done, (sid, series, err) in enumerate(
+                for done, (sid, rank_series, score_series, err) in enumerate(
                     pool.imap_unordered(
                         _moran_rank_fast_worker if engine == "fast" else _moran_rank_worker,
                         tasks,
@@ -984,19 +1024,27 @@ def multiscale_moran_ranks(
                     if err is not None:
                         warnings.warn(err)
                         continue
-                    if series is not None:
-                        series_by_sid[sid] = series
+                    if rank_series is not None:
+                        series_by_sid[sid] = rank_series
+                    if score_series is not None:
+                        score_series_by_sid[sid] = score_series
                     if not quiet:
                         print(f"[{done}/{len(tasks)}] done: {sid}", flush=True)
 
     ordered_cols = [series_by_sid[sid] for sid in index_order if sid in series_by_sid]
     rank_df = pd.concat(ordered_cols, axis=1, sort=False) if ordered_cols else pd.DataFrame()
+    ordered_score_cols = [score_series_by_sid[sid] for sid in index_order if sid in score_series_by_sid]
+    score_df = pd.concat(ordered_score_cols, axis=1, sort=False) if ordered_score_cols else pd.DataFrame()
     if rank_df.empty and tasks:
         warnings.warn(
             "multiscale_moran_ranks produced an empty table (no scale returned non-empty MoranI). "
             "Try `moran_thresh=-1`, set `quiet=False` to see warnings, or run a single scale sequentially to debug."
         )
     rank_df.to_csv(out_csv)
+    if out_score_csv is not None:
+        score_df.to_csv(out_score_csv)
+    if return_scores:
+        return rank_df, score_df
     return rank_df
 
 
@@ -1490,5 +1538,152 @@ def classify_scale_specific_genes_quantile(
         "max_best_std": max_best_std,
         "min_spec_score": min_spec_score,
         "region_cols": {k: list(v) for k, v in region_cols.items()},
+    }
+    return out
+
+
+def classify_scale_specific_scores_quantile(
+    res_score: pd.DataFrame,
+    *,
+    region_cols: Dict[str, List[str]],
+    normalize_columns: bool = True,
+    fillna_floor: bool = True,
+    q_gap_abs: float = 0.50,
+    q_gap_rel: float = 0.50,
+    q_best_mean: float = 0.95,
+    q_best_std: float = 0.50,
+    q_spec: float = 0.50,
+) -> pd.DataFrame:
+    """Classify scale-specific genes from resolution-score trajectories where higher is better.
+
+    This is intended for score tables such as Moran's I trajectories. By default,
+    each resolution column is min-max normalized to ``[0, 1]`` before classification
+    so values remain comparable across scales.
+
+    Parameters
+    ----------
+    res_score
+        Gene x resolution-score table where larger values indicate stronger signal.
+    region_cols
+        Required mapping from region name -> resolution columns.
+    normalize_columns
+        If True, min-max normalize each resolution column independently before scoring.
+    fillna_floor
+        If True, fill missing values with the weakest normalized score (0 after normalization,
+        otherwise the column minimum).
+    q_gap_abs
+        Quantile for ``gap_abs``; larger is stricter because larger region separation is better.
+    q_gap_rel
+        Quantile for ``gap_rel``; larger is stricter because larger relative separation is better.
+    q_best_mean
+        Quantile for ``best_mean``; larger is stricter because better regions have larger scores.
+    q_best_std
+        Quantile for ``best_std``; smaller is stricter because stable regions vary less.
+    q_spec
+        Quantile for ``specificity_score``; larger is stricter because more specific profiles score higher.
+    """
+    if res_score is None or len(res_score) == 0:
+        return pd.DataFrame(index=getattr(res_score, "index", None))
+
+    if region_cols is None:
+        raise ValueError("region_cols must be provided explicitly.")
+
+    region_cols = {
+        str(region): [str(c) for c in cols if str(c) in res_score.columns]
+        for region, cols in region_cols.items()
+    }
+    missing = [region for region, cols in region_cols.items() if len(cols) == 0]
+    if missing:
+        raise ValueError(f"Missing columns for groups: {missing}")
+
+    score_cols = [c for cols in region_cols.values() for c in cols]
+    score_mat = res_score.loc[:, score_cols].apply(pd.to_numeric, errors="coerce")
+
+    if normalize_columns:
+        col_min = score_mat.min(axis=0, skipna=True)
+        col_max = score_mat.max(axis=0, skipna=True)
+        denom = (col_max - col_min).replace(0, np.nan)
+        score_norm = score_mat.subtract(col_min, axis=1).divide(denom, axis=1)
+    else:
+        score_norm = score_mat.copy()
+
+    if fillna_floor:
+        if normalize_columns:
+            score_norm = score_norm.fillna(0.0)
+        else:
+            col_floor = score_norm.min(axis=0, skipna=True)
+            for c in score_norm.columns:
+                floor = float(col_floor.get(c, np.nan))
+                if not np.isfinite(floor):
+                    floor = 0.0
+                score_norm[c] = score_norm[c].fillna(floor)
+
+    out = res_score.copy()
+
+    for region, cols in region_cols.items():
+        out[f"mean_{region}"] = score_norm[cols].mean(axis=1)
+        out[f"std_{region}"] = score_norm[cols].std(axis=1, ddof=0)
+
+    mean_tbl = pd.DataFrame({region: out[f"mean_{region}"] for region in region_cols})
+    std_tbl = pd.DataFrame({region: out[f"std_{region}"] for region in region_cols})
+
+    mean_arr = mean_tbl.to_numpy(dtype=np.float64, copy=False)
+    sort_idx = np.argsort(-mean_arr, axis=1)
+    best_idx = sort_idx[:, 0]
+    second_idx = sort_idx[:, 1] if mean_arr.shape[1] > 1 else np.zeros(mean_arr.shape[0], dtype=np.int64)
+
+    mean_cols = np.asarray(mean_tbl.columns, dtype=object)
+    out["best_region"] = mean_cols[best_idx]
+    out["best_mean"] = mean_arr[np.arange(len(out)), best_idx]
+    out["second_best_mean"] = mean_arr[np.arange(len(out)), second_idx]
+    out["gap_abs"] = out["best_mean"] - out["second_best_mean"]
+    out["gap_rel"] = out["gap_abs"] / (np.abs(out["best_mean"]) + 1e-8)
+
+    std_arr = std_tbl.to_numpy(dtype=np.float64, copy=False)
+    out["best_std"] = std_arr[np.arange(len(out)), best_idx]
+    out["specificity_score"] = out["gap_abs"] / (out["best_std"] + 1e-3)
+
+    sp = score_norm.to_numpy(dtype=np.float64, copy=False)
+    others_mean = (sp.sum(axis=1, keepdims=True) - sp) / max(1, sp.shape[1] - 1)
+    res_score_gain = sp - others_mean
+    best_res_idx = np.argmax(res_score_gain, axis=1)
+    if res_score_gain.shape[1] > 1:
+        second_res = np.partition(res_score_gain, kth=res_score_gain.shape[1] - 2, axis=1)[:, -2]
+    else:
+        second_res = np.zeros(res_score_gain.shape[0], dtype=np.float64)
+
+    out["best_resolution"] = np.asarray(score_cols, dtype=object)[best_res_idx]
+    out["best_resolution_score"] = res_score_gain[np.arange(res_score_gain.shape[0]), best_res_idx]
+    out["best_resolution_margin"] = out["best_resolution_score"] - second_res
+
+    min_gap_abs = float(out["gap_abs"].quantile(float(q_gap_abs)))
+    min_gap_rel = float(out["gap_rel"].quantile(float(q_gap_rel)))
+    min_best_mean = float(out["best_mean"].quantile(float(q_best_mean)))
+    max_best_std = float(out["best_std"].quantile(float(q_best_std)))
+    min_spec_score = float(out["specificity_score"].quantile(float(q_spec)))
+
+    is_specific = (
+        (out["gap_abs"] >= min_gap_abs) &
+        (out["gap_rel"] >= min_gap_rel) &
+        (out["best_mean"] >= min_best_mean) &
+        (out["best_std"] <= max_best_std) &
+        (out["specificity_score"] >= min_spec_score)
+    )
+
+    out["category"] = np.where(is_specific, out["best_region"], "mixed")
+    out.attrs["quantile_thresholds"] = {
+        "q_gap_abs": float(q_gap_abs),
+        "q_gap_rel": float(q_gap_rel),
+        "q_best_mean": float(q_best_mean),
+        "q_best_std": float(q_best_std),
+        "q_spec": float(q_spec),
+        "min_gap_abs": min_gap_abs,
+        "min_gap_rel": min_gap_rel,
+        "min_best_mean": min_best_mean,
+        "max_best_std": max_best_std,
+        "min_spec_score": min_spec_score,
+        "region_cols": {k: list(v) for k, v in region_cols.items()},
+        "normalize_columns": bool(normalize_columns),
+        "fillna_floor": bool(fillna_floor),
     }
     return out

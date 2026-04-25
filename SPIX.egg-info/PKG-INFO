@@ -28,6 +28,8 @@ Requires-Dist: shapely
 Requires-Dist: tqdm
 Requires-Dist: alphashape
 Requires-Dist: igraph
+Requires-Dist: zarr
+Requires-Dist: numcodecs
 Provides-Extra: harmony
 Requires-Dist: harmonypy; extra == "harmony"
 

@@ -12,6 +12,7 @@ SPIX/analysis/celltype_enrichment.py
 SPIX/analysis/enrichment_analysis.py
 SPIX/analysis/geary_supplementary_figure.py
 SPIX/analysis/gene_expression_embedding.py
+SPIX/analysis/gene_expression_gallery.py
 SPIX/analysis/moran_geary_comparison.py
 SPIX/analysis/multiscale_moran_ranks.py
 SPIX/analysis/perform_pseudo_bulk_analysis.py
@@ -26,6 +27,7 @@ SPIX/image_processing/smoothing_legacy_tiles_version.py
 SPIX/optimization/__init__.py
 SPIX/optimization/parameter_selection.py
 SPIX/superpixel/__init__.py
+SPIX/superpixel/compactness_mode.py
 SPIX/superpixel/image_plot_slic_segmentation.py
 SPIX/superpixel/kmeans_segmentation.py
 SPIX/superpixel/leiden_segmentation.py
@@ -41,6 +43,7 @@ SPIX/tiles_embeddings/tiles.py
 SPIX/utils/__init__.py
 SPIX/utils/utils.py
 SPIX/visualization/__init__.py
+SPIX/visualization/origin_display.py
 SPIX/visualization/plotting.py
 SPIX/visualization/raster.py
 benchmarks/visiumhd_segment_benchmark.py

@@ -1,16 +1,18 @@
+import gc
 import numpy as np
 import scanpy as sc
 import pandas as pd
 import hashlib
 import os
 import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from anndata import AnnData
 from sklearn.cluster import KMeans
 import logging
 import time
 import re
 from typing import Any
+from skimage.measure import label as _connected_components_label
 
 from ..utils.utils import create_pseudo_centroids
 
@@ -28,6 +30,7 @@ from .image_plot_slic_segmentation import (
 )
 from .compactness_mode import (
     DEFAULT_COMPACTNESS_SEARCH_MULTIPLIERS,
+    _clip_candidates,
     evaluate_candidate_metrics_from_labels,
     finalize_compactness_rows,
     infer_compactness_range as infer_compactness_range_from_arrays,
@@ -36,10 +39,35 @@ from .compactness_mode import (
     schedule_compactness,
     search_compactness,
 )
-from ..image_processing.image_cache import cache_embedding_image
+from ..image_processing.image_cache import (
+    DEFAULT_CACHE_STORAGE,
+    cache_embedding_image,
+    get_cached_image,
+    get_cached_image_shape,
+    release_cached_image,
+)
+from ..visualization import raster as _raster
 
 
 _CACHED_IMAGE_SEARCH_STATE: dict[str, Any] | None = None
+
+
+def _normalize_gap_collapse_axis_safe(axis) -> str | None:
+    normalize_fn = getattr(_raster, "normalize_gap_collapse_axis", None)
+    if callable(normalize_fn):
+        return normalize_fn(axis)
+    if axis is None:
+        return None
+    text = str(axis).strip().lower()
+    if text in {"", "none", "off", "false", "no", "0"}:
+        return None
+    if text in {"y", "row", "rows", "vertical"}:
+        return "y"
+    if text in {"x", "col", "cols", "column", "columns", "horizontal"}:
+        return "x"
+    if text in {"both", "xy", "yx"}:
+        return "both"
+    return None
 
 
 def _set_cached_image_search_state(state: dict[str, Any] | None) -> None:
@@ -61,33 +89,33 @@ def _cached_image_search_worker(candidate: float) -> dict[str, float]:
         figsize=None,
         fig_dpi=None,
         mask_background=bool(state["mask_background"]),
+        sample_take=state.get("metric_take", None),
     )[0]
     metrics = evaluate_candidate_metrics_from_labels(
         labels=labels,
-        metric_context=state["metric_context"],
+        metric_context=state["metric_context_eval"],
         compactness_search_dims=int(state["compactness_search_dims"]),
     )
     return {"compactness": float(candidate), **metrics}
 
 
 def _summarize_cache_overlap(cache: dict[str, Any]) -> dict[str, Any]:
-    img = np.asarray(cache.get("img"))
-    if img.ndim != 3:
-        raise ValueError("Cached object does not contain a 3D image array.")
+    img_shape = get_cached_image_shape(cache)
     support_mask = np.asarray(cache.get("support_mask"), dtype=bool)
+    plot_params = cache.get("image_plot_params", {}) or {}
     cx = np.asarray(cache.get("cx"), dtype=np.int32).ravel()
     cy = np.asarray(cache.get("cy"), dtype=np.int32).ravel()
     n_tiles = int(min(cx.size, cy.size))
     if n_tiles <= 0:
         raise ValueError("Cached image does not contain cx/cy tile centers.")
-    flat = cy.astype(np.int64, copy=False) * np.int64(max(1, img.shape[1])) + cx.astype(np.int64, copy=False)
+    flat = cy.astype(np.int64, copy=False) * np.int64(max(1, img_shape[1])) + cx.astype(np.int64, copy=False)
     unique, counts = np.unique(flat, return_counts=True)
     unique_centers = int(unique.size)
     collided_tiles = int(n_tiles - unique_centers)
     support_pixels = int(np.count_nonzero(support_mask))
     canvas_pixels = int(support_mask.size)
     return {
-        "shape": tuple(int(x) for x in img.shape),
+        "shape": tuple(int(x) for x in img_shape),
         "n_tiles": int(n_tiles),
         "unique_centers": int(unique_centers),
         "collided_tiles": int(collided_tiles),
@@ -100,8 +128,8 @@ def _summarize_cache_overlap(cache: dict[str, Any]) -> dict[str, Any]:
         "tile_px": int(cache.get("tile_px", 1)),
         "scale": float(cache.get("scale", 1.0)),
         "pixel_perfect": bool(cache.get("pixel_perfect", False)),
-        "runtime_fill_from_boundary": bool(cache.get("runtime_fill_from_boundary", False)),
-        "runtime_fill_holes": bool(cache.get("runtime_fill_holes", False)),
+        "runtime_fill_from_boundary": bool(plot_params.get("runtime_fill_from_boundary", False)),
+        "runtime_fill_holes": bool(plot_params.get("runtime_fill_holes", False)),
     }
 
 
@@ -220,7 +248,7 @@ def _cache_matches_segmentation_raster_config(
     _compare(
         "resolve_center_collisions",
         params.get("resolve_center_collisions", None),
-        bool(resolve_center_collisions),
+        _raster.normalize_collision_mode(resolve_center_collisions),
     )
     _compare(
         "center_collision_radius",
@@ -240,7 +268,7 @@ def _resolve_compactness_search_raster_options(
     pixel_perfect: bool,
     pixel_shape: str,
     soft_rasterization: bool,
-    resolve_center_collisions: bool,
+    resolve_center_collisions,
     center_collision_radius: int,
     compactness_search_downsample_factor: float,
     compactness_search_raster_mode: str,
@@ -257,7 +285,7 @@ def _resolve_compactness_search_raster_options(
     effective_pixel_perfect = bool(pixel_perfect)
     effective_pixel_shape = str(pixel_shape)
     effective_soft = bool(soft_rasterization)
-    effective_resolve = bool(resolve_center_collisions)
+    effective_resolve = resolve_center_collisions
     reason = "requested"
 
     auto_dense_origin_soft = bool(
@@ -491,6 +519,168 @@ def _store_segment_pixel_boundary_payload(
     }
 
 
+def _component_counts_by_segment(
+    label_img: np.ndarray,
+    *,
+    support_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    arr = np.asarray(label_img, dtype=np.int32)
+    valid = arr >= 0
+    if support_mask is not None:
+        support = np.asarray(support_mask, dtype=bool)
+        if support.shape != arr.shape:
+            raise ValueError("support_mask must match label_img shape.")
+        valid &= support
+    if not np.any(valid):
+        return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
+
+    work = np.where(valid, arr, -1)
+    cc = _connected_components_label(work, connectivity=1, background=-1)
+    cc_mask = cc > 0
+    if not np.any(cc_mask):
+        return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
+
+    comp_ids = np.asarray(cc[cc_mask], dtype=np.int64)
+    comp_labels = np.asarray(work[cc_mask], dtype=np.int32)
+    order = np.argsort(comp_ids, kind="mergesort")
+    comp_ids = comp_ids[order]
+    comp_labels = comp_labels[order]
+    starts = np.r_[0, np.flatnonzero(np.diff(comp_ids)) + 1]
+    per_component_labels = comp_labels[starts]
+    seg_labels, comp_counts = np.unique(per_component_labels, return_counts=True)
+    return np.asarray(seg_labels, dtype=np.int32), np.asarray(comp_counts, dtype=np.int32)
+
+
+def summarize_segment_integrity(
+    adata: AnnData,
+    *,
+    segment_key: str = "Segment",
+    image_cache_key: str = "image_plot_slic",
+    target_segment_um: float | None = None,
+    pitch_um: float | None = None,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """
+    Summarize whether an existing segmentation behaves cleanly on the raster.
+
+    When the stored pixel-boundary payload is available (created by
+    ``segment_image(..., method='image_plot_slic')``), this reports:
+    - observed segment size distribution in ``adata.obs[segment_key]``
+    - cached raster overlap/collision stats
+    - how many unsupported/background raster pixels were assigned a label
+    - how often a single segment breaks into multiple connected components
+      within the observed support mask
+    """
+    if segment_key not in adata.obs.columns:
+        raise KeyError(f"No segmentation column adata.obs['{segment_key}'].")
+
+    seg_series = pd.Series(adata.obs[segment_key])
+    seg_nonnull = seg_series.dropna()
+    counts = seg_nonnull.value_counts(dropna=True)
+    result: dict[str, Any] = {
+        "segment_key": str(segment_key),
+        "n_obs_total": int(adata.n_obs),
+        "n_obs_segmented": int(seg_nonnull.size),
+        "n_segments_observed": int(counts.size),
+        "segment_size_mean": float(counts.mean()) if not counts.empty else np.nan,
+        "segment_size_median": float(counts.median()) if not counts.empty else np.nan,
+        "segment_size_min": int(counts.min()) if not counts.empty else 0,
+        "segment_size_p05": float(counts.quantile(0.05)) if not counts.empty else np.nan,
+        "segment_size_p95": float(counts.quantile(0.95)) if not counts.empty else np.nan,
+        "segment_size_max": int(counts.max()) if not counts.empty else 0,
+        "segment_size_cv": (
+            float(counts.std(ddof=0) / max(float(counts.mean()), 1e-12))
+            if not counts.empty else np.nan
+        ),
+    }
+
+    if target_segment_um is not None and pitch_um is not None:
+        expected_spots_per_segment = max((float(target_segment_um) / float(pitch_um)) ** 2, 1.0)
+        result["target_segment_um"] = float(target_segment_um)
+        result["pitch_um"] = float(pitch_um)
+        result["expected_spots_per_segment"] = float(expected_spots_per_segment)
+        if seg_nonnull.size > 0:
+            result["expected_n_segments"] = int(round(float(seg_nonnull.size) / float(expected_spots_per_segment)))
+            result["mean_vs_expected_size_ratio"] = float(result["segment_size_mean"] / float(expected_spots_per_segment))
+            result["median_vs_expected_size_ratio"] = float(result["segment_size_median"] / float(expected_spots_per_segment))
+
+    if image_cache_key in adata.uns:
+        try:
+            result["cache_overlap"] = _summarize_cache_overlap(adata.uns[image_cache_key])
+        except Exception as exc:
+            result["cache_overlap_error"] = str(exc)
+
+    segment_suffix = _sanitize_segment_name(segment_key)
+    payload = adata.uns.get(f"{segment_suffix}_pixel_boundary", None)
+    if isinstance(payload, dict) and ("label_img" in payload):
+        label_img = np.asarray(payload["label_img"], dtype=np.int32)
+        support_mask_raw = payload.get("support_mask", None)
+        support_mask = None if support_mask_raw is None else np.asarray(support_mask_raw, dtype=bool)
+        raster_diag: dict[str, Any] = {
+            "label_img_shape": tuple(int(x) for x in label_img.shape),
+            "has_support_mask": bool(support_mask is not None),
+        }
+        if support_mask is not None and support_mask.shape == label_img.shape:
+            support_valid = support_mask & (label_img >= 0)
+            background_valid = (~support_mask) & (label_img >= 0)
+            support_labels = np.asarray(label_img[support_valid], dtype=np.int32)
+            background_labels = np.asarray(label_img[background_valid], dtype=np.int32)
+            seg_labels_support, comp_counts_support = _component_counts_by_segment(
+                label_img,
+                support_mask=support_mask,
+            )
+            raster_diag.update(
+                {
+                    "support_pixels": int(np.count_nonzero(support_mask)),
+                    "background_pixels": int(np.count_nonzero(~support_mask)),
+                    "support_labeled_pixels": int(np.count_nonzero(support_valid)),
+                    "background_labeled_pixels": int(np.count_nonzero(background_valid)),
+                    "background_labeled_fraction_of_canvas": float(np.count_nonzero(background_valid) / max(1, label_img.size)),
+                    "background_labeled_fraction_of_background": float(np.count_nonzero(background_valid) / max(1, np.count_nonzero(~support_mask))),
+                    "n_labels_in_support_raster": int(np.unique(support_labels).size) if support_labels.size else 0,
+                    "n_labels_touching_background": int(np.unique(background_labels).size) if background_labels.size else 0,
+                    "labels_touching_background_fraction": (
+                        float(np.unique(background_labels).size / max(1, np.unique(support_labels).size))
+                        if background_labels.size else 0.0
+                    ),
+                    "split_labels_within_support": int(np.count_nonzero(comp_counts_support > 1)),
+                    "split_labels_fraction_within_support": float(np.count_nonzero(comp_counts_support > 1) / max(1, seg_labels_support.size)),
+                    "max_components_per_label_within_support": int(comp_counts_support.max()) if comp_counts_support.size else 0,
+                    "median_components_per_label_within_support": float(np.median(comp_counts_support)) if comp_counts_support.size else 0.0,
+                }
+            )
+        result["raster_diagnostics"] = raster_diag
+    else:
+        result["raster_diagnostics"] = None
+
+    if verbose:
+        print(
+            f"[segment_integrity] key={segment_key} | "
+            f"n_segments={result['n_segments_observed']} | "
+            f"mean_size={result['segment_size_mean']:.3f} | "
+            f"median_size={result['segment_size_median']:.3f} | "
+            f"size_cv={result['segment_size_cv']:.3f}"
+        )
+        cache_overlap = result.get("cache_overlap", None)
+        if isinstance(cache_overlap, dict):
+            print(
+                "[segment_integrity] cache overlap: "
+                f"collision_fraction={float(cache_overlap['collision_fraction']):.6f} | "
+                f"support_fraction={float(cache_overlap['support_fraction']):.6f} | "
+                f"tile_px={int(cache_overlap['tile_px'])}"
+            )
+        raster_diag = result.get("raster_diagnostics", None)
+        if isinstance(raster_diag, dict):
+            print(
+                "[segment_integrity] raster: "
+                f"bg_labeled={int(raster_diag.get('background_labeled_pixels', 0))} | "
+                f"bg_frac={float(raster_diag.get('background_labeled_fraction_of_background', 0.0)):.6f} | "
+                f"split_labels={int(raster_diag.get('split_labels_within_support', 0))} | "
+                f"split_frac={float(raster_diag.get('split_labels_fraction_within_support', 0.0)):.6f}"
+            )
+    return result
+
+
 def fixed_grid_segmentation(
     spatial_coords: np.ndarray,
     side_um: float,
@@ -619,7 +809,7 @@ def _compactness_search_cache_key(
             f"pp={int(bool(pixel_perfect))}",
             f"pixel={pixel_shape}",
             f"soft={int(bool(soft_rasterization))}",
-            f"collide={int(bool(resolve_center_collisions))}",
+            f"collide={_raster.normalize_collision_mode(resolve_center_collisions)}",
             f"cr={int(center_collision_radius)}",
             f"fillb={int(bool(runtime_fill_from_boundary))}",
             f"fillr={int(runtime_fill_closing_radius)}",
@@ -670,6 +860,26 @@ def _search_compactness_cached_image_process(
         compactness_metric_sample_size=compactness_metric_sample_size,
     )
     t1 = time.perf_counter()
+    cache_storage_kind = str(cache.get("cache_storage", "memory"))
+    cache_preload = (
+        cache.get("img", None) is None
+        and cache.get("img_path", None) is not None
+        and cache_storage_kind not in {"memory", "float32_memmap"}
+    )
+    if cache_preload:
+        t_preload0 = time.perf_counter()
+        get_cached_image(cache, cache_in_memory=True)
+        t_preload1 = time.perf_counter()
+        if verbose:
+            print(
+                f"[perf] {mode} process cache preload: "
+                f"{t_preload1 - t_preload0:.3f}s | storage={cache_storage_kind}"
+            )
+    metric_take = metric_context.get("metric_take", None)
+    metric_context_eval = metric_context
+    if metric_take is not None:
+        metric_context_eval = dict(metric_context)
+        metric_context_eval["metric_take"] = None
     if verbose:
         print(
             f"[perf] {mode} process candidate prep: "
@@ -678,7 +888,8 @@ def _search_compactness_cached_image_process(
     state = {
         "cache": cache,
         "n_segments": int(n_segments),
-        "metric_context": metric_context,
+        "metric_context_eval": metric_context_eval,
+        "metric_take": None if metric_take is None else np.asarray(metric_take, dtype=np.int64),
         "compactness_search_dims": int(compactness_search_dims),
         "enforce_connectivity": bool(enforce_connectivity),
         "mask_background": bool(mask_background),
@@ -732,6 +943,219 @@ def _effective_compactness_search_jobs(
             )
         return int(effective)
     return int(jobs)
+
+
+def _normalize_compactness_search_mode(compactness_search_mode: str | None) -> str:
+    mode = str(compactness_search_mode or "grid").strip().lower()
+    aliases = {
+        "grid": "grid",
+        "default": "grid",
+        "adaptive": "adaptive_multifidelity",
+        "adaptive_multifidelity": "adaptive_multifidelity",
+        "multifidelity": "adaptive_multifidelity",
+    }
+    if mode not in aliases:
+        raise ValueError("compactness_search_mode must be one of {'grid','adaptive_multifidelity'}.")
+    return aliases[mode]
+
+
+def _resolve_adaptive_multifidelity_stage_downsamples(
+    final_downsample: float,
+    stage_downsample_factors: tuple[float, ...] | list[float] | None,
+) -> list[float]:
+    if stage_downsample_factors is not None:
+        raw = [float(x) for x in stage_downsample_factors if np.isfinite(float(x)) and float(x) > 0]
+    else:
+        final = float(max(1.0, float(final_downsample)))
+        raw = []
+        if final < 4.0:
+            raw.append(4.0)
+        if final < 2.0:
+            raw.append(2.0)
+        raw.append(final)
+    ordered: list[float] = []
+    seen: set[float] = set()
+    for value in sorted(raw, reverse=True):
+        key = round(float(value), 6)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(float(max(1.0, value)))
+    return ordered or [float(max(1.0, float(final_downsample)))]
+
+
+def _resolve_adaptive_multifidelity_stage_sample_sizes(
+    final_sample_size: int | None,
+    n_stages: int,
+    stage_sample_sizes: tuple[int | None, ...] | list[int | None] | None,
+) -> list[int | None]:
+    if stage_sample_sizes is not None:
+        resolved: list[int | None] = []
+        for value in list(stage_sample_sizes)[: max(1, int(n_stages))]:
+            if value is None:
+                resolved.append(None)
+            else:
+                resolved.append(int(max(1, int(value))))
+        if not resolved:
+            resolved = [None if final_sample_size is None else int(max(1, int(final_sample_size)))]
+        while len(resolved) < int(n_stages):
+            resolved.append(resolved[-1])
+        return resolved
+
+    if final_sample_size is None:
+        defaults = [4000, 8000, None]
+        if n_stages <= len(defaults):
+            return defaults[-int(n_stages):]
+        return [defaults[0]] * (int(n_stages) - len(defaults)) + defaults
+
+    final = int(max(1, int(final_sample_size)))
+    if int(n_stages) <= 1:
+        return [final]
+    out: list[int | None] = []
+    for idx in range(int(n_stages)):
+        frac = float(idx + 1) / float(int(n_stages))
+        out.append(int(max(1000, round(final * frac))))
+    out[-1] = final
+    return out
+
+
+def _refine_adaptive_multifidelity_candidates(
+    *,
+    candidates: list[float],
+    detail: dict[str, Any],
+    compactness_min: float | None,
+    compactness_max: float | None,
+    top_k: int,
+    target_count: int | None = None,
+) -> list[float]:
+    pool = sorted(
+        {
+            float(x)
+            for x in candidates
+            if np.isfinite(float(x)) and float(x) > 0
+        }
+    )
+    if len(pool) <= 1:
+        return pool
+
+    scores = {
+        round(float(row["compactness"]), 12): float(row.get("score", np.inf))
+        for row in detail.get("candidates", [])
+    }
+    best = float(detail.get("selected_compactness", pool[len(pool) // 2]))
+    ranked = sorted(
+        pool,
+        key=lambda value: (
+            scores.get(round(float(value), 12), np.inf),
+            abs(np.log(float(value) / max(best, 1e-12))),
+        ),
+    )
+    winners = sorted(ranked[: max(1, int(top_k))])
+    pool_arr = np.asarray(pool, dtype=float)
+    neighbor_idx: set[int] = set()
+    for value in winners:
+        idx = int(np.argmin(np.abs(pool_arr - float(value))))
+        for delta in (-1, 0, 1):
+            j = idx + delta
+            if 0 <= j < len(pool):
+                neighbor_idx.add(int(j))
+    selected = [float(pool[j]) for j in sorted(neighbor_idx)]
+    low = float(min(selected) if selected else best)
+    high = float(max(selected) if selected else best)
+    if not np.isfinite(low) or low <= 0:
+        low = float(best) / 1.5
+    if not np.isfinite(high) or high <= low:
+        high = float(best) * 1.5
+    dense_n = int(max(5, target_count if target_count is not None else (max(2 * int(top_k), 7))))
+    dense = np.geomspace(low / 1.35, high * 1.35, num=dense_n).tolist()
+    refined = sorted(
+        {
+            float(x)
+            for x in _clip_candidates(
+                list(selected) + list(winners) + list(dense) + [float(best)],
+                compactness_min=compactness_min,
+                compactness_max=compactness_max,
+            )
+        }
+    )
+    return refined or winners or pool
+
+
+def _run_compactness_search_with_cache(
+    *,
+    candidates: list[float],
+    cache: dict[str, Any],
+    n_segments: int,
+    embeddings: np.ndarray,
+    spatial_coords: np.ndarray,
+    compactness_search_dims: int,
+    compactness_min: float | None,
+    compactness_max: float | None,
+    scheduled: float | None,
+    mode: str,
+    target_segment_um: float | None,
+    compactness_search_jobs: int,
+    compactness_metric_sample_size: int | None,
+    enforce_connectivity: bool,
+    mask_background: bool,
+    verbose: bool,
+    use_process_search: bool,
+) -> tuple[float, dict[str, Any]]:
+    effective_jobs = _effective_compactness_search_jobs(
+        requested_jobs=int(compactness_search_jobs),
+        n_candidates=len(candidates),
+        n_segments=int(n_segments),
+        backend="process" if use_process_search else "thread",
+        verbose=verbose,
+    )
+    if use_process_search:
+        if verbose:
+            print(f"[perf] {mode}: compactness search backend: process")
+        return _search_compactness_cached_image_process(
+            candidates=candidates,
+            cache=cache,
+            n_segments=int(n_segments),
+            embeddings=np.asarray(embeddings, dtype=float),
+            spatial_coords=np.asarray(spatial_coords, dtype=float),
+            compactness_search_dims=int(compactness_search_dims),
+            compactness_min=compactness_min,
+            compactness_max=compactness_max,
+            scheduled=scheduled,
+            mode=str(mode),
+            target_segment_um=target_segment_um,
+            compactness_search_jobs=int(effective_jobs),
+            compactness_metric_sample_size=compactness_metric_sample_size,
+            enforce_connectivity=bool(enforce_connectivity),
+            mask_background=bool(mask_background),
+            verbose=verbose,
+        )
+    if verbose:
+        print(f"[perf] {mode}: compactness search backend: thread")
+    return search_compactness(
+        candidates=candidates,
+        embeddings=np.asarray(embeddings, dtype=float),
+        spatial_coords=np.asarray(spatial_coords, dtype=float),
+        segmenter=lambda candidate: slic_segmentation_from_cached_image(
+            cache,
+            n_segments=int(n_segments),
+            compactness=float(candidate),
+            enforce_connectivity=enforce_connectivity,
+            show_image=False,
+            verbose=False,
+            figsize=None,
+            fig_dpi=None,
+            mask_background=mask_background,
+        )[0],
+        compactness_search_dims=int(compactness_search_dims),
+        compactness_min=compactness_min,
+        compactness_max=compactness_max,
+        scheduled=scheduled,
+        mode=str(mode),
+        target_segment_um=target_segment_um,
+        compactness_search_jobs=int(effective_jobs),
+        compactness_metric_sample_size=compactness_metric_sample_size,
+        verbose=verbose,
+    )
 
 
 def _pseudo_centroids_from_clusters_df(
@@ -920,6 +1344,77 @@ def _auto_fast_compactness_search_target_um(
     if target < base:
         return float(base)
     return target
+
+
+def _cached_reference_tile_count(
+    adata: AnnData,
+    *,
+    origin: bool,
+    verbose: bool,
+) -> int | None:
+    cache_key = "__spix_fast_compactness_reference_counts__"
+    origin_key = "origin_true" if bool(origin) else "origin_false"
+    uns = getattr(adata, "uns", None)
+    cached_counts = uns.get(cache_key, None) if uns is not None else None
+    if isinstance(cached_counts, dict) and origin_key in cached_counts:
+        cached_value = cached_counts.get(origin_key, None)
+        if cached_value is not None:
+            if verbose:
+                print(
+                    f"[perf] fast compactness reference count cache hit: "
+                    f"origin={int(bool(origin))} | n_tiles={int(cached_value)}"
+                )
+            return int(cached_value)
+
+    t_ref0 = time.perf_counter()
+    try:
+        tiles_all = adata.uns["tiles"]
+        if bool(origin) and ("spatial" in adata.obsm):
+            spatial_direct = np.asarray(adata.obsm["spatial"])
+            if (
+                spatial_direct.ndim == 2
+                and spatial_direct.shape[0] == adata.n_obs
+                and spatial_direct.shape[1] >= 2
+            ):
+                direct_n = int(adata.n_obs)
+                if verbose:
+                    print(
+                        f"[perf] fast compactness reference count direct: "
+                        f"origin=1 | n_tiles={direct_n} | source=adata.obsm['spatial'] | "
+                        f"time={time.perf_counter() - t_ref0:.3f}s"
+                    )
+                if uns is not None:
+                    if not isinstance(cached_counts, dict):
+                        cached_counts = {}
+                    cached_counts[origin_key] = int(direct_n)
+                    uns[cache_key] = cached_counts
+                return direct_n
+
+        tiles_for_n = tiles_all
+        if "origin" in tiles_all.columns and bool(origin) and (tiles_all["origin"] == 1).any():
+            tiles_for_n = tiles_all[tiles_all["origin"] == 1]
+        if "barcode" in tiles_for_n.columns:
+            tiles_for_n = tiles_for_n.drop_duplicates("barcode")
+        n_tiles = int(len(tiles_for_n))
+        if verbose:
+            print(
+                f"[perf] fast compactness reference count computed: "
+                f"origin={int(bool(origin))} | n_tiles={n_tiles} | "
+                f"time={time.perf_counter() - t_ref0:.3f}s"
+            )
+        if uns is not None:
+            if not isinstance(cached_counts, dict):
+                cached_counts = {}
+            cached_counts[origin_key] = int(n_tiles)
+            uns[cache_key] = cached_counts
+        return n_tiles
+    except Exception:
+        if verbose:
+            print(
+                f"[perf] fast compactness reference count unavailable: "
+                f"origin={int(bool(origin))} | time={time.perf_counter() - t_ref0:.3f}s"
+            )
+        return None
 
 
 def _resolve_segmentation_tiles(
@@ -1230,8 +1725,10 @@ def select_compactness(
     runtime_fill_closing_radius: int = 1,
     runtime_fill_external_radius: int = 0,
     runtime_fill_holes: bool = True,
+    gap_collapse_axis: str | None = None,
+    gap_collapse_max_run_px: int = 1,
     soft_rasterization: bool = False,
-    resolve_center_collisions: bool = False,
+    resolve_center_collisions: bool | str = "auto",
     center_collision_radius: int = 2,
     mask_background: bool = False,
     compactness_min: float | None = None,
@@ -1243,32 +1740,19 @@ def select_compactness(
     compactness_search_jobs: int = 1,
     compactness_metric_sample_size: int | None = 12000,
     compactness_search_downsample_factor: float = 1.0,
+    compactness_search_mode: str = "grid",
     compactness_search_raster_mode: str = "auto",
     compactness_search_resolution_cap: int | None = None,
+    adaptive_multifidelity_top_k: int = 4,
+    adaptive_multifidelity_stage_downsample_factors: tuple[float, ...] | None = None,
+    adaptive_multifidelity_stage_sample_sizes: tuple[int | None, ...] | None = None,
     use_cached_image: bool = True,
     image_cache_key: str = "image_plot_slic",
+    cache_storage: str = DEFAULT_CACHE_STORAGE,
     verbose: bool = True,
 ) -> dict[str, Any]:
+    compactness_search_mode_norm = _normalize_compactness_search_mode(compactness_search_mode)
     effective_dimensions = list(dimensions if search_dimensions is None else search_dimensions)
-    search_raster_options = _resolve_compactness_search_raster_options(
-        adata,
-        coordinate_mode=str(coordinate_mode),
-        origin=bool(origin),
-        array_row_key=str(array_row_key),
-        array_col_key=str(array_col_key),
-        pixel_perfect=bool(pixel_perfect),
-        pixel_shape=str(pixel_shape),
-        soft_rasterization=bool(soft_rasterization),
-        resolve_center_collisions=bool(resolve_center_collisions),
-        center_collision_radius=int(center_collision_radius),
-        compactness_search_downsample_factor=float(compactness_search_downsample_factor),
-        compactness_search_raster_mode=str(compactness_search_raster_mode),
-        verbose=bool(verbose),
-    )
-    effective_pixel_perfect = bool(search_raster_options["pixel_perfect"])
-    effective_pixel_shape = str(search_raster_options["pixel_shape"])
-    effective_soft_rasterization = bool(search_raster_options["soft_rasterization"])
-    effective_resolve_center_collisions = bool(search_raster_options["resolve_center_collisions"])
     t_prepare0 = time.perf_counter()
     prepared = _prepare_image_plot_compactness_inputs(
         adata,
@@ -1316,11 +1800,39 @@ def select_compactness(
     if verbose:
         print(f"[perf] compactness infer range: {t_range1 - t_range0:.3f}s")
 
-    transient_cache_key = None
-    cache = None
-    reusable_cache_key = image_cache_key
-    if use_cached_image:
-        reusable_cache_key = _compactness_search_cache_key(
+    transient_cache_keys: list[str] = []
+    stage_cache_state: dict[float, tuple[dict[str, Any], dict[str, Any]]] = {}
+
+    def _get_stage_cache(stage_downsample_factor: float) -> tuple[dict[str, Any], dict[str, Any]]:
+        stage_key = round(float(stage_downsample_factor), 6)
+        cached_state = stage_cache_state.get(stage_key, None)
+        if cached_state is not None:
+            return cached_state
+
+        stage_raster_options = _resolve_compactness_search_raster_options(
+            adata,
+            coordinate_mode=str(coordinate_mode),
+            origin=bool(origin),
+            array_row_key=str(array_row_key),
+            array_col_key=str(array_col_key),
+            pixel_perfect=bool(pixel_perfect),
+            pixel_shape=str(pixel_shape),
+            soft_rasterization=bool(soft_rasterization),
+            resolve_center_collisions=resolve_center_collisions,
+            center_collision_radius=int(center_collision_radius),
+            compactness_search_downsample_factor=float(stage_downsample_factor),
+            compactness_search_raster_mode=str(compactness_search_raster_mode),
+            verbose=bool(verbose),
+        )
+        stage_pixel_perfect = bool(stage_raster_options["pixel_perfect"])
+        stage_pixel_shape = str(stage_raster_options["pixel_shape"])
+        stage_soft_rasterization = bool(stage_raster_options["soft_rasterization"])
+        stage_resolve_center_collisions = bool(stage_raster_options["resolve_center_collisions"])
+
+        cache = None
+        reusable_cache_key = image_cache_key
+        if use_cached_image:
+            reusable_cache_key = _compactness_search_cache_key(
                 base_key=str(image_cache_key),
                 embedding=str(embedding),
                 dimensions=list(effective_dimensions),
@@ -1328,76 +1840,94 @@ def select_compactness(
                 coordinate_mode=str(coordinate_mode),
                 array_row_key=str(array_row_key),
                 array_col_key=str(array_col_key),
-                pixel_perfect=bool(effective_pixel_perfect),
-                pixel_shape=str(effective_pixel_shape),
-                soft_rasterization=bool(effective_soft_rasterization),
-                resolve_center_collisions=bool(effective_resolve_center_collisions),
+                pixel_perfect=bool(stage_pixel_perfect),
+                pixel_shape=str(stage_pixel_shape),
+                soft_rasterization=bool(stage_soft_rasterization),
+                resolve_center_collisions=bool(stage_resolve_center_collisions),
                 center_collision_radius=int(center_collision_radius),
                 runtime_fill_from_boundary=bool(runtime_fill_from_boundary),
                 runtime_fill_closing_radius=int(runtime_fill_closing_radius),
-            runtime_fill_external_radius=int(runtime_fill_external_radius),
-            runtime_fill_holes=bool(runtime_fill_holes),
-            downsample_factor=float(compactness_search_downsample_factor),
-        )
-    if use_cached_image and reusable_cache_key in adata.uns:
-        candidate_cache = adata.uns[reusable_cache_key]
-        cached_emb = candidate_cache.get("embedding_key", None)
-        cached_dims = candidate_cache.get("dimensions", None)
-        cached_origin = candidate_cache.get("origin", None)
-        if (
-            (cached_emb is None or cached_emb == embedding)
-            and (cached_dims is None or list(cached_dims) == effective_dimensions)
-            and (cached_origin is None or bool(cached_origin) == bool(origin))
-            and (
-                candidate_cache.get("downsample_factor", 1.0) is None
-                or np.isclose(float(candidate_cache.get("downsample_factor", 1.0)), float(compactness_search_downsample_factor))
+                runtime_fill_external_radius=int(runtime_fill_external_radius),
+                runtime_fill_holes=bool(runtime_fill_holes),
+                downsample_factor=float(stage_downsample_factor),
             )
-        ):
-            cache = candidate_cache
+            if reusable_cache_key in adata.uns:
+                candidate_cache = adata.uns[reusable_cache_key]
+                cached_emb = candidate_cache.get("embedding_key", None)
+                cached_dims = candidate_cache.get("dimensions", None)
+                cached_origin = candidate_cache.get("origin", None)
+                if (
+                    (cached_emb is None or cached_emb == embedding)
+                    and (cached_dims is None or list(cached_dims) == effective_dimensions)
+                    and (cached_origin is None or bool(cached_origin) == bool(origin))
+                    and (
+                        candidate_cache.get("downsample_factor", 1.0) is None
+                        or np.isclose(float(candidate_cache.get("downsample_factor", 1.0)), float(stage_downsample_factor))
+                    )
+                ):
+                    cache = candidate_cache
+                    if verbose:
+                        print(
+                            "[perf] reusing raster cache for compactness selection: "
+                            f"ds={float(stage_downsample_factor):.4g}"
+                        )
+                        _print_compactness_cache_summary(cache)
+                elif verbose:
+                    print(
+                        "[warning] Existing cached image does not match compactness stage settings; "
+                        f"rebuilding cache for ds={float(stage_downsample_factor):.4g}."
+                    )
+
+        if cache is None:
+            transient_cache_key = None if use_cached_image else f"__spix_select_compactness_cache__ds_{stage_key:g}"
+            cache_key = reusable_cache_key if use_cached_image else transient_cache_key
+            t_cache0 = time.perf_counter()
+            cache = cache_embedding_image(
+                adata,
+                embedding=embedding,
+                dimensions=effective_dimensions,
+                origin=origin,
+                key=cache_key,
+                coordinate_mode=coordinate_mode,
+                array_row_key=array_row_key,
+                array_col_key=array_col_key,
+                figsize=figsize,
+                fig_dpi=fig_dpi,
+                imshow_tile_size=imshow_tile_size,
+                imshow_scale_factor=imshow_scale_factor,
+                pixel_perfect=stage_pixel_perfect,
+                pixel_shape=stage_pixel_shape,
+                verbose=False,
+                show=False,
+                runtime_fill_from_boundary=runtime_fill_from_boundary,
+                runtime_fill_closing_radius=runtime_fill_closing_radius,
+                runtime_fill_external_radius=runtime_fill_external_radius,
+                runtime_fill_holes=runtime_fill_holes,
+                soft_rasterization=stage_soft_rasterization,
+                resolve_center_collisions=stage_resolve_center_collisions,
+                center_collision_radius=center_collision_radius,
+                downsample_factor=float(stage_downsample_factor),
+                memmap_scope="transient" if transient_cache_key is not None else "persistent",
+                memmap_cleanup="on_exit" if transient_cache_key is not None else "none",
+                cache_storage="float32_memmap" if transient_cache_key is not None else cache_storage,
+            )
+            t_cache1 = time.perf_counter()
+            if transient_cache_key is not None:
+                transient_cache_keys.append(transient_cache_key)
             if verbose:
-                print("[perf] reusing raster cache for compactness selection.")
+                print(
+                    "[perf] built raster cache for compactness selection: "
+                    f"ds={float(stage_downsample_factor):.4g} | {t_cache1 - t_cache0:.3f}s"
+                )
                 _print_compactness_cache_summary(cache)
-        elif verbose:
-            print("[warning] Existing cached image does not match embedding/dimensions/origin; rebuilding cache for compactness selection.")
-    if cache is None:
-        transient_cache_key = None if use_cached_image else "__spix_select_compactness_cache"
-        cache_key = reusable_cache_key if use_cached_image else transient_cache_key
-        t_cache0 = time.perf_counter()
-        cache = cache_embedding_image(
-            adata,
-            embedding=embedding,
-            dimensions=effective_dimensions,
-            origin=origin,
-            key=cache_key,
-            coordinate_mode=coordinate_mode,
-            array_row_key=array_row_key,
-            array_col_key=array_col_key,
-            figsize=figsize,
-            fig_dpi=fig_dpi,
-            imshow_tile_size=imshow_tile_size,
-            imshow_scale_factor=imshow_scale_factor,
-            pixel_perfect=effective_pixel_perfect,
-            pixel_shape=effective_pixel_shape,
-            verbose=False,
-            show=False,
-            runtime_fill_from_boundary=runtime_fill_from_boundary,
-            runtime_fill_closing_radius=runtime_fill_closing_radius,
-            runtime_fill_external_radius=runtime_fill_external_radius,
-            runtime_fill_holes=runtime_fill_holes,
-            soft_rasterization=effective_soft_rasterization,
-            resolve_center_collisions=effective_resolve_center_collisions,
-            center_collision_radius=center_collision_radius,
-            downsample_factor=float(compactness_search_downsample_factor),
-        )
-        t_cache1 = time.perf_counter()
-        if verbose:
-            print(f"[perf] built raster cache for compactness selection: {t_cache1 - t_cache0:.3f}s")
-            _print_compactness_cache_summary(cache)
+
+        out = (cache, stage_raster_options)
+        stage_cache_state[stage_key] = out
+        return out
 
     try:
         use_process_search = bool(
-            cache is not None
-            and int(compactness_search_jobs) > 1
+            int(compactness_search_jobs) > 1
             and os.name != "nt"
         )
         if compactness_candidates is None:
@@ -1408,18 +1938,109 @@ def select_compactness(
             coarse_candidates = np.geomspace(lower, upper, num=max(int(coarse_steps), 2)).tolist()
         else:
             coarse_candidates = [float(x) for x in compactness_candidates]
-        t_coarse0 = time.perf_counter()
-        coarse_jobs = _effective_compactness_search_jobs(
-            requested_jobs=int(compactness_search_jobs),
-            n_candidates=len(coarse_candidates),
-            n_segments=int(search_resolution),
-            backend="process" if use_process_search else "thread",
-            verbose=verbose,
+        final_search_raster_options = _resolve_compactness_search_raster_options(
+            adata,
+            coordinate_mode=str(coordinate_mode),
+            origin=bool(origin),
+            array_row_key=str(array_row_key),
+            array_col_key=str(array_col_key),
+            pixel_perfect=bool(pixel_perfect),
+            pixel_shape=str(pixel_shape),
+            soft_rasterization=bool(soft_rasterization),
+            resolve_center_collisions=resolve_center_collisions,
+            center_collision_radius=int(center_collision_radius),
+            compactness_search_downsample_factor=float(compactness_search_downsample_factor),
+            compactness_search_raster_mode=str(compactness_search_raster_mode),
+            verbose=False,
         )
-        if use_process_search:
+
+        adaptive_stage_details: list[dict[str, Any]] = []
+        if compactness_search_mode_norm == "adaptive_multifidelity":
+            stage_downsamples = _resolve_adaptive_multifidelity_stage_downsamples(
+                float(compactness_search_downsample_factor),
+                adaptive_multifidelity_stage_downsample_factors,
+            )
+            stage_sample_sizes = _resolve_adaptive_multifidelity_stage_sample_sizes(
+                compactness_metric_sample_size,
+                len(stage_downsamples),
+                adaptive_multifidelity_stage_sample_sizes,
+            )
+            current_candidates = sorted(
+                {
+                    float(x)
+                    for x in coarse_candidates
+                    if np.isfinite(float(x)) and float(x) > 0
+                }
+            )
             if verbose:
-                print("[perf] compactness search backend: process")
-            coarse_best, coarse_detail = _search_compactness_cached_image_process(
+                print(
+                    "[perf] compactness adaptive multifidelity: "
+                    f"stages={len(stage_downsamples)} | downsample={stage_downsamples} | "
+                    f"samples={stage_sample_sizes}"
+                )
+            stage_best = None
+            chosen_detail = None
+            for stage_idx, (stage_downsample, stage_sample_size) in enumerate(
+                zip(stage_downsamples, stage_sample_sizes),
+                start=1,
+            ):
+                cache, stage_raster_options = _get_stage_cache(float(stage_downsample))
+                stage_mode = f"adaptive_multifidelity_stage_{stage_idx}"
+                t_stage0 = time.perf_counter()
+                stage_best, stage_detail = _run_compactness_search_with_cache(
+                    candidates=current_candidates,
+                    cache=cache,
+                    n_segments=int(search_resolution),
+                    embeddings=np.asarray(prepared["embeddings"], dtype=float),
+                    spatial_coords=np.asarray(prepared["spatial_coords"], dtype=float),
+                    compactness_search_dims=int(compactness_search_dims),
+                    compactness_min=compactness_min,
+                    compactness_max=compactness_max,
+                    scheduled=None if stage_best is None else float(stage_best),
+                    mode=stage_mode,
+                    target_segment_um=target_segment_um,
+                    compactness_search_jobs=int(compactness_search_jobs),
+                    compactness_metric_sample_size=stage_sample_size,
+                    enforce_connectivity=bool(enforce_connectivity),
+                    mask_background=bool(mask_background),
+                    verbose=verbose,
+                    use_process_search=use_process_search,
+                )
+                t_stage1 = time.perf_counter()
+                stage_detail = dict(stage_detail)
+                stage_detail["stage_index"] = int(stage_idx)
+                stage_detail["fidelity_downsample_factor"] = float(stage_downsample)
+                stage_detail["fidelity_metric_sample_size"] = (
+                    None if stage_sample_size is None else int(stage_sample_size)
+                )
+                stage_detail["input_candidates"] = [float(x) for x in current_candidates]
+                stage_detail["search_raster_options"] = dict(stage_raster_options)
+                adaptive_stage_details.append(stage_detail)
+                chosen_detail = stage_detail
+                final_search_raster_options = dict(stage_raster_options)
+                if verbose:
+                    print(
+                        f"[perf] compactness adaptive stage {stage_idx}: "
+                        f"candidates={len(current_candidates)} | ds={float(stage_downsample):.4g} | "
+                        f"time={t_stage1 - t_stage0:.3f}s | selected={float(stage_best):.6g}"
+                    )
+                if stage_idx < len(stage_downsamples):
+                    current_candidates = _refine_adaptive_multifidelity_candidates(
+                        candidates=current_candidates,
+                        detail=stage_detail,
+                        compactness_min=compactness_min,
+                        compactness_max=compactness_max,
+                        top_k=int(adaptive_multifidelity_top_k),
+                        target_count=max(int(adaptive_multifidelity_top_k) * 2, 7),
+                    )
+            coarse_best = float(stage_best)
+            coarse_detail = adaptive_stage_details[0]
+            refine_detail = adaptive_stage_details[-1] if len(adaptive_stage_details) > 1 else None
+            refine_best = float(stage_best)
+        else:
+            cache, final_search_raster_options = _get_stage_cache(float(compactness_search_downsample_factor))
+            t_coarse0 = time.perf_counter()
+            coarse_best, coarse_detail = _run_compactness_search_with_cache(
                 candidates=coarse_candidates,
                 cache=cache,
                 n_segments=int(search_resolution),
@@ -1431,60 +2052,26 @@ def select_compactness(
                 scheduled=None,
                 mode="coarse_search",
                 target_segment_um=target_segment_um,
-                compactness_search_jobs=int(coarse_jobs),
+                compactness_search_jobs=int(compactness_search_jobs),
                 compactness_metric_sample_size=compactness_metric_sample_size,
                 enforce_connectivity=bool(enforce_connectivity),
                 mask_background=bool(mask_background),
                 verbose=verbose,
+                use_process_search=use_process_search,
             )
-        else:
+            t_coarse1 = time.perf_counter()
             if verbose:
-                print("[perf] compactness search backend: thread")
-            coarse_best, coarse_detail = search_compactness(
-                candidates=coarse_candidates,
-                embeddings=np.asarray(prepared["embeddings"], dtype=float),
-                spatial_coords=np.asarray(prepared["spatial_coords"], dtype=float),
-                segmenter=lambda candidate: slic_segmentation_from_cached_image(
-                    cache,
-                    n_segments=int(search_resolution),
-                    compactness=float(candidate),
-                    enforce_connectivity=enforce_connectivity,
-                    show_image=False,
-                    verbose=False,
-                    figsize=None,
-                    fig_dpi=None,
-                    mask_background=mask_background,
-                )[0],
-                compactness_search_dims=int(compactness_search_dims),
-                compactness_min=compactness_min,
-                compactness_max=compactness_max,
-                mode="coarse_search",
-                target_segment_um=target_segment_um,
-                compactness_search_jobs=int(coarse_jobs),
-                compactness_metric_sample_size=compactness_metric_sample_size,
-                verbose=verbose,
-            )
-        t_coarse1 = time.perf_counter()
-        if verbose:
-            print(f"[perf] compactness coarse search: {t_coarse1 - t_coarse0:.3f}s")
-        if compactness_candidates is None and int(refine_steps) > 0:
-            refine_lower = max(lower, float(coarse_best) / 1.7)
-            refine_upper = min(upper, float(coarse_best) * 1.7)
-            refine_candidates = np.geomspace(
-                refine_lower,
-                refine_upper,
-                num=max(int(refine_steps), 3),
-            ).tolist()
-            t_refine0 = time.perf_counter()
-            refine_jobs = _effective_compactness_search_jobs(
-                requested_jobs=int(compactness_search_jobs),
-                n_candidates=len(refine_candidates),
-                n_segments=int(search_resolution),
-                backend="process" if use_process_search else "thread",
-                verbose=verbose,
-            )
-            if use_process_search:
-                refine_best, refine_detail = _search_compactness_cached_image_process(
+                print(f"[perf] compactness coarse search: {t_coarse1 - t_coarse0:.3f}s")
+            if compactness_candidates is None and int(refine_steps) > 0:
+                refine_lower = max(lower, float(coarse_best) / 1.7)
+                refine_upper = min(upper, float(coarse_best) * 1.7)
+                refine_candidates = np.geomspace(
+                    refine_lower,
+                    refine_upper,
+                    num=max(int(refine_steps), 3),
+                ).tolist()
+                t_refine0 = time.perf_counter()
+                refine_best, refine_detail = _run_compactness_search_with_cache(
                     candidates=refine_candidates,
                     cache=cache,
                     n_segments=int(search_resolution),
@@ -1496,45 +2083,20 @@ def select_compactness(
                     scheduled=float(coarse_best),
                     mode="refine_search",
                     target_segment_um=target_segment_um,
-                    compactness_search_jobs=int(refine_jobs),
+                    compactness_search_jobs=int(compactness_search_jobs),
                     compactness_metric_sample_size=compactness_metric_sample_size,
                     enforce_connectivity=bool(enforce_connectivity),
                     mask_background=bool(mask_background),
                     verbose=verbose,
+                    use_process_search=use_process_search,
                 )
+                t_refine1 = time.perf_counter()
+                if verbose:
+                    print(f"[perf] compactness refine search: {t_refine1 - t_refine0:.3f}s")
             else:
-                refine_best, refine_detail = search_compactness(
-                    candidates=refine_candidates,
-                    embeddings=np.asarray(prepared["embeddings"], dtype=float),
-                    spatial_coords=np.asarray(prepared["spatial_coords"], dtype=float),
-                    segmenter=lambda candidate: slic_segmentation_from_cached_image(
-                        cache,
-                        n_segments=int(search_resolution),
-                        compactness=float(candidate),
-                        enforce_connectivity=enforce_connectivity,
-                        show_image=False,
-                        verbose=False,
-                        figsize=None,
-                        fig_dpi=None,
-                        mask_background=mask_background,
-                    )[0],
-                    compactness_search_dims=int(compactness_search_dims),
-                    compactness_min=compactness_min,
-                    compactness_max=compactness_max,
-                    scheduled=float(coarse_best),
-                    mode="refine_search",
-                    target_segment_um=target_segment_um,
-                    compactness_search_jobs=int(refine_jobs),
-                    compactness_metric_sample_size=compactness_metric_sample_size,
-                    verbose=verbose,
-                )
-            t_refine1 = time.perf_counter()
-            if verbose:
-                print(f"[perf] compactness refine search: {t_refine1 - t_refine0:.3f}s")
-        else:
-            refine_best = float(coarse_best)
-            refine_detail = None
-        chosen_detail = refine_detail if refine_detail is not None else coarse_detail
+                refine_best = float(coarse_best)
+                refine_detail = None
+            chosen_detail = refine_detail if refine_detail is not None else coarse_detail
         selected_rows = [
             row for row in chosen_detail["candidates"]
             if float(row["compactness"]) == float(refine_best)
@@ -1553,17 +2115,20 @@ def select_compactness(
             "selected_observed_segment_count": observed_segment_count,
             "search_dimensions": effective_dimensions,
             "compactness_search_downsample_factor": float(compactness_search_downsample_factor),
+            "compactness_search_mode": str(compactness_search_mode_norm),
             "compactness_metric_sample_size": None if compactness_metric_sample_size is None else int(compactness_metric_sample_size),
-            "compactness_search_raster_options": search_raster_options,
+            "compactness_search_raster_options": final_search_raster_options,
             "mask_background": bool(mask_background),
             "range": range_info,
             "coarse_search": coarse_detail,
             "refine_search": refine_detail,
         }
+        if adaptive_stage_details:
+            result["adaptive_multifidelity_search"] = adaptive_stage_details
         return result
     finally:
-        if transient_cache_key is not None:
-            adata.uns.pop(transient_cache_key, None)
+        for transient_cache_key in transient_cache_keys:
+            release_cached_image(adata, transient_cache_key, remove_memmap_file=True)
 
 
 def fast_select_compactness(
@@ -1589,8 +2154,12 @@ def fast_select_compactness(
     compactness_search_jobs: int = 4,
     compactness_metric_sample_size: int | None = 12000,
     compactness_search_downsample_factor: float = 2.0,
+    compactness_search_mode: str = "grid",
     compactness_search_raster_mode: str = "auto",
     compactness_search_resolution_cap: int | None = None,
+    adaptive_multifidelity_top_k: int = 4,
+    adaptive_multifidelity_stage_downsample_factors: tuple[float, ...] | None = None,
+    adaptive_multifidelity_stage_sample_sizes: tuple[int | None, ...] | None = None,
     search_target_segment_um: float | None = None,
     compactness_scale_power: float = 0.3,
     verbose: bool = True,
@@ -1601,17 +2170,13 @@ def fast_select_compactness(
         if search_dimensions is not None
         else list(dimensions[: min(len(dimensions), 8)])
     )
+    t_fast0 = time.perf_counter()
     if search_target_segment_um is None:
-        try:
-            _tiles_all = adata.uns["tiles"]
-            _tiles_for_n = _tiles_all
-            if "origin" in _tiles_all.columns and bool(origin) and (_tiles_all["origin"] == 1).any():
-                _tiles_for_n = _tiles_all[_tiles_all["origin"] == 1]
-            if "barcode" in _tiles_for_n.columns:
-                _tiles_for_n = _tiles_for_n.drop_duplicates("barcode")
-            n_tiles_for_reference = int(len(_tiles_for_n))
-        except Exception:
-            n_tiles_for_reference = None
+        n_tiles_for_reference = _cached_reference_tile_count(
+            adata,
+            origin=bool(origin),
+            verbose=bool(verbose),
+        )
         selection_target_segment_um = _auto_fast_compactness_search_target_um(
             target_segment_um,
             n_tiles=n_tiles_for_reference,
@@ -1620,6 +2185,14 @@ def fast_select_compactness(
             min_reference_segment_side_px=10.0,
             max_stable_search_n_segments=15000,
         )
+        if verbose:
+            print(
+                f"[perf] fast compactness auto reference target: "
+                f"requested_target_um={None if target_segment_um is None else float(target_segment_um):.6g} | "
+                f"search_target_um={None if selection_target_segment_um is None else float(selection_target_segment_um):.6g} | "
+                f"n_tiles_for_reference={None if n_tiles_for_reference is None else int(n_tiles_for_reference)} | "
+                f"time={time.perf_counter() - t_fast0:.3f}s"
+            )
         auto_reference_target = bool(
             selection_target_segment_um is not None
             and target_segment_um is not None
@@ -1628,6 +2201,13 @@ def fast_select_compactness(
     else:
         selection_target_segment_um = float(search_target_segment_um)
         auto_reference_target = False
+        if verbose:
+            print(
+                f"[perf] fast compactness reference target override: "
+                f"requested_target_um={None if target_segment_um is None else float(target_segment_um):.6g} | "
+                f"search_target_um={float(selection_target_segment_um):.6g} | "
+                f"time={time.perf_counter() - t_fast0:.3f}s"
+            )
     result = select_compactness(
         adata,
         dimensions=dimensions,
@@ -1651,8 +2231,12 @@ def fast_select_compactness(
         compactness_search_jobs=compactness_search_jobs,
         compactness_metric_sample_size=compactness_metric_sample_size,
         compactness_search_downsample_factor=compactness_search_downsample_factor,
+        compactness_search_mode=compactness_search_mode,
         compactness_search_raster_mode=compactness_search_raster_mode,
         compactness_search_resolution_cap=compactness_search_resolution_cap,
+        adaptive_multifidelity_top_k=adaptive_multifidelity_top_k,
+        adaptive_multifidelity_stage_downsample_factors=adaptive_multifidelity_stage_downsample_factors,
+        adaptive_multifidelity_stage_sample_sizes=adaptive_multifidelity_stage_sample_sizes,
         verbose=verbose,
         **kwargs,
     )
@@ -1773,8 +2357,10 @@ def evaluate_compactness_sweep(
     runtime_fill_closing_radius: int = 1,
     runtime_fill_external_radius: int = 0,
     runtime_fill_holes: bool = True,
+    gap_collapse_axis: str | None = None,
+    gap_collapse_max_run_px: int = 1,
     soft_rasterization: bool = False,
-    resolve_center_collisions: bool = False,
+    resolve_center_collisions: bool | str = "auto",
     center_collision_radius: int = 2,
     mask_background: bool = False,
     compactness_min: float | None = None,
@@ -1789,6 +2375,7 @@ def evaluate_compactness_sweep(
     compactness_search_raster_mode: str = "auto",
     use_cached_image: bool = True,
     image_cache_key: str = "image_plot_slic",
+    cache_storage: str = DEFAULT_CACHE_STORAGE,
     verbose: bool = True,
 ) -> pd.DataFrame:
     selection_result = select_compactness(
@@ -1831,6 +2418,7 @@ def evaluate_compactness_sweep(
         compactness_search_raster_mode=compactness_search_raster_mode,
         use_cached_image=use_cached_image,
         image_cache_key=image_cache_key,
+        cache_storage=cache_storage,
         verbose=verbose,
     )
     return compactness_search_frame(selection_result)
@@ -1862,8 +2450,10 @@ def plot_compactness_sweep(
     runtime_fill_closing_radius: int = 1,
     runtime_fill_external_radius: int = 0,
     runtime_fill_holes: bool = True,
+    gap_collapse_axis: str | None = None,
+    gap_collapse_max_run_px: int = 1,
     soft_rasterization: bool = False,
-    resolve_center_collisions: bool = False,
+    resolve_center_collisions: bool | str = "auto",
     center_collision_radius: int = 2,
     mask_background: bool = False,
     compactness_min: float | None = None,
@@ -1878,6 +2468,7 @@ def plot_compactness_sweep(
     compactness_search_raster_mode: str = "auto",
     use_cached_image: bool = True,
     image_cache_key: str = "image_plot_slic",
+    cache_storage: str = DEFAULT_CACHE_STORAGE,
     metrics: list[str] | None = None,
     log_x: bool = False,
     show: bool = True,
@@ -1926,6 +2517,7 @@ def plot_compactness_sweep(
             compactness_search_raster_mode=compactness_search_raster_mode,
             use_cached_image=use_cached_image,
             image_cache_key=image_cache_key,
+            cache_storage=cache_storage,
             verbose=verbose,
         )
     frame = compactness_search_frame(selection_result)
@@ -2023,6 +2615,837 @@ def plot_compactness_sweep(
         "figure": fig,
         "axes": axes,
     }
+
+
+def _format_precompute_scale_value(value: float) -> str:
+    value = float(value)
+    if not np.isfinite(value):
+        return "nan"
+    return f"{value:g}".replace("+", "")
+
+
+def _precompute_scale_id(resolution: float, compactness: float | None = None) -> str:
+    res_text = _format_precompute_scale_value(float(resolution))
+    if compactness is None:
+        return f"r{res_text}"
+    comp_text = _format_precompute_scale_value(float(compactness))
+    return f"r{res_text}_c{comp_text}"
+
+
+def _normalize_precompute_float_list(
+    values: float | list[float] | tuple[float, ...] | np.ndarray | None,
+    *,
+    name: str,
+) -> list[float]:
+    if values is None:
+        return []
+    if np.isscalar(values):
+        return [float(values)]
+    try:
+        out = [float(v) for v in values]
+    except TypeError as exc:
+        raise ValueError(f"{name} must be a scalar or iterable of numeric values.") from exc
+    if len(out) == 0:
+        return []
+    return out
+
+
+def _normalize_precompute_storage_mode(storage: str) -> str:
+    mode = str(storage or "uns").strip().lower()
+    aliases = {
+        "memory": "uns",
+        "mem": "uns",
+        "adata.uns": "uns",
+        "uns": "uns",
+        "file": "disk",
+        "files": "disk",
+        "disk": "disk",
+        "both": "both",
+    }
+    if mode not in aliases:
+        raise ValueError("storage must be one of {'uns', 'disk', 'both'}.")
+    return aliases[mode]
+
+
+def _compress_observed_labels_for_export(
+    labels_tile: np.ndarray,
+    label_img: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray | None, int]:
+    labels_tile_arr = np.asarray(labels_tile, dtype=np.int32)
+    valid = labels_tile_arr >= 0
+
+    if not np.any(valid):
+        if label_img is None:
+            return labels_tile_arr, None, 0
+        label_img_out = np.full_like(np.asarray(label_img, dtype=np.int32), -1)
+        return labels_tile_arr, label_img_out, 0
+
+    observed = np.unique(labels_tile_arr[valid]).astype(np.int32)
+    max_label = int(max(int(labels_tile_arr.max()), int(observed.max())))
+    remap = np.full(max_label + 1, -1, dtype=np.int32)
+    remap[observed] = np.arange(observed.size, dtype=np.int32)
+
+    labels_tile_out = np.where(valid, remap[labels_tile_arr], -1).astype(np.int32, copy=False)
+
+    label_img_out = None
+    if label_img is not None:
+        label_img_arr = np.asarray(label_img, dtype=np.int32)
+        label_img_out = np.full_like(label_img_arr, -1)
+        img_valid = (label_img_arr >= 0) & (label_img_arr <= max_label)
+        label_img_out[img_valid] = remap[label_img_arr[img_valid]]
+
+    return labels_tile_out, label_img_out, int(observed.size)
+
+
+def _native_identity_available(cache: dict[str, Any]) -> bool:
+    tile_obs_indices = cache.get("tile_obs_indices", None)
+    if tile_obs_indices is not None:
+        idx = np.asarray(tile_obs_indices, dtype=np.int64)
+        return bool(idx.ndim == 1 and idx.size > 0 and np.unique(idx).size == idx.size)
+    cache_barcodes = pd.Series(cache.get("barcodes") or [], dtype=str)
+    return bool((not cache_barcodes.empty) and (not cache_barcodes.duplicated().any()))
+
+
+def _identity_segmentation_from_cache(
+    cache: dict[str, Any],
+    *,
+    n_tiles: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    labels_tile = np.arange(int(n_tiles), dtype=np.int32)
+    support_mask = cache.get("support_mask", None)
+    if support_mask is not None:
+        label_shape = np.asarray(support_mask, dtype=bool).shape
+    else:
+        label_shape = get_cached_image_shape(cache)[:2]
+    label_img = np.full(label_shape, -1, dtype=np.int32)
+
+    cx = np.asarray(cache.get("cx", []), dtype=np.int64).ravel()
+    cy = np.asarray(cache.get("cy", []), dtype=np.int64).ravel()
+    n_centers = int(min(cx.size, cy.size, labels_tile.size))
+    if n_centers > 0:
+        label_img[cy[:n_centers], cx[:n_centers]] = labels_tile[:n_centers]
+
+    return labels_tile, label_img
+
+
+def _cached_tile_labels_to_obs_codes(
+    adata: AnnData,
+    cache: dict[str, Any],
+    labels_tile: np.ndarray,
+    *,
+    image_cache_key: str,
+) -> np.ndarray:
+    tile_labels = np.asarray(labels_tile, dtype=np.int32)
+    n_obs = int(adata.n_obs)
+    seg_codes = np.full(n_obs, -1, dtype=np.int32)
+
+    tile_obs_indices = cache.get("tile_obs_indices", None)
+    if tile_obs_indices is not None:
+        idx = np.asarray(tile_obs_indices, dtype=np.int64)
+        if idx.ndim != 1 or idx.size != tile_labels.size:
+            raise ValueError(
+                f"Cached image '{image_cache_key}' has tile_obs_indices of length {idx.size}, "
+                f"but got {tile_labels.size} tile labels."
+            )
+        valid = (idx >= 0) & (idx < n_obs)
+        idx = idx[valid]
+        valid_labels = tile_labels[valid]
+        if idx.size == 0:
+            return seg_codes
+        if np.unique(idx).size == idx.size:
+            seg_codes[idx] = valid_labels
+            return seg_codes
+        origin_flags = cache.get("origin_flags", None)
+        origin_valid = None
+        if origin_flags is not None:
+            origin_arr = np.asarray(origin_flags)
+            if origin_arr.ndim == 1 and origin_arr.size == tile_labels.size:
+                origin_valid = origin_arr[valid]
+        agg_idx, agg_labels = _aggregate_labels_majority_by_obs_index(
+            idx,
+            valid_labels,
+            origin_flags=origin_valid,
+        )
+        seg_codes[agg_idx] = np.asarray(agg_labels, dtype=np.int32)
+        return seg_codes
+
+    cache_barcodes = pd.Series(cache.get("barcodes") or [], dtype=str)
+    if cache_barcodes.empty:
+        raise ValueError(
+            f"Cached image '{image_cache_key}' missing both tile_obs_indices and barcodes."
+        )
+    if cache_barcodes.size != tile_labels.size:
+        raise ValueError(
+            f"Cached image '{image_cache_key}' has {cache_barcodes.size} barcodes, "
+            f"but got {tile_labels.size} tile labels."
+        )
+
+    if cache_barcodes.duplicated().any():
+        clusters_df = _aggregate_labels_majority(
+            cache_barcodes,
+            tile_labels,
+            origin_flags=cache.get("origin_flags", None),
+        )
+        tile_barcodes = clusters_df["barcode"].astype(str).to_numpy()
+        tile_labels_use = clusters_df["Segment"].to_numpy(dtype=np.int32)
+    else:
+        tile_barcodes = cache_barcodes.to_numpy()
+        tile_labels_use = tile_labels
+
+    obs_barcodes = pd.Index(adata.obs.index.astype(str))
+    obs_pos = obs_barcodes.get_indexer(pd.Index(tile_barcodes))
+    ok = obs_pos >= 0
+    seg_codes[obs_pos[ok]] = np.asarray(tile_labels_use[ok], dtype=np.int32)
+    return seg_codes
+
+
+def precompute_multiscale_segments(
+    adata: AnnData,
+    *,
+    resolutions: list[float] | tuple[float, ...] | np.ndarray | float | None = None,
+    manual_pairs: list[tuple[float, float]] | tuple[tuple[float, float], ...] | None = None,
+    compactnesses: list[float] | None = None,
+    compactness_candidates: list[float] | None = None,
+    extra_compactnesses: list[float] | None = None,
+    dimensions: list[int] = list(range(30)),
+    embedding: str = "X_embedding",
+    segment_method: str = "image_plot_slic",
+    image_cache_key: str = "image_plot_slic",
+    storage: str = "disk",
+    uns_key: str = "multiscale_segments",
+    out_dir: str | None = "./multiscale_segments",
+    filename_prefix: str = "segments__",
+    index_filename: str = "segments_index.csv",
+    pitch_um: float = 2.0,
+    origin: bool = True,
+    use_cached_image: bool = True,
+    enforce_connectivity: bool = False,
+    max_workers: int = 8,
+    compactness_search_jobs: int = 16,
+    compactness_search_downsample_factor: float = 2.0,
+    compactness_scale_power: float = 0.3,
+    native_identity: bool = True,
+    native_tol: float = 1e-8,
+    save_compressed: bool = False,
+    cache_kwargs: dict[str, Any] | None = None,
+    fast_select_kwargs: dict[str, Any] | None = None,
+    slic_kwargs: dict[str, Any] | None = None,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """Precompute cached-image SLIC segmentations over many settings.
+
+    Two execution modes are supported:
+
+    1. Manual compactness grid mode:
+       pass ``compactnesses=[...]`` to evaluate every ``resolution x compactness`` pair.
+    2. Auto compactness mode:
+       omit ``compactnesses`` and pass ``compactness_candidates=[...]``. Compactness is
+       selected once per reference target using ``fast_select_compactness`` and then
+       scaled per resolution. Optionally pass ``extra_compactnesses=[...]`` to also
+       export fixed-compactness reference segmentations for every resolution in the
+       same run (for example GRID-like controls such as ``1e7``).
+
+    Returns
+    -------
+    pd.DataFrame
+        Index table for the computed scales. By default this follows the legacy
+        workflow and exports ``segments__*.npz`` plus the index CSV to disk. If
+        ``storage`` includes ``"uns"``, the full bundle is also stored in
+        ``adata.uns[uns_key]``.
+    """
+    if str(segment_method) != "image_plot_slic":
+        raise ValueError("precompute_multiscale_segments currently supports only segment_method='image_plot_slic'.")
+    if not bool(use_cached_image):
+        raise ValueError("precompute_multiscale_segments currently requires use_cached_image=True.")
+    storage_mode = _normalize_precompute_storage_mode(storage)
+    resolutions_use = _normalize_precompute_float_list(resolutions, name="resolutions")
+    compactnesses_use = _normalize_precompute_float_list(compactnesses, name="compactnesses")
+    compactness_candidates_use = _normalize_precompute_float_list(
+        compactness_candidates,
+        name="compactness_candidates",
+    )
+    extra_compactnesses_use = _normalize_precompute_float_list(
+        extra_compactnesses,
+        name="extra_compactnesses",
+    )
+
+    if manual_pairs is not None and compactnesses is not None:
+        raise ValueError("Use either manual_pairs or compactnesses, not both.")
+
+    manual_pairs_use: list[tuple[float, float]] = []
+    if manual_pairs is not None:
+        for pair in manual_pairs:
+            if pair is None or len(pair) != 2:
+                raise ValueError("manual_pairs must contain (resolution, compactness) pairs.")
+            manual_pairs_use.append((float(pair[0]), float(pair[1])))
+
+    manual_mode = bool(manual_pairs_use) or (compactnesses is not None)
+    if manual_mode and (not manual_pairs_use) and len(compactnesses_use) == 0:
+        raise ValueError("compactnesses must be non-empty when provided.")
+    if (not manual_mode) and len(resolutions_use) == 0:
+        raise ValueError("resolutions must contain at least one value.")
+    if manual_pairs_use and len(resolutions_use) > 0:
+        raise ValueError("When manual_pairs is provided, omit resolutions.")
+    if (not manual_mode) and len(compactness_candidates_use) == 0:
+        raise ValueError(
+            "Provide compactnesses for manual mode or compactness_candidates for auto mode."
+        )
+    if manual_mode and (not manual_pairs_use) and len(resolutions_use) == 0:
+        raise ValueError("resolutions must contain at least one value for manual grid mode.")
+    if manual_mode and len(extra_compactnesses_use) > 0:
+        raise ValueError("extra_compactnesses is only supported in auto compactness mode.")
+
+    cache_kwargs_use = dict(cache_kwargs or {})
+    fast_select_kwargs_use = dict(fast_select_kwargs or {})
+    slic_kwargs_use = dict(slic_kwargs or {})
+
+    if storage_mode in {"disk", "both"}:
+        if out_dir is None:
+            raise ValueError("out_dir must be provided when storage includes 'disk'.")
+        os.makedirs(out_dir, exist_ok=True)
+
+    coordinate_mode = str(cache_kwargs_use.get("coordinate_mode", "spatial"))
+    array_row_key = str(cache_kwargs_use.get("array_row_key", "array_row"))
+    array_col_key = str(cache_kwargs_use.get("array_col_key", "array_col"))
+    pixel_perfect = bool(cache_kwargs_use.get("pixel_perfect", False))
+    pixel_shape = str(cache_kwargs_use.get("pixel_shape", "square"))
+    runtime_fill_from_boundary = bool(cache_kwargs_use.get("runtime_fill_from_boundary", False))
+    runtime_fill_closing_radius = int(max(0, int(cache_kwargs_use.get("runtime_fill_closing_radius", 1))))
+    runtime_fill_external_radius = int(max(0, int(cache_kwargs_use.get("runtime_fill_external_radius", 0))))
+    runtime_fill_holes = bool(cache_kwargs_use.get("runtime_fill_holes", True))
+    soft_rasterization = bool(cache_kwargs_use.get("soft_rasterization", False))
+    resolve_center_collisions = cache_kwargs_use.get("resolve_center_collisions", "auto")
+    center_collision_radius = int(cache_kwargs_use.get("center_collision_radius", 2))
+
+    need_cache = (image_cache_key not in adata.uns)
+    if not need_cache:
+        cache = adata.uns[image_cache_key]
+        need_cache = (
+            cache.get("embedding_key") != embedding
+            or list(cache.get("dimensions", [])) != list(dimensions)
+            or (
+                cache.get("origin", None) is not None
+                and bool(cache.get("origin")) != bool(origin)
+            )
+        )
+        if not need_cache:
+            cache_matches_config, _ = _cache_matches_segmentation_raster_config(
+                adata,
+                cache,
+                coordinate_mode=coordinate_mode,
+                origin=origin,
+                array_row_key=array_row_key,
+                array_col_key=array_col_key,
+                pixel_perfect=pixel_perfect,
+                pixel_shape=pixel_shape,
+                runtime_fill_from_boundary=runtime_fill_from_boundary,
+                runtime_fill_closing_radius=runtime_fill_closing_radius,
+                runtime_fill_external_radius=runtime_fill_external_radius,
+                runtime_fill_holes=runtime_fill_holes,
+                soft_rasterization=soft_rasterization,
+                resolve_center_collisions=resolve_center_collisions,
+                center_collision_radius=center_collision_radius,
+            )
+            need_cache = not bool(cache_matches_config)
+
+    if need_cache:
+        if verbose:
+            print("[cache] building cached image...", flush=True)
+        cache_build_kwargs = dict(cache_kwargs_use)
+        cache_build_kwargs.setdefault("origin", bool(origin))
+        cache_build_kwargs.setdefault("verbose", False)
+        cache_build_kwargs.setdefault("show", False)
+        cache_build_kwargs.setdefault("store", "auto")
+        cache_build_kwargs.setdefault("store_barcodes", "auto")
+        cache_embedding_image(
+            adata,
+            embedding=embedding,
+            dimensions=list(dimensions),
+            key=image_cache_key,
+            **cache_build_kwargs,
+        )
+
+    cache = adata.uns[image_cache_key]
+    n_obs = int(adata.n_obs)
+
+    tiles_all = adata.uns["tiles"]
+    tiles_for_n = tiles_all
+    if "origin" in tiles_all.columns and bool(origin) and (tiles_all["origin"] == 1).any():
+        tiles_for_n = tiles_all[tiles_all["origin"] == 1]
+    if "barcode" in tiles_for_n.columns:
+        tiles_for_n = tiles_for_n.drop_duplicates("barcode")
+
+    save_fn = np.savez_compressed if bool(save_compressed) else np.savez
+    native_available = bool(native_identity) and _native_identity_available(cache)
+
+    reference_compactness: dict[float, dict[str, Any]] = {}
+    if not manual_mode:
+        reference_groups: dict[float, list[float]] = {}
+        for res in resolutions_use:
+            res_value = float(res)
+            if native_available and np.isclose(res_value, float(pitch_um), atol=float(native_tol)):
+                continue
+            ref_um = float(
+                resolve_fast_compactness_reference_target_um(
+                    adata,
+                    target_segment_um=res_value,
+                    pitch_um=float(pitch_um),
+                    origin=bool(origin),
+                    compactness_search_downsample_factor=float(compactness_search_downsample_factor),
+                )
+            )
+            reference_groups.setdefault(ref_um, []).append(res_value)
+
+        if verbose:
+            print(f"[compactness] reference groups: {reference_groups}", flush=True)
+
+        for ref_um in sorted(reference_groups):
+            fast_params = dict(fast_select_kwargs_use)
+            fast_params.update(
+                {
+                    "dimensions": list(dimensions),
+                    "embedding": embedding,
+                    "target_segment_um": float(ref_um),
+                    "pitch_um": float(pitch_um),
+                    "origin": bool(origin),
+                }
+            )
+            fast_params.setdefault("compactness_candidates", list(compactness_candidates_use))
+            fast_params.setdefault("compactness_search_jobs", int(compactness_search_jobs))
+            fast_params.setdefault(
+                "compactness_search_downsample_factor",
+                float(compactness_search_downsample_factor),
+            )
+            fast_params.setdefault("verbose", bool(verbose))
+            sel_ref = fast_select_compactness(adata, **fast_params)
+            reference_compactness[float(ref_um)] = {
+                "search_target_um": float(sel_ref.get("search_target_segment_um", ref_um)),
+                "search_selected_compactness": float(
+                    sel_ref.get("search_selected_compactness", sel_ref["selected_compactness"])
+                ),
+                "selected_compactness": float(sel_ref["selected_compactness"]),
+                "selection_result": sel_ref,
+            }
+            if verbose:
+                print(
+                    f"[compactness] ref_um={ref_um:.1f}  "
+                    f"search_target_um={reference_compactness[float(ref_um)]['search_target_um']:.1f}  "
+                    f"search_selected={reference_compactness[float(ref_um)]['search_selected_compactness']:.6g}",
+                    flush=True,
+                )
+
+    def _pack_record(
+        *,
+        sid: str,
+        meta: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = dict(meta)
+        payload.setdefault("cache_key", str(image_cache_key))
+        payload.setdefault("embedding_key", str(embedding))
+        record = {
+            "scale_id": sid,
+            **{
+                key: value
+                for key, value in payload.items()
+                if key not in {"seg_codes", "label_img"}
+            },
+        }
+        return {
+            "scale_id": sid,
+            "record": record,
+            "payload": payload,
+        }
+
+    def _segment_manual(resolution: float, compactness: float) -> dict[str, Any]:
+        t0 = time.perf_counter()
+        sid = _precompute_scale_id(resolution, compactness=compactness)
+        requested_n_segments = int(
+            n_segments_from_size(
+                tiles_for_n,
+                target_um=float(resolution),
+                pitch_um=float(pitch_um),
+            )
+        )
+
+        slic_params = dict(slic_kwargs_use)
+        slic_params.update(
+            {
+                "n_segments": int(requested_n_segments),
+                "compactness": float(compactness),
+                "enforce_connectivity": bool(enforce_connectivity),
+                "show_image": False,
+                "verbose": False,
+                "figsize": None,
+                "fig_dpi": None,
+            }
+        )
+        labels_tile, label_img = slic_segmentation_from_cached_image(cache, **slic_params)
+        labels_tile, label_img, observed_tile_n_segments = _compress_observed_labels_for_export(
+            labels_tile,
+            label_img=np.asarray(label_img, dtype=np.int32),
+        )
+        seg_codes = _cached_tile_labels_to_obs_codes(
+            adata,
+            cache,
+            labels_tile,
+            image_cache_key=image_cache_key,
+        )
+        observed_obs_n_segments = int(np.unique(seg_codes[seg_codes >= 0]).size)
+        dt = time.perf_counter() - t0
+        return _pack_record(
+            sid=sid,
+            meta={
+                "mode": "manual_grid",
+                "resolution": float(resolution),
+                "compactness": float(compactness),
+                "segment_method": str(segment_method),
+                "pitch_um": float(pitch_um),
+                "reference_target_um": np.nan,
+                "search_target_um": np.nan,
+                "reference_compactness": np.nan,
+                "scaled_compactness": float(compactness),
+                "requested_n_segments": int(requested_n_segments),
+                "observed_tile_n_segments": int(observed_tile_n_segments),
+                "observed_obs_n_segments": int(observed_obs_n_segments),
+                "max_label": int(labels_tile.max(initial=-1)),
+                "native_identity": False,
+                "origin": bool(origin),
+                "use_cached_image": bool(use_cached_image),
+                "seconds": float(dt),
+                "seg_codes": seg_codes,
+                "label_img": label_img,
+            },
+        )
+
+    def _segment_extra_reference(resolution: float, compactness: float) -> dict[str, Any]:
+        completed = _segment_manual(float(resolution), float(compactness))
+        payload = dict(completed["payload"])
+        payload["mode"] = "extra_reference"
+        payload["reference_target_um"] = np.nan
+        payload["search_target_um"] = np.nan
+        payload["reference_compactness"] = float(compactness)
+        payload["scaled_compactness"] = float(compactness)
+
+        record = dict(completed["record"])
+        record.update(
+            {
+                "mode": "extra_reference",
+                "reference_target_um": np.nan,
+                "search_target_um": np.nan,
+                "reference_compactness": float(compactness),
+                "scaled_compactness": float(compactness),
+            }
+        )
+        return {
+            "scale_id": str(completed["scale_id"]),
+            "record": record,
+            "payload": payload,
+        }
+
+    def _segment_auto(resolution: float) -> dict[str, Any]:
+        t0 = time.perf_counter()
+        sid = _precompute_scale_id(resolution)
+
+        if native_available and np.isclose(float(resolution), float(pitch_um), atol=float(native_tol)):
+            n_tiles = None
+            tile_obs_indices = cache.get("tile_obs_indices", None)
+            if tile_obs_indices is not None:
+                n_tiles = int(np.asarray(tile_obs_indices).size)
+            else:
+                n_tiles = int(len(cache.get("barcodes", [])))
+            labels_tile, label_img = _identity_segmentation_from_cache(cache, n_tiles=int(n_tiles))
+            seg_codes = _cached_tile_labels_to_obs_codes(
+                adata,
+                cache,
+                labels_tile,
+                image_cache_key=image_cache_key,
+            )
+            observed_tile_n_segments = int(labels_tile.shape[0])
+            observed_obs_n_segments = int(np.unique(seg_codes[seg_codes >= 0]).size)
+            dt = time.perf_counter() - t0
+            return _pack_record(
+                sid=sid,
+                meta={
+                    "mode": "native_identity",
+                    "resolution": float(resolution),
+                    "compactness": np.nan,
+                    "segment_method": str(segment_method),
+                    "pitch_um": float(pitch_um),
+                    "reference_target_um": float(resolution),
+                    "search_target_um": float(resolution),
+                    "reference_compactness": np.nan,
+                    "scaled_compactness": np.nan,
+                    "requested_n_segments": int(observed_tile_n_segments),
+                    "observed_tile_n_segments": int(observed_tile_n_segments),
+                    "observed_obs_n_segments": int(observed_obs_n_segments),
+                    "max_label": int(labels_tile.max(initial=-1)),
+                    "native_identity": True,
+                    "origin": bool(origin),
+                    "use_cached_image": bool(use_cached_image),
+                    "seconds": float(dt),
+                    "seg_codes": seg_codes,
+                    "label_img": label_img,
+                },
+            )
+
+        requested_n_segments = int(
+            n_segments_from_size(
+                tiles_for_n,
+                target_um=float(resolution),
+                pitch_um=float(pitch_um),
+            )
+        )
+        ref_um = float(
+            resolve_fast_compactness_reference_target_um(
+                adata,
+                target_segment_um=float(resolution),
+                pitch_um=float(pitch_um),
+                origin=bool(origin),
+                compactness_search_downsample_factor=float(compactness_search_downsample_factor),
+            )
+        )
+        ref_info = reference_compactness[ref_um]
+        if np.isclose(float(resolution), ref_um):
+            scaled_compactness = float(ref_info["selected_compactness"])
+        else:
+            scaled_compactness = float(
+                scale_compactness(
+                    ref_info["search_selected_compactness"],
+                    from_um=float(ref_info["search_target_um"]),
+                    to_um=float(resolution),
+                    power=float(compactness_scale_power),
+                )
+            )
+
+        slic_params = dict(slic_kwargs_use)
+        slic_params.update(
+            {
+                "n_segments": int(requested_n_segments),
+                "compactness": float(scaled_compactness),
+                "enforce_connectivity": bool(enforce_connectivity),
+                "show_image": False,
+                "verbose": False,
+                "figsize": None,
+                "fig_dpi": None,
+            }
+        )
+        labels_tile, label_img = slic_segmentation_from_cached_image(cache, **slic_params)
+        labels_tile, label_img, observed_tile_n_segments = _compress_observed_labels_for_export(
+            labels_tile,
+            label_img=np.asarray(label_img, dtype=np.int32),
+        )
+        seg_codes = _cached_tile_labels_to_obs_codes(
+            adata,
+            cache,
+            labels_tile,
+            image_cache_key=image_cache_key,
+        )
+        observed_obs_n_segments = int(np.unique(seg_codes[seg_codes >= 0]).size)
+        dt = time.perf_counter() - t0
+        return _pack_record(
+            sid=sid,
+            meta={
+                "mode": "auto_reference",
+                "resolution": float(resolution),
+                "compactness": float(scaled_compactness),
+                "segment_method": str(segment_method),
+                "pitch_um": float(pitch_um),
+                "reference_target_um": float(ref_um),
+                "search_target_um": float(ref_info["search_target_um"]),
+                "reference_compactness": float(ref_info["search_selected_compactness"]),
+                "scaled_compactness": float(scaled_compactness),
+                "requested_n_segments": int(requested_n_segments),
+                "observed_tile_n_segments": int(observed_tile_n_segments),
+                "observed_obs_n_segments": int(observed_obs_n_segments),
+                "max_label": int(labels_tile.max(initial=-1)),
+                "native_identity": False,
+                "origin": bool(origin),
+                "use_cached_image": bool(use_cached_image),
+                "seconds": float(dt),
+                "seg_codes": seg_codes,
+                "label_img": label_img,
+            },
+        )
+
+    if manual_mode:
+        if manual_pairs_use:
+            param_grid = list(manual_pairs_use)
+            mode_label = "manual pairs"
+        else:
+            param_grid = [(float(r), float(c)) for r in resolutions_use for c in compactnesses_use]
+            mode_label = "manual grid"
+        if verbose:
+            print(
+                f"▶ segment precompute: {len(param_grid)} {mode_label} settings (threads={int(max_workers)})",
+                flush=True,
+            )
+    else:
+        param_grid = [float(r) for r in resolutions_use]
+        if verbose:
+            print(
+                f"▶ segment precompute: {len(param_grid)} auto scales"
+                f"{' + ' + str(len(param_grid) * len(extra_compactnesses_use)) + ' fixed references' if len(extra_compactnesses_use) > 0 else ''}"
+                f" (threads={int(max_workers)})",
+                flush=True,
+            )
+
+    results: list[dict[str, Any]] = []
+    uns_records: dict[str, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=int(max_workers)) as executor:
+        future_map = {}
+        if manual_mode:
+            for res_value, comp_value in param_grid:
+                future = executor.submit(_segment_manual, res_value, comp_value)
+                future_map[future] = (res_value, comp_value)
+        else:
+            for res_value in param_grid:
+                future = executor.submit(_segment_auto, res_value)
+                future_map[future] = res_value
+            for res_value in param_grid:
+                for comp_value in extra_compactnesses_use:
+                    future = executor.submit(_segment_extra_reference, res_value, comp_value)
+                    future_map[future] = (res_value, comp_value)
+
+        for future in as_completed(future_map):
+            completed = future.result()
+            sid = str(completed["scale_id"])
+            record = dict(completed["record"])
+            payload = dict(completed["payload"])
+
+            if storage_mode in {"uns", "both"}:
+                uns_records[sid] = payload
+
+            if storage_mode in {"disk", "both"}:
+                path = os.path.join(str(out_dir), f"{filename_prefix}{sid}.npz")
+                save_fn(path, **payload)
+                record["path"] = path
+            else:
+                record["path"] = None
+
+            results.append(record)
+            if verbose:
+                if record["mode"] == "manual_grid":
+                    print(
+                        f"[done] {record['scale_id']}  "
+                        f"compactness={record['compactness']:.6g}  "
+                        f"requested={record['requested_n_segments']}  "
+                        f"observed_tile={record['observed_tile_n_segments']}  "
+                        f"observed_obs={record['observed_obs_n_segments']}  "
+                        f"{record['seconds']:.2f}s",
+                        flush=True,
+                    )
+                else:
+                    if record["mode"] == "extra_reference":
+                        print(
+                            f"[done] {record['scale_id']}  "
+                            f"fixed_compactness={record['compactness']:.6g}  "
+                            f"requested={record['requested_n_segments']}  "
+                            f"observed_tile={record['observed_tile_n_segments']}  "
+                            f"observed_obs={record['observed_obs_n_segments']}  "
+                            f"{record['seconds']:.2f}s",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[done] {record['scale_id']}  "
+                            f"ref_um={record['reference_target_um']:.1f}  "
+                            f"compactness={record.get('scaled_compactness', np.nan)}  "
+                            f"requested={record['requested_n_segments']}  "
+                            f"observed_tile={record['observed_tile_n_segments']}  "
+                            f"observed_obs={record['observed_obs_n_segments']}  "
+                            f"{record['seconds']:.2f}s",
+                            flush=True,
+                        )
+            gc.collect()
+
+    sort_cols = ["resolution", "compactness"] if ("compactness" in pd.DataFrame(results).columns) else ["resolution"]
+    index_df = pd.DataFrame(results).sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+    if storage_mode in {"disk", "both"}:
+        index_csv = os.path.join(str(out_dir), str(index_filename))
+        index_df.to_csv(index_csv, index=False)
+        if verbose:
+            print(f"saved: {index_csv}", flush=True)
+    if storage_mode in {"uns", "both"}:
+        adata.uns[str(uns_key)] = {
+            "index": index_df.copy(),
+            "records": uns_records,
+            "config": {
+                "resolutions": list(resolutions_use),
+                "manual_pairs": list(manual_pairs_use),
+                "compactnesses": list(compactnesses_use),
+                "compactness_candidates": list(compactness_candidates_use),
+                "extra_compactnesses": list(extra_compactnesses_use),
+                "dimensions": list(dimensions),
+                "embedding": str(embedding),
+                "segment_method": str(segment_method),
+                "image_cache_key": str(image_cache_key),
+                "pitch_um": float(pitch_um),
+                "origin": bool(origin),
+                "storage": str(storage_mode),
+                "filename_prefix": str(filename_prefix),
+                "index_filename": str(index_filename),
+            },
+        }
+        if verbose:
+            print(f"stored: adata.uns['{uns_key}']", flush=True)
+    return index_df
+
+
+def export_precomputed_multiscale_segments(
+    source: AnnData | dict[str, Any],
+    *,
+    uns_key: str = "multiscale_segments",
+    out_dir: str = "./multiscale_segments",
+    filename_prefix: str | None = None,
+    index_filename: str | None = None,
+    save_compressed: bool = False,
+) -> pd.DataFrame:
+    """Export a precomputed multiscale segmentation bundle from memory to disk."""
+    if isinstance(source, AnnData):
+        if str(uns_key) not in source.uns:
+            raise KeyError(f"adata.uns['{uns_key}'] not found.")
+        bundle = source.uns[str(uns_key)]
+    else:
+        bundle = source
+
+    if not isinstance(bundle, dict):
+        raise ValueError("source must be an AnnData object or a multiscale segmentation bundle dict.")
+    if "index" not in bundle or "records" not in bundle:
+        raise KeyError("bundle must contain 'index' and 'records'.")
+
+    bundle_index = bundle["index"]
+    bundle_records = bundle["records"]
+    config = bundle.get("config", {}) or {}
+    if not isinstance(bundle_index, pd.DataFrame):
+        bundle_index = pd.DataFrame(bundle_index)
+    if not isinstance(bundle_records, dict):
+        raise ValueError("bundle['records'] must be a dict keyed by scale_id.")
+
+    filename_prefix_use = str(
+        config.get("filename_prefix", "segments__") if filename_prefix is None else filename_prefix
+    )
+    index_filename_use = str(
+        config.get("index_filename", "segments_index.csv") if index_filename is None else index_filename
+    )
+    save_fn = np.savez_compressed if bool(save_compressed) else np.savez
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    exported_index = bundle_index.copy()
+    exported_paths: list[str] = []
+    for _, row in exported_index.iterrows():
+        sid = str(row["scale_id"])
+        if sid not in bundle_records:
+            raise KeyError(f"scale_id '{sid}' missing from bundle['records'].")
+        payload = bundle_records[sid]
+        path = os.path.join(out_dir, f"{filename_prefix_use}{sid}.npz")
+        save_fn(path, **payload)
+        exported_paths.append(path)
+
+    exported_index["path"] = exported_paths
+    index_csv = os.path.join(out_dir, index_filename_use)
+    exported_index.to_csv(index_csv, index=False)
+    return exported_index
 
 
 # Configure logging
@@ -2246,10 +3669,14 @@ def segment_image(
     runtime_fill_closing_radius: int = 1,
     runtime_fill_external_radius: int = 0,
     runtime_fill_holes: bool = True,
+    gap_collapse_axis: str | None = None,
+    gap_collapse_max_run_px: int = 1,
     soft_rasterization: bool = False,
-    resolve_center_collisions: bool = False,
+    resolve_center_collisions: bool | str = "auto",
     center_collision_radius: int = 2,
     mask_background: bool = False,
+    masked_slic_mode: str = "strict",
+    ignore_cache_param_mismatches: bool = True,
     show_image: bool = False,
     brighten_continuous: bool = False,
     continuous_gamma: float = 0.8,
@@ -2258,6 +3685,7 @@ def segment_image(
     n_jobs: int | None = None,
     use_cached_image: bool = False,
     image_cache_key: str = "image_plot_slic",
+    cache_storage: str = DEFAULT_CACHE_STORAGE,
     cache_fast_path: bool = True,
     compute_pseudo_centroids: bool = True,
     coordinate_mode: str = "spatial",  # 'spatial'|'array'|'visium'|'visiumhd'|'auto'
@@ -2341,6 +3769,12 @@ def segment_image(
     runtime_fill_holes : bool, optional (default ``True``)
         Whether to fill enclosed holes in the raster support when
         ``runtime_fill_from_boundary=True``.
+    gap_collapse_axis : {"x", "y", "both"} or None, optional (default ``None``)
+        Collapse short fully-empty raster row/column gaps before
+        ``image_plot_slic`` runs.
+    gap_collapse_max_run_px : int, optional (default ``1``)
+        Maximum empty row/column run length that will be removed when
+        ``gap_collapse_axis`` is enabled.
     soft_rasterization : bool, optional (default ``False``)
         If True, use bilinear splatting and bilinear label readback for
         ``image_plot_slic`` instead of hard one-pixel assignment. This is
@@ -2353,6 +3787,22 @@ def segment_image(
     center_collision_radius : int, optional (default ``2``)
         Search radius in raster pixels used when
         ``resolve_center_collisions=True``.
+    mask_background : bool, optional (default ``False``)
+        When ``True``, restrict ``image_plot_slic`` to the observed/fill-completed
+        raster support instead of running across the full canvas.
+    masked_slic_mode : {"strict", "fast_fill"}, optional (default ``"strict"``)
+        Execution mode used when ``mask_background=True`` for
+        ``method='image_plot_slic'``. ``"strict"`` runs SLIC with an explicit
+        mask for maximum fidelity but can be slow on large masks. ``"fast_fill"``
+        fills background pixels from the nearest supported location, runs
+        unmasked SLIC, and then discards background labels; this is usually much
+        faster while preserving masked behavior approximately.
+    ignore_cache_param_mismatches : bool, optional (default ``True``)
+        When ``use_cached_image=True``, reuse the cached raster even if raster
+        generation settings (fill, pixel snapping, soft rasterization, etc.)
+        differ from the current request. A warning is still emitted so the
+        effective segmentation input is explicit. Embedding/dimension/origin
+        mismatches remain strict and still trigger regeneration.
     show_image : bool, optional (default ``False``)
         If ``True`` display the intermediate images produced by
         ``image_plot_slic_segmentation``.
@@ -2478,6 +3928,19 @@ def segment_image(
         if verbose:
             print("[info] compactness was omitted; using compactness_mode='auto_search'.")
     base_compactness = 1.0 if requested_compactness is None else float(requested_compactness)
+    gap_collapse_axis = _normalize_gap_collapse_axis_safe(gap_collapse_axis)
+    gap_collapse_active = bool(
+        method == "image_plot_slic"
+        and gap_collapse_axis is not None
+        and int(max(0, int(gap_collapse_max_run_px))) > 0
+    )
+    if gap_collapse_active and use_cached_image:
+        if verbose:
+            print(
+                "[warning] gap_collapse is not yet compatible with use_cached_image=True; "
+                "regenerating the raster directly."
+            )
+        use_cached_image = False
 
     if method == "fixed_grid" and verbose:
         print(
@@ -2524,17 +3987,23 @@ def segment_image(
             resolve_center_collisions=resolve_center_collisions,
             center_collision_radius=center_collision_radius,
         )
+        cache_raster_reusable = bool(cache_matches_config) or bool(ignore_cache_param_mismatches)
         if (cached_emb is None or cached_emb == embedding) and (
             cached_dims is None or list(cached_dims) == list(dimensions)
         ) and (
             cached_origin is None or bool(cached_origin) == bool(origin)
-        ) and cache_matches_config:
+        ) and cache_raster_reusable:
+            if verbose and (not cache_matches_config):
+                print(
+                    "[warning] Cached image raster settings differ from requested segmentation settings; "
+                    f"reusing cache anyway. mismatches={cache_mismatches}"
+                )
             if show_image:
                 preview_figsize, preview_figdpi = _resolve_cached_preview_size(
                     cache,
                     figsize=figsize,
                     fig_dpi=fig_dpi,
-                    img_shape=np.asarray(cache.get("img")).shape,
+                    img_shape=get_cached_image_shape(cache),
                 )
                 cache_pp = cache.get("pixel_perfect", None)
                 if verbose:
@@ -2571,6 +4040,7 @@ def segment_image(
                 brighten_continuous=brighten_continuous,
                 continuous_gamma=continuous_gamma,
                 mask_background=mask_background,
+                masked_slic_mode=masked_slic_mode,
                 return_raster_meta=True,
             )
             t1 = time.perf_counter()
@@ -2699,6 +4169,7 @@ def segment_image(
             and (cached_dims is None or list(cached_dims) == list(dimensions))
             and (cached_origin is None or bool(cached_origin) == bool(origin))
             and (not cache_matches_config)
+            and (not ignore_cache_param_mismatches)
         ):
             print(
                 "[warning] Cached image raster settings differ from requested segmentation settings; "
@@ -2928,6 +4399,8 @@ def segment_image(
                         runtime_fill_closing_radius=runtime_fill_closing_radius,
                         runtime_fill_external_radius=runtime_fill_external_radius,
                         runtime_fill_holes=runtime_fill_holes,
+                        gap_collapse_axis=gap_collapse_axis,
+                        gap_collapse_max_run_px=gap_collapse_max_run_px,
                         soft_rasterization=soft_rasterization,
                         resolve_center_collisions=resolve_center_collisions,
                         center_collision_radius=center_collision_radius,
@@ -2935,6 +4408,8 @@ def segment_image(
                         verbose=False,
                         n_jobs=n_jobs,
                         mask_background=mask_background,
+                        masked_slic_mode=masked_slic_mode,
+                        persistent_store=getattr(adata, "uns", None),
                     )[0],
                 )
                 labels, _, _ = image_plot_slic_segmentation(
@@ -2954,6 +4429,8 @@ def segment_image(
                     runtime_fill_closing_radius=runtime_fill_closing_radius,
                     runtime_fill_external_radius=runtime_fill_external_radius,
                     runtime_fill_holes=runtime_fill_holes,
+                    gap_collapse_axis=gap_collapse_axis,
+                    gap_collapse_max_run_px=gap_collapse_max_run_px,
                     soft_rasterization=soft_rasterization,
                     resolve_center_collisions=resolve_center_collisions,
                     center_collision_radius=center_collision_radius,
@@ -2961,6 +4438,8 @@ def segment_image(
                     verbose=verbose,
                     n_jobs=n_jobs,
                     mask_background=mask_background,
+                    masked_slic_mode=masked_slic_mode,
+                    persistent_store=getattr(adata, "uns", None),
                 )
                 compactness_details_by_library[str(lib)] = compactness_detail
                 # Aggregate tile labels -> per-observation labels (use origin flags for tie-break)
@@ -3133,6 +4612,9 @@ def segment_image(
                     soft_rasterization=soft_rasterization,
                     resolve_center_collisions=resolve_center_collisions,
                     center_collision_radius=center_collision_radius,
+                    memmap_scope="transient",
+                    memmap_cleanup="on_exit",
+                    cache_storage="float32_memmap",
                 )
                 if verbose:
                     print("[perf] built transient raster cache for compactness search.")
@@ -3174,19 +4656,26 @@ def segment_image(
                             )
                         raise KeyError
                     if not cache_matches_config:
-                        if verbose:
-                            print(
-                                "[warning] Cached image raster settings differ from requested segmentation settings; "
-                                f"regenerating image. mismatches={cache_mismatches}"
-                            )
-                        raise KeyError
+                        if bool(ignore_cache_param_mismatches):
+                            if verbose:
+                                print(
+                                    "[warning] Cached image raster settings differ from requested segmentation settings; "
+                                    f"reusing cache anyway. mismatches={cache_mismatches}"
+                                )
+                        else:
+                            if verbose:
+                                print(
+                                    "[warning] Cached image raster settings differ from requested segmentation settings; "
+                                    f"regenerating image. mismatches={cache_mismatches}"
+                                )
+                            raise KeyError
 
                     if show_image:
                         preview_figsize, preview_figdpi = _resolve_cached_preview_size(
                             cache,
                             figsize=figsize,
                             fig_dpi=fig_dpi,
-                            img_shape=np.asarray(cache.get("img")).shape,
+                            img_shape=get_cached_image_shape(cache),
                         )
                         cache_pp = cache.get("pixel_perfect", None)
                         if verbose:
@@ -3217,6 +4706,7 @@ def segment_image(
                             figsize=None,
                             fig_dpi=None,
                             mask_background=mask_background,
+                            masked_slic_mode=masked_slic_mode,
                         )[0],
                     )
 
@@ -3233,6 +4723,7 @@ def segment_image(
                         brighten_continuous=brighten_continuous,
                         continuous_gamma=continuous_gamma,
                         mask_background=mask_background,
+                        masked_slic_mode=masked_slic_mode,
                         return_raster_meta=True,
                     )
                     t1 = time.perf_counter()
@@ -3331,6 +4822,8 @@ def segment_image(
                             runtime_fill_closing_radius=runtime_fill_closing_radius,
                             runtime_fill_external_radius=runtime_fill_external_radius,
                             runtime_fill_holes=runtime_fill_holes,
+                            gap_collapse_axis=gap_collapse_axis,
+                            gap_collapse_max_run_px=gap_collapse_max_run_px,
                             soft_rasterization=soft_rasterization,
                             resolve_center_collisions=resolve_center_collisions,
                             center_collision_radius=center_collision_radius,
@@ -3338,6 +4831,8 @@ def segment_image(
                             verbose=False,
                             n_jobs=n_jobs,
                             mask_background=mask_background,
+                            masked_slic_mode=masked_slic_mode,
+                            persistent_store=getattr(adata, "uns", None),
                         )[0],
                     )
                     t0 = time.perf_counter()
@@ -3358,6 +4853,8 @@ def segment_image(
                         runtime_fill_closing_radius=runtime_fill_closing_radius,
                         runtime_fill_external_radius=runtime_fill_external_radius,
                         runtime_fill_holes=runtime_fill_holes,
+                        gap_collapse_axis=gap_collapse_axis,
+                        gap_collapse_max_run_px=gap_collapse_max_run_px,
                         soft_rasterization=soft_rasterization,
                         resolve_center_collisions=resolve_center_collisions,
                         center_collision_radius=center_collision_radius,
@@ -3367,6 +4864,8 @@ def segment_image(
                         brighten_continuous=brighten_continuous,
                         continuous_gamma=continuous_gamma,
                         mask_background=mask_background,
+                        masked_slic_mode=masked_slic_mode,
+                        persistent_store=getattr(adata, "uns", None),
                         return_raster_meta=True,
                     )
                     t1 = time.perf_counter()
@@ -3409,7 +4908,7 @@ def segment_image(
                     combined_data = None
                 finally:
                     if transient_cache_key is not None:
-                        adata.uns.pop(transient_cache_key, None)
+                        release_cached_image(adata, transient_cache_key, remove_memmap_file=True)
             else:
                 compactness_value, compactness_detail = resolve_compactness(
                     compactness=requested_compactness,
@@ -3441,6 +4940,8 @@ def segment_image(
                         runtime_fill_closing_radius=runtime_fill_closing_radius,
                         runtime_fill_external_radius=runtime_fill_external_radius,
                         runtime_fill_holes=runtime_fill_holes,
+                        gap_collapse_axis=gap_collapse_axis,
+                        gap_collapse_max_run_px=gap_collapse_max_run_px,
                         soft_rasterization=soft_rasterization,
                         resolve_center_collisions=resolve_center_collisions,
                         center_collision_radius=center_collision_radius,
@@ -3448,6 +4949,8 @@ def segment_image(
                         verbose=False,
                         n_jobs=n_jobs,
                         mask_background=mask_background,
+                        masked_slic_mode=masked_slic_mode,
+                        persistent_store=getattr(adata, "uns", None),
                     )[0],
                 )
                 t0 = time.perf_counter()
@@ -3468,6 +4971,8 @@ def segment_image(
                     runtime_fill_closing_radius=runtime_fill_closing_radius,
                     runtime_fill_external_radius=runtime_fill_external_radius,
                     runtime_fill_holes=runtime_fill_holes,
+                    gap_collapse_axis=gap_collapse_axis,
+                    gap_collapse_max_run_px=gap_collapse_max_run_px,
                     soft_rasterization=soft_rasterization,
                     resolve_center_collisions=resolve_center_collisions,
                     center_collision_radius=center_collision_radius,
@@ -3477,6 +4982,8 @@ def segment_image(
                     brighten_continuous=brighten_continuous,
                     continuous_gamma=continuous_gamma,
                     mask_background=mask_background,
+                    masked_slic_mode=masked_slic_mode,
+                    persistent_store=getattr(adata, "uns", None),
                     return_raster_meta=True,
                 )
                 t1 = time.perf_counter()
@@ -3683,12 +5190,17 @@ def segment_image_inner(
     runtime_fill_closing_radius: int = 1,
     runtime_fill_external_radius: int = 0,
     runtime_fill_holes: bool = True,
+    gap_collapse_axis: str | None = None,
+    gap_collapse_max_run_px: int = 1,
     soft_rasterization: bool = False,
-    resolve_center_collisions: bool = False,
+    resolve_center_collisions: bool | str = "auto",
     center_collision_radius: int = 2,
+    mask_background: bool = False,
+    masked_slic_mode: str = "strict",
     show_image: bool = False,
     fig_dpi: int | None = None,
     n_jobs: int | None = None,
+    persistent_store=None,
     grid_origin_x: float | None = None,
     grid_origin_y: float | None = None,
 ):
@@ -3755,12 +5267,16 @@ def segment_image_inner(
     runtime_fill_holes : bool, optional
         Whether to fill enclosed holes in the raster support when
         ``runtime_fill_from_boundary=True``.
+    gap_collapse_axis / gap_collapse_max_run_px : optional
+        Optional empty-gap collapsing controls passed through to
+        ``image_plot_slic``.
     soft_rasterization : bool, optional
         If True, use bilinear splatting and bilinear label readback for
         ``image_plot_slic``.
-    resolve_center_collisions : bool, optional
-        If True, locally reassign duplicate raster centers onto nearby empty
-        pixels before ``image_plot_slic`` runs.
+    resolve_center_collisions : bool or {"auto"}, optional
+        ``True`` always reassigns duplicate raster centers onto nearby empty
+        pixels before ``image_plot_slic`` runs. ``"auto"`` only does this for
+        dense one-pixel rasters with substantial collisions.
     center_collision_radius : int, optional
         Search radius in raster pixels used when
         ``resolve_center_collisions=True``.
@@ -3770,6 +5286,8 @@ def segment_image_inner(
     n_jobs : int or None, optional
         Number of worker threads for ``image_plot_slic`` rasterization. When
         ``None``, defers to ``SPIX_IMAGE_PLOT_SLIC_N_JOBS`` env var or 1.
+    persistent_store : mapping-like or None, optional
+        Optional cache store passed to ``image_plot_slic`` helpers.
     grid_origin_x / grid_origin_y : float or None, optional
         Optional explicit grid origin for ``method='fixed_grid'``.
         When omitted, the minimum observed x/y coordinates are used.
@@ -3827,6 +5345,8 @@ def segment_image_inner(
             runtime_fill_closing_radius=runtime_fill_closing_radius,
             runtime_fill_external_radius=runtime_fill_external_radius,
             runtime_fill_holes=runtime_fill_holes,
+            gap_collapse_axis=gap_collapse_axis,
+            gap_collapse_max_run_px=gap_collapse_max_run_px,
             soft_rasterization=soft_rasterization,
             resolve_center_collisions=resolve_center_collisions,
             center_collision_radius=center_collision_radius,
@@ -3834,6 +5354,8 @@ def segment_image_inner(
             verbose=verbose,
             n_jobs=n_jobs,
             mask_background=mask_background,
+            masked_slic_mode=masked_slic_mode,
+            persistent_store=persistent_store,
         )
         combined_data = None
     elif method == "fixed_grid":

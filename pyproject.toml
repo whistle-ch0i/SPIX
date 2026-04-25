@@ -35,7 +35,9 @@ dependencies = [
     "shapely",
     "tqdm",
     "alphashape",
-    "igraph"
+    "igraph",
+    "zarr",
+    "numcodecs",
 ]
 
 [project.optional-dependencies]

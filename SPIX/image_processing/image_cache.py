@@ -4,6 +4,9 @@ import os
 import time
 import atexit
 import glob
+import hashlib
+import shutil
+import socket
 from pathlib import Path
 from sklearn.preprocessing import MinMaxScaler
 from scipy.spatial import KDTree
@@ -13,19 +16,61 @@ from matplotlib import colors as mcolors
 from skimage.segmentation import find_boundaries
 from skimage.transform import resize
 from scipy.ndimage import gaussian_filter, binary_dilation
+try:
+    import zarr
+    from numcodecs import Blosc
+except Exception:  # pragma: no cover - optional dependency
+    zarr = None
+    Blosc = None
 
 # no additional utils needed here after function removals
 from SPIX.visualization import raster as _raster
 
 
 _MEMMAP_CLEANUP_PATHS: set[str] = set()
+_MEMMAP_SCOPE_DIRS = {"persistent", "transient"}
+_CACHE_STORAGE_KINDS = {"lossless_float32", "uint16", "float32_memmap", "float32_zarr"}
+_CACHE_FILE_SUFFIXES = (".dat", ".npz", ".npy", ".zarr")
+DEFAULT_CACHE_STORAGE = "float32_zarr"
+_CACHE_SESSION_ID = os.environ.get(
+    "SPIX_CACHE_SESSION_ID",
+    f"{socket.gethostname()}-{os.getpid()}-{int(time.time() * 1000)}",
+)
+
+
+def _normalize_gap_collapse_axis_safe(axis):
+    normalize_fn = getattr(_raster, "normalize_gap_collapse_axis", None)
+    if callable(normalize_fn):
+        return normalize_fn(axis)
+    if axis is None:
+        return None
+    text = str(axis).strip().lower()
+    if text in {"", "none", "off", "false", "no", "0"}:
+        return None
+    if text in {"y", "row", "rows", "vertical"}:
+        return "y"
+    if text in {"x", "col", "cols", "column", "columns", "horizontal"}:
+        return "x"
+    if text in {"both", "xy", "yx"}:
+        return "both"
+    return None
+
+
+def _require_zarr() -> None:
+    if zarr is None or Blosc is None:
+        raise RuntimeError(
+            "cache_storage='float32_zarr' requires optional dependencies 'zarr' and 'numcodecs'."
+        )
 
 
 def _cleanup_registered_memmaps() -> None:  # pragma: no cover
     # Best-effort cleanup; ignore failures (e.g., file already removed).
     for p in list(_MEMMAP_CLEANUP_PATHS):
         try:
-            os.remove(p)
+            if os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                os.remove(p)
         except Exception:
             pass
 
@@ -33,13 +78,426 @@ def _cleanup_registered_memmaps() -> None:  # pragma: no cover
 atexit.register(_cleanup_registered_memmaps)
 
 
+def _safe_cache_component(value: Any) -> str:
+    text = str(value).strip()
+    if not text:
+        return "default"
+    safe = "".join(c if (c.isalnum() or c in ("-", "_", ".")) else "_" for c in text)
+    return safe or "default"
+
+
 def _default_memmap_dir() -> str:
-    # Prefer a user cache dir over writing inside the current project.
+    # Prefer a stable user cache root over writing inside the current project.
     # Users can override with `memmap_dir=` or env var `SPIX_CACHE_DIR`.
     env = os.environ.get("SPIX_CACHE_DIR")
     if env:
         return env
-    return os.path.join(os.getcwd(), ".spix_cache")
+    try:
+        return str(Path.home() / ".cache" / "spix")
+    except Exception:
+        return os.path.join(os.getcwd(), ".spix_cache")
+
+
+def _dataset_cache_namespace(adata) -> str:
+    try:
+        override = getattr(adata, "uns", {}).get("spix_cache_namespace", None)
+        if override:
+            return _safe_cache_component(override)
+    except Exception:
+        pass
+
+    hasher = hashlib.sha1()
+    try:
+        hasher.update(f"n_obs={int(adata.n_obs)}|n_vars={int(adata.n_vars)}".encode("utf-8"))
+    except Exception:
+        hasher.update(b"n_obs=unknown|n_vars=unknown")
+
+    try:
+        obs_names = getattr(adata, "obs_names", None)
+        if obs_names is not None:
+            n_names = len(obs_names)
+            edge_n = min(64, n_names)
+            head = [str(v) for v in obs_names[:edge_n]]
+            tail = [str(v) for v in obs_names[-edge_n:]] if n_names > edge_n else []
+            for token in head + ["__TAIL__"] + tail:
+                hasher.update(token.encode("utf-8", errors="ignore"))
+                hasher.update(b"\0")
+    except Exception:
+        pass
+
+    try:
+        spatial = np.asarray(adata.obsm.get("spatial"))
+        if spatial.ndim == 2 and spatial.shape[0] > 0 and spatial.shape[1] >= 2:
+            arr = np.asarray(spatial[:, :2], dtype=np.float64)
+            edge_n = min(8, arr.shape[0])
+            sample = arr[:edge_n] if arr.shape[0] <= edge_n else np.vstack([arr[:edge_n], arr[-edge_n:]])
+            hasher.update(f"spatial_shape={arr.shape}".encode("utf-8"))
+            hasher.update(np.nan_to_num(sample, nan=0.0, posinf=0.0, neginf=0.0).tobytes())
+            mins = np.nanmin(arr, axis=0)
+            maxs = np.nanmax(arr, axis=0)
+            hasher.update(np.nan_to_num(mins, nan=0.0, posinf=0.0, neginf=0.0).tobytes())
+            hasher.update(np.nan_to_num(maxs, nan=0.0, posinf=0.0, neginf=0.0).tobytes())
+    except Exception:
+        pass
+
+    try:
+        filename = getattr(adata, "filename", None)
+        if filename:
+            hasher.update(str(filename).encode("utf-8", errors="ignore"))
+    except Exception:
+        pass
+
+    return f"adata_{hasher.hexdigest()[:16]}"
+
+
+def _resolve_memmap_cache_dir(
+    adata,
+    *,
+    memmap_dir: Optional[str],
+    cache_namespace: Optional[str],
+    memmap_scope: str,
+) -> tuple[str, Optional[str], str, Optional[str]]:
+    scope = str(memmap_scope or "persistent").lower()
+    if scope not in _MEMMAP_SCOPE_DIRS:
+        raise ValueError("memmap_scope must be one of {'persistent','transient'}.")
+    if memmap_dir is not None:
+        try:
+            resolved = str(Path(memmap_dir).expanduser().resolve(strict=False))
+        except Exception:
+            resolved = str(memmap_dir)
+        return resolved, None, scope, None
+
+    root = Path(_default_memmap_dir()).expanduser()
+    namespace = _safe_cache_component(cache_namespace or _dataset_cache_namespace(adata))
+    session_id = _safe_cache_component(_CACHE_SESSION_ID) if scope == "transient" else None
+    if scope == "transient":
+        cache_dir = root / "transient" / session_id / namespace
+    else:
+        cache_dir = root / "persistent" / namespace
+    return str(cache_dir.resolve(strict=False)), namespace, scope, session_id
+
+
+def _prune_empty_cache_dirs(path: Path, *, stop_at: Optional[Path] = None) -> None:
+    current = Path(path)
+    stop = None if stop_at is None else Path(stop_at)
+    while True:
+        if stop is not None:
+            try:
+                if current.resolve(strict=False) == stop.resolve(strict=False):
+                    break
+            except Exception:
+                if str(current) == str(stop):
+                    break
+        try:
+            current.rmdir()
+        except Exception:
+            break
+        if current.parent == current:
+            break
+        current = current.parent
+
+
+def _normalize_cache_storage(cache_storage: Optional[str]) -> str:
+    storage = str(cache_storage or DEFAULT_CACHE_STORAGE).lower()
+    if storage not in _CACHE_STORAGE_KINDS:
+        raise ValueError("cache_storage must be one of {'lossless_float32','uint16','float32_memmap','float32_zarr'}.")
+    return storage
+
+
+def _cache_disk_suffix(cache_storage: str) -> str:
+    storage = _normalize_cache_storage(cache_storage)
+    if storage == "lossless_float32":
+        return ".npz"
+    if storage == "uint16":
+        return ".npy"
+    if storage == "float32_zarr":
+        return ".zarr"
+    return ".dat"
+
+
+def _cache_disk_path(cache_dir: str, key: str, embedding: str, shape: tuple[int, int, int], cache_storage: str) -> str:
+    safe_key = _safe_cache_component(key)
+    safe_emb = _safe_cache_component(embedding)
+    h, w, dims = (int(shape[0]), int(shape[1]), int(shape[2]))
+    suffix = _cache_disk_suffix(cache_storage)
+    return os.path.join(cache_dir, f"{safe_key}__{safe_emb}__{h}x{w}x{dims}{suffix}")
+
+
+def _temporary_cache_work_path(final_path: str) -> str:
+    if final_path.endswith(".dat"):
+        return final_path
+    return f"{final_path}.tmp.dat"
+
+
+def _zarr_chunk_shape(shape: tuple[int, int, int]) -> tuple[int, int, int]:
+    _require_zarr()
+    h, w, c = (int(shape[0]), int(shape[1]), int(shape[2]))
+    chunk_h = int(max(1, int(os.environ.get("SPIX_ZARR_CHUNK_H", "512"))))
+    chunk_w = int(max(1, int(os.environ.get("SPIX_ZARR_CHUNK_W", "512"))))
+    chunk_c_default = min(max(1, c), 4 if c > 4 else c)
+    chunk_c = int(max(1, int(os.environ.get("SPIX_ZARR_CHUNK_C", str(chunk_c_default)))))
+    return (min(h, chunk_h), min(w, chunk_w), min(c, chunk_c))
+
+
+def _zarr_compressor():
+    _require_zarr()
+    cname = str(os.environ.get("SPIX_ZARR_COMPRESSOR", "zstd"))
+    clevel = int(max(1, min(9, int(os.environ.get("SPIX_ZARR_CLEVEL", "5")))))
+    shuffle_mode = str(os.environ.get("SPIX_ZARR_SHUFFLE", "bitshuffle")).strip().lower()
+    if shuffle_mode == "shuffle":
+        shuffle = Blosc.SHUFFLE
+    elif shuffle_mode == "noshuffle":
+        shuffle = Blosc.NOSHUFFLE
+    else:
+        shuffle = Blosc.BITSHUFFLE
+    return Blosc(cname=cname, clevel=clevel, shuffle=shuffle)
+
+
+def _load_cache_image_from_disk(cache: Dict[str, Any], *, channels: Optional[Sequence[int]] = None) -> np.ndarray:
+    img_path = cache.get("img_path", None)
+    if not img_path:
+        raise ValueError("Cached image does not have an on-disk image path.")
+    storage = _normalize_cache_storage(cache.get("cache_storage", "float32_memmap"))
+    h = int(cache.get("h"))
+    w = int(cache.get("w"))
+    c = int(cache.get("channels", cache.get("img_channels", 0)))
+    if storage == "float32_memmap":
+        arr = np.memmap(img_path, dtype=np.float32, mode="r", shape=(h, w, c))
+        if channels is None:
+            return arr
+        return np.asarray(arr[:, :, list(channels)], dtype=np.float32)
+    if storage == "lossless_float32":
+        with np.load(img_path) as data:
+            arr = np.asarray(data["img"], dtype=np.float32)
+            if channels is None:
+                return arr
+            return np.asarray(arr[:, :, list(channels)], dtype=np.float32)
+    if storage == "uint16":
+        arr = np.load(img_path, mmap_mode="r")
+        if channels is not None:
+            arr = arr[:, :, list(channels)]
+        return np.asarray(arr, dtype=np.float32) / 65535.0
+    if storage == "float32_zarr":
+        _require_zarr()
+        arr = zarr.open(img_path, mode="r")
+        if channels is None:
+            return np.asarray(arr, dtype=np.float32)
+        return np.asarray(arr[:, :, list(channels)], dtype=np.float32)
+    raise ValueError(f"Unsupported cache storage: {storage}")
+
+
+def get_cached_image_shape(cache: Dict[str, Any]) -> tuple[int, int, int]:
+    """Return cached image shape without loading the image payload when possible."""
+    img = cache.get("img", None)
+    if isinstance(img, np.ndarray) and img.ndim == 3:
+        return tuple(int(x) for x in img.shape)
+
+    h = cache.get("h", None)
+    w = cache.get("w", None)
+    c = cache.get("channels", cache.get("img_channels", None))
+    if h is None or w is None or c is None:
+        raise ValueError("Cached image does not contain shape metadata.")
+    return (int(h), int(w), int(c))
+
+
+def get_cached_image(cache: Dict[str, Any], *, cache_in_memory: bool = False) -> np.ndarray:
+    """Return the cached image array, loading it from disk if necessary."""
+    return get_cached_image_channels(cache, channels=None, cache_in_memory=cache_in_memory)
+
+
+def get_cached_image_channels(
+    cache: Dict[str, Any],
+    *,
+    channels: Optional[Sequence[int]] = None,
+    cache_in_memory: bool = False,
+) -> np.ndarray:
+    """Return cached image channels, using partial reads when the storage supports it."""
+    img = cache.get("img", None)
+    if isinstance(img, np.ndarray) and img.ndim == 3:
+        if channels is None:
+            return img
+        return np.asarray(img[:, :, list(channels)], dtype=np.float32)
+    loaded = _load_cache_image_from_disk(cache, channels=channels)
+    if cache_in_memory and channels is None:
+        cache["img"] = loaded
+    return loaded
+
+
+def _write_cache_image_to_disk(img: np.ndarray, img_path: str, cache_storage: str) -> None:
+    storage = _normalize_cache_storage(cache_storage)
+    img_f32 = np.asarray(img, dtype=np.float32)
+    tmp_path = f"{img_path}.tmpwrite"
+    if storage == "float32_memmap":
+        if tmp_path != img_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        mm = np.memmap(img_path, dtype=np.float32, mode="w+", shape=img_f32.shape)
+        mm[...] = img_f32
+        mm.flush()
+        return
+    if storage == "lossless_float32":
+        np.savez_compressed(tmp_path, img=img_f32)
+        npz_path = tmp_path if tmp_path.endswith(".npz") else f"{tmp_path}.npz"
+        os.replace(npz_path, img_path)
+        return
+    if storage == "uint16":
+        arr = np.rint(np.clip(img_f32, 0.0, 1.0) * 65535.0).astype(np.uint16)
+        np.save(tmp_path, arr)
+        npy_path = tmp_path if tmp_path.endswith(".npy") else f"{tmp_path}.npy"
+        os.replace(npy_path, img_path)
+        return
+    if storage == "float32_zarr":
+        _require_zarr()
+        tmp_dir = f"{img_path}.tmpwrite"
+        if os.path.isdir(tmp_dir):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        if os.path.isdir(img_path):
+            shutil.rmtree(img_path, ignore_errors=True)
+        arr = zarr.open(
+            tmp_dir,
+            mode="w",
+            shape=img_f32.shape,
+            chunks=_zarr_chunk_shape(tuple(int(x) for x in img_f32.shape)),
+            dtype="f4",
+            compressor=_zarr_compressor(),
+        )
+        arr[...] = img_f32
+        shutil.move(tmp_dir, img_path)
+        return
+    raise ValueError(f"Unsupported cache storage: {storage}")
+
+
+def _iter_memmap_paths(
+    *,
+    memmap_dir: Optional[str],
+    key: Optional[str],
+    embedding: Optional[str],
+    cache_namespace: Optional[str],
+    scope: str,
+    session_id: Optional[str],
+) -> tuple[list[Path], Optional[Path]]:
+    scope_norm = str(scope or "all").lower()
+    if scope_norm not in {"all", "persistent", "transient"}:
+        raise ValueError("scope must be one of {'all','persistent','transient'}.")
+
+    root_scope_map: list[tuple[Path, str]] = []
+    if memmap_dir is not None:
+        root = Path(memmap_dir).expanduser()
+        stop_root = root
+        has_scoped_children = any((root / scope_name).exists() for scope_name in _MEMMAP_SCOPE_DIRS)
+        namespace_safe = _safe_cache_component(cache_namespace) if cache_namespace is not None else None
+        if has_scoped_children:
+            if scope_norm in {"all", "persistent"}:
+                scoped_root = root / "persistent"
+                if namespace_safe is not None:
+                    scoped_root = scoped_root / namespace_safe
+                root_scope_map.append((scoped_root, "persistent"))
+            if scope_norm in {"all", "transient"}:
+                scoped_root = root / "transient"
+                if session_id is not None:
+                    scoped_root = scoped_root / _safe_cache_component(session_id)
+                    if namespace_safe is not None:
+                        scoped_root = scoped_root / namespace_safe
+                root_scope_map.append((scoped_root, "transient"))
+            roots = [path for path, _ in root_scope_map]
+        else:
+            roots = [root]
+            root_scope_map = [(root, scope_norm)]
+    else:
+        stop_root = Path(_default_memmap_dir()).expanduser()
+        namespace_safe = _safe_cache_component(cache_namespace) if cache_namespace is not None else None
+        if scope_norm in {"all", "persistent"}:
+            root = stop_root / "persistent"
+            if namespace_safe is not None:
+                root = root / namespace_safe
+            root_scope_map.append((root, "persistent"))
+        if scope_norm in {"all", "transient"}:
+            root = stop_root / "transient"
+            if session_id is not None:
+                root = root / _safe_cache_component(session_id)
+                if namespace_safe is not None:
+                    root = root / namespace_safe
+            elif namespace_safe is not None:
+                # Namespace is nested one level deeper under session ids.
+                root = root
+            root_scope_map.append((root, "transient"))
+        roots = [root for root, _ in root_scope_map]
+
+    namespace_safe = _safe_cache_component(cache_namespace) if cache_namespace is not None else None
+    if not root_scope_map:
+        root_scope_map = [(root, scope_norm) for root in roots]
+
+    safe_key = None if key is None else _safe_cache_component(key)
+    safe_emb = None if embedding is None else _safe_cache_component(embedding)
+    matched: list[Path] = []
+    seen: set[str] = set()
+    for root, root_scope in root_scope_map:
+        if not root.exists():
+            continue
+        for suffix in _CACHE_FILE_SUFFIXES:
+            paths_iter = root.rglob(f"*{suffix}")
+            for path in paths_iter:
+                name = path.name
+                if safe_key is not None and not name.startswith(f"{safe_key}__"):
+                    continue
+                if safe_emb is not None and f"__{safe_emb}__" not in name:
+                    continue
+                if (
+                    namespace_safe is not None
+                    and root_scope == "transient"
+                    and session_id is None
+                    and namespace_safe not in path.parts
+                ):
+                    continue
+                resolved = str(path.resolve(strict=False))
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                matched.append(path)
+    matched.sort()
+    return matched, stop_root
+
+
+def _release_cache_disk_image(
+    cache: Optional[Dict[str, Any]],
+    *,
+    remove_file: bool = True,
+    verbose: bool = False,
+    strict: bool = False,
+) -> bool:
+    if not isinstance(cache, dict):
+        return False
+    img = cache.get("img", None)
+    if isinstance(img, np.memmap):
+        try:
+            mmap_obj = getattr(img, "_mmap", None)
+            if mmap_obj is not None:
+                mmap_obj.close()
+        except Exception:
+            if strict:
+                raise
+    img_path = cache.get("img_path", None)
+    if not img_path:
+        return False
+    _MEMMAP_CLEANUP_PATHS.discard(str(img_path))
+    if not remove_file:
+        return True
+    try:
+        if os.path.isdir(img_path):
+            shutil.rmtree(img_path, ignore_errors=True)
+        else:
+            os.remove(img_path)
+        cache_root = cache.get("cache_root", None)
+        if cache_root is not None:
+            _prune_empty_cache_dirs(Path(img_path).parent, stop_at=Path(cache_root))
+        if verbose:
+            print(f"[release_cached_memmap_file] removed={img_path}")
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        if strict:
+            raise
+        return False
 
 
 def _downsample_support_mask(mask: np.ndarray, new_h: int, new_w: int) -> np.ndarray:
@@ -112,6 +570,10 @@ def clear_memmap_cache(
     *,
     key: Optional[str] = None,
     embedding: Optional[str] = None,
+    cache_namespace: Optional[str] = None,
+    scope: str = "all",
+    session_id: Optional[str] = None,
+    remove_empty_dirs: bool = True,
     verbose: bool = False,
     strict: bool = False,
 ) -> int:
@@ -120,43 +582,292 @@ def clear_memmap_cache(
     Parameters
     ----------
     memmap_dir
-        Directory to clear. Defaults to the same resolution as cache generation
-        (env `SPIX_CACHE_DIR` → `~/.cache/spix` → `./.spix_cache`).
+        Cache root to clear. Defaults to the same root used by cache generation.
     key, embedding
         If provided, only delete files matching this key/embedding prefix.
+    cache_namespace
+        Optional persistent/transient namespace to target under the shared cache root.
+    scope
+        Which cache tree to clear: ``all``, ``persistent``, or ``transient``.
+    session_id
+        Optional transient session id filter.
 
     Returns
     -------
     int
         Number of deleted files.
     """
-    cache_dir_in = memmap_dir or _default_memmap_dir()
-    try:
-        cache_dir = str(Path(cache_dir_in).expanduser().resolve(strict=False))
-    except Exception:
-        cache_dir = str(cache_dir_in)
+    paths, stop_root = _iter_memmap_paths(
+        memmap_dir=memmap_dir,
+        key=key,
+        embedding=embedding,
+        cache_namespace=cache_namespace,
+        scope=scope,
+        session_id=session_id,
+    )
     if verbose:
-        print(f"[clear_memmap_cache] cache_dir={cache_dir!r}")
-    if key is None and embedding is None:
-        pattern = os.path.join(cache_dir, "*.dat")
-    else:
-        safe_key = "*" if key is None else "".join(c if (c.isalnum() or c in ("-", "_")) else "_" for c in str(key))
-        safe_emb = "*" if embedding is None else "".join(
-            c if (c.isalnum() or c in ("-", "_")) else "_" for c in str(embedding)
-        )
-        pattern = os.path.join(cache_dir, f"{safe_key}__{safe_emb}__*.dat")
-    paths = list(glob.glob(pattern))
-    if verbose:
-        print(f"[clear_memmap_cache] matched_files={len(paths)} pattern={pattern!r}")
+        roots_msg = memmap_dir or _default_memmap_dir()
+        print(f"[clear_memmap_cache] cache_root={roots_msg!r} matched_files={len(paths)}")
     deleted = 0
     for p in paths:
         try:
-            os.remove(p)
+            if Path(p).is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                os.remove(p)
             deleted += 1
+            _MEMMAP_CLEANUP_PATHS.discard(str(p))
+            if remove_empty_dirs:
+                _prune_empty_cache_dirs(Path(p).parent, stop_at=stop_root)
         except Exception:
             if strict:
                 raise
     return deleted
+
+
+def summarize_memmap_cache(
+    memmap_dir: Optional[str] = None,
+    *,
+    key: Optional[str] = None,
+    embedding: Optional[str] = None,
+    cache_namespace: Optional[str] = None,
+    scope: str = "all",
+    session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Summarize on-disk memmap files created by ``cache_embedding_image``."""
+    paths, stop_root = _iter_memmap_paths(
+        memmap_dir=memmap_dir,
+        key=key,
+        embedding=embedding,
+        cache_namespace=cache_namespace,
+        scope=scope,
+        session_id=session_id,
+    )
+    files: list[Dict[str, Any]] = []
+    total_bytes = 0
+    for path in paths:
+        try:
+            if path.is_dir():
+                size = 0
+                for child in path.rglob("*"):
+                    if child.is_file():
+                        try:
+                            size += int(child.stat().st_size)
+                        except Exception:
+                            continue
+            else:
+                size = int(path.stat().st_size)
+        except Exception:
+            size = 0
+        total_bytes += size
+        files.append(
+            {
+                "path": str(path.resolve(strict=False)),
+                "size_bytes": int(size),
+                "size_mb": float(size) / (1024.0 * 1024.0),
+            }
+        )
+    return {
+        "cache_root": str((Path(memmap_dir).expanduser() if memmap_dir is not None else stop_root).resolve(strict=False)),
+        "scope": str(scope),
+        "cache_namespace": None if cache_namespace is None else _safe_cache_component(cache_namespace),
+        "session_id": session_id,
+        "count": int(len(files)),
+        "total_bytes": int(total_bytes),
+        "total_mb": float(total_bytes) / (1024.0 * 1024.0),
+        "files": files,
+    }
+
+
+def release_cached_image(
+    adata,
+    key: str,
+    *,
+    remove_memmap_file: bool = False,
+    verbose: bool = False,
+    strict: bool = False,
+) -> bool:
+    """Remove a cached image entry from ``adata.uns`` and optionally delete its memmap file."""
+    if not hasattr(adata, "uns") or key not in adata.uns:
+        return False
+    cache = adata.uns.get(key)
+    if remove_memmap_file:
+        _release_cache_disk_image(cache, remove_file=True, verbose=verbose, strict=strict)
+    adata.uns.pop(key, None)
+    return True
+
+
+def _geometry_cache_bucket_summary(adata) -> Dict[str, int]:
+    if not hasattr(adata, "uns"):
+        return {"canvas_entries": 0, "fill_entries": 0}
+    canvas_key = getattr(_raster, "_PERSISTENT_RASTER_CANVAS_BUCKET_KEY", "_spix_raster_canvas_cache_v1")
+    fill_key = getattr(_raster, "_PERSISTENT_FILL_CACHE_BUCKET_KEY", "_spix_raster_fill_cache_v1")
+    canvas_bucket = adata.uns.get(canvas_key, None)
+    fill_bucket = adata.uns.get(fill_key, None)
+    return {
+        "canvas_entries": int(len(canvas_bucket)) if isinstance(canvas_bucket, dict) else 0,
+        "fill_entries": int(len(fill_bucket)) if isinstance(fill_bucket, dict) else 0,
+    }
+
+
+def _clear_geometry_cache_buckets(adata) -> Dict[str, int]:
+    removed = {"canvas_entries": 0, "fill_entries": 0}
+    if not hasattr(adata, "uns"):
+        return removed
+    canvas_key = getattr(_raster, "_PERSISTENT_RASTER_CANVAS_BUCKET_KEY", "_spix_raster_canvas_cache_v1")
+    fill_key = getattr(_raster, "_PERSISTENT_FILL_CACHE_BUCKET_KEY", "_spix_raster_fill_cache_v1")
+    canvas_bucket = adata.uns.pop(canvas_key, None)
+    fill_bucket = adata.uns.pop(fill_key, None)
+    if isinstance(canvas_bucket, dict):
+        removed["canvas_entries"] = int(len(canvas_bucket))
+    if isinstance(fill_bucket, dict):
+        removed["fill_entries"] = int(len(fill_bucket))
+    try:
+        raster_canvas_cache = getattr(_raster, "_RASTER_CANVAS_CACHE", None)
+        if raster_canvas_cache is not None:
+            raster_canvas_cache.clear()
+    except Exception:
+        pass
+    try:
+        fill_assignment_cache = getattr(_raster, "_FILL_ASSIGNMENT_CACHE", None)
+        if fill_assignment_cache is not None:
+            fill_assignment_cache.clear()
+    except Exception:
+        pass
+    return removed
+
+
+def summarize_current_cache(
+    adata,
+    *,
+    memmap_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Summarize persistent/transient memmap cache for the current dataset."""
+    namespace = _dataset_cache_namespace(adata)
+    persistent = summarize_memmap_cache(
+        memmap_dir=memmap_dir,
+        cache_namespace=namespace,
+        scope="persistent",
+    )
+    transient = summarize_memmap_cache(
+        memmap_dir=memmap_dir,
+        cache_namespace=namespace,
+        scope="transient",
+    )
+    transient_current_session = summarize_memmap_cache(
+        memmap_dir=memmap_dir,
+        cache_namespace=namespace,
+        scope="transient",
+        session_id=_CACHE_SESSION_ID,
+    )
+    return {
+        "cache_namespace": namespace,
+        "session_id": _CACHE_SESSION_ID,
+        "geometry_cache": _geometry_cache_bucket_summary(adata),
+        "persistent": persistent,
+        "transient": transient,
+        "transient_current_session": transient_current_session,
+        "total_bytes": int(persistent["total_bytes"]) + int(transient["total_bytes"]),
+        "total_mb": float(persistent["total_mb"]) + float(transient["total_mb"]),
+        "count": int(persistent["count"]) + int(transient["count"]),
+    }
+
+
+def clear_current_cache(
+    adata,
+    *,
+    memmap_dir: Optional[str] = None,
+    clear_persistent: bool = True,
+    clear_transient: bool = True,
+    clear_in_memory: bool = True,
+    verbose: bool = False,
+    strict: bool = False,
+) -> Dict[str, int]:
+    """Clear cache for the current dataset namespace.
+
+    This is the high-level cleanup entrypoint for most users.
+    """
+    namespace = _dataset_cache_namespace(adata)
+    removed_in_memory = 0
+    removed_geometry = {"canvas_entries": 0, "fill_entries": 0}
+    if clear_in_memory and hasattr(adata, "uns"):
+        for key in list(list_cached_images(adata)):
+            cache = adata.uns.get(key, {})
+            if isinstance(cache, dict) and cache.get("cache_namespace") == namespace:
+                if release_cached_image(adata, key, remove_memmap_file=True, verbose=verbose, strict=strict):
+                    removed_in_memory += 1
+        removed_geometry = _clear_geometry_cache_buckets(adata)
+
+    removed_persistent = 0
+    removed_transient = 0
+    if clear_persistent:
+        removed_persistent = clear_memmap_cache(
+            memmap_dir=memmap_dir,
+            cache_namespace=namespace,
+            scope="persistent",
+            verbose=verbose,
+            strict=strict,
+        )
+    if clear_transient:
+        removed_transient = clear_memmap_cache(
+            memmap_dir=memmap_dir,
+            cache_namespace=namespace,
+            scope="transient",
+            verbose=verbose,
+            strict=strict,
+        )
+    return {
+        "cache_namespace": namespace,
+        "removed_in_memory": int(removed_in_memory),
+        "removed_geometry_canvas_entries": int(removed_geometry["canvas_entries"]),
+        "removed_geometry_fill_entries": int(removed_geometry["fill_entries"]),
+        "removed_persistent_files": int(removed_persistent),
+        "removed_transient_files": int(removed_transient),
+        "removed_files": int(removed_persistent + removed_transient),
+    }
+
+
+def clear_temporary_cache(
+    adata=None,
+    *,
+    memmap_dir: Optional[str] = None,
+    session_id: Optional[str] = None,
+    include_other_sessions: bool = False,
+    verbose: bool = False,
+    strict: bool = False,
+) -> int:
+    """Clear transient cache files.
+
+    By default removes only the current process/session's transient cache files.
+    Pass ``adata`` to limit cleanup to the current dataset namespace as well.
+    Set ``include_other_sessions=True`` to remove transient cache files from
+    other notebooks/processes too.
+    """
+    namespace = _dataset_cache_namespace(adata) if adata is not None else None
+    effective_session_id = None if include_other_sessions else _safe_cache_component(session_id or _CACHE_SESSION_ID)
+    return clear_memmap_cache(
+        memmap_dir=memmap_dir,
+        cache_namespace=namespace,
+        scope="transient",
+        session_id=effective_session_id,
+        verbose=verbose,
+        strict=strict,
+    )
+
+
+def clear_all_cache(
+    *,
+    memmap_dir: Optional[str] = None,
+    verbose: bool = False,
+    strict: bool = False,
+) -> int:
+    """Clear every memmap cache file under the shared cache root."""
+    return clear_memmap_cache(
+        memmap_dir=memmap_dir,
+        scope="all",
+        verbose=verbose,
+        strict=strict,
+    )
 
 
 class _QuietCacheDict(dict):
@@ -212,6 +923,9 @@ def cache_embedding_image(
     implementation: str = "auto",  # 'auto'|'optimized'|'legacy'
     store: str = "auto",  # 'auto'|'memory'|'memmap'
     memmap_dir: Optional[str] = None,
+    cache_namespace: Optional[str] = None,
+    memmap_scope: str = "persistent",  # 'persistent'|'transient'
+    cache_storage: str = DEFAULT_CACHE_STORAGE,  # 'lossless_float32'|'uint16'|'float32_memmap'|'float32_zarr'
     memmap_threshold_mb: float = 512.0,
     memmap_prune: str = "none",  # 'none'|'key' (remove older shapes for same key+embedding)
     memmap_cleanup: str = "none",  # 'none'|'on_exit' (delete created file when Python exits)
@@ -255,8 +969,10 @@ def cache_embedding_image(
     runtime_fill_closing_radius: int = 1,
     runtime_fill_external_radius: int = 0,
     runtime_fill_holes: bool = True,
+    gap_collapse_axis: str | None = None,
+    gap_collapse_max_run_px: int = 1,
     soft_rasterization: bool = False,
-    resolve_center_collisions: bool = False,
+    resolve_center_collisions: bool | str = "auto",
     center_collision_radius: int = 2,
     **plot_kwargs,
 ) -> Dict[str, Any]:
@@ -337,6 +1053,8 @@ def cache_embedding_image(
             runtime_fill_closing_radius=runtime_fill_closing_radius,
             runtime_fill_external_radius=runtime_fill_external_radius,
             runtime_fill_holes=runtime_fill_holes,
+            gap_collapse_axis=gap_collapse_axis,
+            gap_collapse_max_run_px=gap_collapse_max_run_px,
             soft_rasterization=soft_rasterization,
             resolve_center_collisions=resolve_center_collisions,
             center_collision_radius=center_collision_radius,
@@ -348,6 +1066,10 @@ def cache_embedding_image(
     store = (store or "auto").lower()
     if store not in {"auto", "memory", "memmap"}:
         raise ValueError("store must be one of {'auto','memory','memmap'}.")
+    memmap_scope = (memmap_scope or "persistent").lower()
+    if memmap_scope not in _MEMMAP_SCOPE_DIRS:
+        raise ValueError("memmap_scope must be one of {'persistent','transient'}.")
+    cache_storage = _normalize_cache_storage(cache_storage)
     memmap_prune = (memmap_prune or "none").lower()
     if memmap_prune not in {"none", "key"}:
         raise ValueError("memmap_prune must be one of {'none','key'}.")
@@ -560,6 +1282,7 @@ def cache_embedding_image(
         n_points=int(n_points_eff),
         logger=None,
         context="cache_embedding_image",
+        persistent_store=getattr(adata, "uns", None),
     )
     figsize = raster_canvas["figsize"]
     fig_dpi = raster_canvas["fig_dpi"]
@@ -588,32 +1311,70 @@ def cache_embedding_image(
         print(f"Rasterizing → image size (h, w, C)=({h}, {w}, {dims}) | tile_px={s}")
 
     est_mb = (float(h) * float(w) * float(dims) * 4.0) / (1024.0 * 1024.0)
-    use_memmap = store == "memmap" or (store == "auto" and est_mb >= float(memmap_threshold_mb))
+    use_disk_cache = store == "memmap" or (store == "auto" and est_mb >= float(memmap_threshold_mb))
     img_path: Optional[str] = None
+    work_img_path: Optional[str] = None
     cache_dir_resolved: Optional[str] = None
-    if use_memmap:
-        cache_dir = memmap_dir or _default_memmap_dir()
+    cache_root_resolved: Optional[str] = None
+    cache_namespace_resolved: Optional[str] = None
+    cache_session_id: Optional[str] = None
+    if use_disk_cache:
+        cache_dir, cache_namespace_resolved, memmap_scope, cache_session_id = _resolve_memmap_cache_dir(
+            adata,
+            memmap_dir=memmap_dir,
+            cache_namespace=cache_namespace,
+            memmap_scope=memmap_scope,
+        )
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
         cache_dir_resolved = cache_dir
-        safe_key = "".join(c if (c.isalnum() or c in ("-", "_")) else "_" for c in str(key))
-        safe_emb = "".join(c if (c.isalnum() or c in ("-", "_")) else "_" for c in str(embedding))
+        if memmap_dir is not None:
+            cache_root_resolved = str(Path(memmap_dir).expanduser().resolve(strict=False))
+        else:
+            cache_root_resolved = str(Path(_default_memmap_dir()).expanduser().resolve(strict=False))
+        safe_key = _safe_cache_component(key)
+        safe_emb = _safe_cache_component(embedding)
+        if downsample_factor and downsample_factor > 1.0:
+            factor = int(downsample_factor)
+            final_h = max(1, h // factor)
+            final_w = max(1, w // factor)
+        else:
+            final_h, final_w = h, w
+        img_path = _cache_disk_path(cache_dir, key, embedding, (final_h, final_w, dims), cache_storage)
+        if cache_storage == "float32_memmap":
+            work_img_path = img_path
+        else:
+            work_img_path = os.path.join(cache_dir, f"{safe_key}__{safe_emb}__{h}x{w}x{dims}.tmp.dat")
         if memmap_prune == "key":
             prefix = os.path.join(cache_dir, f"{safe_key}__{safe_emb}__")
-            for old in glob.glob(prefix + "*.dat"):
+            for old in glob.glob(prefix + "*"):
                 try:
-                    os.remove(old)
+                    if os.path.isdir(old):
+                        shutil.rmtree(old, ignore_errors=True)
+                    else:
+                        os.remove(old)
                 except Exception:
                     pass
-        img_path = os.path.join(cache_dir, f"{safe_key}__{safe_emb}__{h}x{w}x{dims}.dat")
-        img = np.memmap(img_path, dtype=np.float32, mode="w+", shape=(h, w, dims))
+        if work_img_path != img_path and os.path.exists(work_img_path):
+            try:
+                os.remove(work_img_path)
+            except Exception:
+                pass
+        img = np.memmap(work_img_path, dtype=np.float32, mode="w+", shape=(h, w, dims))
         img.fill(1.0)
         if verbose:
-            print(f"[cache_embedding_image] Using memmap image at: {img_path} (~{est_mb:.1f} MB)")
-        if memmap_cleanup == "on_exit" and img_path is not None:
-            _MEMMAP_CLEANUP_PATHS.add(img_path)
+            print(
+                f"[cache_embedding_image] Using disk-backed raster buffer at: {work_img_path} "
+                f"(final={img_path}, storage={cache_storage}, ~{est_mb:.1f} MB raw)"
+            )
+        if memmap_cleanup == "on_exit":
+            if img_path is not None:
+                _MEMMAP_CLEANUP_PATHS.add(img_path)
+            if work_img_path is not None:
+                _MEMMAP_CLEANUP_PATHS.add(work_img_path)
     else:
         img = np.ones((h, w, dims), dtype=np.float32)
     paint_mask = np.zeros((h, w), dtype=bool)
+    t_init = time.perf_counter() if verbose else None
 
     # Precompute pixel offsets for square/circle tiles (relative to center)
     dx, dy = _raster.tile_pixel_offsets(int(s), pixel_shape=pixel_shape)
@@ -647,18 +1408,77 @@ def cache_embedding_image(
             h=int(h),
         )
     collision_info = None
-    if resolve_center_collisions and not soft_enabled:
+    apply_collision_resolve, collision_stats, _ = _raster.should_resolve_center_collisions(
+        resolve_center_collisions,
+        cx=cx_seed,
+        cy=cy_seed,
+        w=int(w),
+        h=int(h),
+        tile_px=int(s),
+        pixel_perfect=bool(pixel_perfect),
+        soft_enabled=bool(soft_enabled),
+        logger=None,
+        context="cache_embedding_image",
+    )
+    if apply_collision_resolve:
+        collision_radius_eff = _raster.resolve_collision_search_radius(
+            resolve_center_collisions,
+            base_radius=int(center_collision_radius),
+            collision_stats=collision_stats,
+            logger=None,
+            context="cache_embedding_image",
+        )
         cx_seed, cy_seed, collision_info = _raster.resolve_center_collisions(
             cx_seed,
             cy_seed,
             w=int(w),
             h=int(h),
-            max_radius=int(center_collision_radius),
+            max_radius=int(collision_radius_eff),
             logger=None,
             context="cache_embedding_image",
         )
-    elif resolve_center_collisions and soft_enabled and verbose:
-        print("[cache_embedding_image] Ignoring resolve_center_collisions because soft_rasterization=True.")
+    elif collision_stats is not None:
+        collision_info = {
+            "applied": False,
+            "enabled": _raster.normalize_collision_mode(resolve_center_collisions) != "never",
+            "search_radius": int(max(0, center_collision_radius)),
+            "n_tiles": int(collision_stats["n_tiles"]),
+            "n_unique_centers_before": int(collision_stats["n_unique_centers"]),
+            "n_unique_centers_after": int(collision_stats["n_unique_centers"]),
+            "collision_fraction_before": float(collision_stats["collision_fraction"]),
+            "collision_fraction_after": float(collision_stats["collision_fraction"]),
+            "n_collided_tiles_before": int(collision_stats["n_collided_tiles"]),
+            "n_collided_tiles_after": int(collision_stats["n_collided_tiles"]),
+            "n_reassigned_tiles": 0,
+            "max_stack_before": int(collision_stats["max_stack"]),
+            "max_stack_after": int(collision_stats["max_stack"]),
+            "unresolved_tiles": int(collision_stats["n_collided_tiles"]),
+        }
+    gap_collapse_axis_norm = _normalize_gap_collapse_axis_safe(gap_collapse_axis)
+    gap_collapse_active = bool(
+        gap_collapse_axis_norm is not None and int(max(0, int(gap_collapse_max_run_px))) > 0
+    )
+    if gap_collapse_active and soft_enabled:
+        soft_enabled = False
+        soft_fx_seed = None
+        soft_fy_seed = None
+    if gap_collapse_active:
+        cx_seed, cy_seed, w, h, gap_collapse_info = _raster.collapse_empty_center_gaps(
+            cx=cx_seed,
+            cy=cy_seed,
+            w=int(w),
+            h=int(h),
+            axis=gap_collapse_axis_norm,
+            max_gap_run_px=int(gap_collapse_max_run_px),
+            logger=None,
+            context="cache_embedding_image",
+        )
+    else:
+        gap_collapse_info = {
+            "applied": False,
+            "axis": gap_collapse_axis_norm,
+            "max_gap_run_px": int(max(0, int(gap_collapse_max_run_px))),
+        }
     t_centers = time.perf_counter() if verbose else None
 
     # Optional depth ordering similar to image_plot (alpha-driven)
@@ -754,6 +1574,8 @@ def cache_embedding_image(
             closing_radius=int(fill_radius),
             external_radius=int(external_radius),
             fill_holes=bool(runtime_fill_holes),
+            use_observed_pixels=bool(int(s) == 1),
+            persistent_store=getattr(adata, "uns", None),
             logger=None,
             context="cache_embedding_image",
         )
@@ -842,7 +1664,7 @@ def cache_embedding_image(
             w=int(w),
             h=int(h),
         )
-    elif downsample_factor and downsample_factor > 1.0 and resolve_center_collisions:
+    elif downsample_factor and downsample_factor > 1.0 and collision_info is not None and bool(collision_info.get("applied", False)):
         factor = int(max(1, round(float(downsample_factor))))
         cx = np.clip((cx_seed // factor).astype(np.int32, copy=False), 0, max(0, w - 1))
         cy = np.clip((cy_seed // factor).astype(np.int32, copy=False), 0, max(0, h - 1))
@@ -917,8 +1739,13 @@ def cache_embedding_image(
         "segment_key": seg_col,
         "segment_key_requested": segment_key,
         "store": store,
-        "memmap": bool(use_memmap),
+        "memmap": bool(use_disk_cache and cache_storage == "float32_memmap"),
         "memmap_dir": cache_dir_resolved,
+        "cache_root": cache_root_resolved,
+        "cache_namespace": cache_namespace_resolved,
+        "cache_scope": memmap_scope if use_disk_cache else None,
+        "cache_session_id": cache_session_id,
+        "cache_storage": cache_storage if use_disk_cache else "memory",
         "img_path": img_path,
         # provenance
         "created_by": "cache_embedding_image",
@@ -980,12 +1807,15 @@ def cache_embedding_image(
             "runtime_fill_closing_radius": int(max(0, int(runtime_fill_closing_radius))),
             "runtime_fill_external_radius": int(max(0, int(runtime_fill_external_radius))),
             "runtime_fill_holes": bool(runtime_fill_holes),
+            "gap_collapse_axis": gap_collapse_axis_norm,
+            "gap_collapse_max_run_px": int(max(0, int(gap_collapse_max_run_px))),
             "soft_rasterization": bool(soft_enabled),
-            "resolve_center_collisions": bool(resolve_center_collisions),
+            "resolve_center_collisions": _raster.normalize_collision_mode(resolve_center_collisions),
             "center_collision_radius": int(center_collision_radius),
             **plot_kwargs,
         },
         "runtime_fill": runtime_fill_info,
+        "gap_collapse": dict(gap_collapse_info),
     }
 
     # Optional: build preview RGB with boundary overlay
@@ -1031,9 +1861,37 @@ def cache_embedding_image(
             out[..., c] = np.where(hmask, a * high_col[c] + (1 - a) * out[..., c], out[..., c])
         cache["img_preview"] = np.clip(out, 0.0, 1.0).astype(np.float32)
         cache["label_img"] = label_img.astype(np.int32)
+    t_postprocess = time.perf_counter() if verbose else None
+
+    if use_disk_cache:
+        if isinstance(img, np.memmap):
+            try:
+                img.flush()
+            except Exception:
+                pass
+        if cache_storage == "float32_memmap":
+            cache["img"] = img
+        else:
+            _write_cache_image_to_disk(img, img_path, cache_storage)
+            if isinstance(img, np.memmap):
+                try:
+                    mmap_obj = getattr(img, "_mmap", None)
+                    if mmap_obj is not None:
+                        mmap_obj.close()
+                except Exception:
+                    pass
+            if work_img_path is not None and work_img_path != img_path:
+                try:
+                    os.remove(work_img_path)
+                except Exception:
+                    pass
+                _MEMMAP_CLEANUP_PATHS.discard(str(work_img_path))
+            cache["img"] = None
+    t_disk_write = time.perf_counter() if verbose else None
 
     adata.uns[key] = cache
-    if verbose and all(v is not None for v in [t_total0, t_coords, t_coordmode, t_embed, t_canvas, t_scale, t_centers, t_raster, t_fill, t_downsample]):
+    t_finalize = time.perf_counter() if verbose else None
+    if verbose and all(v is not None for v in [t_total0, t_coords, t_coordmode, t_embed, t_canvas, t_scale, t_init, t_centers, t_raster, t_fill, t_downsample, t_postprocess, t_disk_write, t_finalize]):
         print(
             "[perf] cache_embedding_image detail: "
             f"coords={t_coords - t_total0:.3f}s | "
@@ -1041,11 +1899,15 @@ def cache_embedding_image(
             f"embedding_slice={t_embed - t_coordmode:.3f}s | "
             f"canvas={t_canvas - t_embed:.3f}s | "
             f"scale={t_scale - t_canvas:.3f}s | "
-            f"centers={t_centers - t_scale:.3f}s | "
+            f"init={t_init - t_scale:.3f}s | "
+            f"centers={t_centers - t_init:.3f}s | "
             f"rasterize={t_raster - t_centers:.3f}s | "
             f"fill={t_fill - t_raster:.3f}s | "
             f"downsample={t_downsample - t_fill:.3f}s | "
-            f"total={t_downsample - t_total0:.3f}s"
+            f"postprocess={t_postprocess - t_downsample:.3f}s | "
+            f"disk_write={t_disk_write - t_postprocess:.3f}s | "
+            f"finalize={t_finalize - t_disk_write:.3f}s | "
+            f"total={t_finalize - t_total0:.3f}s"
         )
     if show:
         try:
@@ -1113,6 +1975,8 @@ def _cache_embedding_image_legacy(
     runtime_fill_closing_radius: int,
     runtime_fill_external_radius: int,
     runtime_fill_holes: bool,
+    gap_collapse_axis: str | None,
+    gap_collapse_max_run_px: int,
     soft_rasterization: bool,
     resolve_center_collisions: bool,
     center_collision_radius: int,
@@ -1273,6 +2137,7 @@ def _cache_embedding_image_legacy(
         n_points=int(n_points_eff),
         logger=None,
         context="cache_embedding_image(legacy)",
+        persistent_store=getattr(adata, "uns", None),
     )
     figsize = raster_canvas["figsize"]
     fig_dpi = raster_canvas["fig_dpi"]
@@ -1331,18 +2196,77 @@ def _cache_embedding_image_legacy(
             h=int(h),
         )
     collision_info = None
-    if resolve_center_collisions and not soft_enabled:
+    apply_collision_resolve, collision_stats, _ = _raster.should_resolve_center_collisions(
+        resolve_center_collisions,
+        cx=cx_seed,
+        cy=cy_seed,
+        w=int(w),
+        h=int(h),
+        tile_px=int(s),
+        pixel_perfect=bool(pixel_perfect),
+        soft_enabled=bool(soft_enabled),
+        logger=None,
+        context="cache_embedding_image(legacy)",
+    )
+    if apply_collision_resolve:
+        collision_radius_eff = _raster.resolve_collision_search_radius(
+            resolve_center_collisions,
+            base_radius=int(center_collision_radius),
+            collision_stats=collision_stats,
+            logger=None,
+            context="cache_embedding_image(legacy)",
+        )
         cx_seed, cy_seed, collision_info = _raster.resolve_center_collisions(
             cx_seed,
             cy_seed,
             w=int(w),
             h=int(h),
-            max_radius=int(center_collision_radius),
+            max_radius=int(collision_radius_eff),
             logger=None,
             context="cache_embedding_image(legacy)",
         )
-    elif resolve_center_collisions and soft_enabled and verbose:
-        print("[cache_embedding_image] Ignoring resolve_center_collisions because soft_rasterization=True (legacy).")
+    elif collision_stats is not None:
+        collision_info = {
+            "applied": False,
+            "enabled": _raster.normalize_collision_mode(resolve_center_collisions) != "never",
+            "search_radius": int(max(0, center_collision_radius)),
+            "n_tiles": int(collision_stats["n_tiles"]),
+            "n_unique_centers_before": int(collision_stats["n_unique_centers"]),
+            "n_unique_centers_after": int(collision_stats["n_unique_centers"]),
+            "collision_fraction_before": float(collision_stats["collision_fraction"]),
+            "collision_fraction_after": float(collision_stats["collision_fraction"]),
+            "n_collided_tiles_before": int(collision_stats["n_collided_tiles"]),
+            "n_collided_tiles_after": int(collision_stats["n_collided_tiles"]),
+            "n_reassigned_tiles": 0,
+            "max_stack_before": int(collision_stats["max_stack"]),
+            "max_stack_after": int(collision_stats["max_stack"]),
+            "unresolved_tiles": int(collision_stats["n_collided_tiles"]),
+        }
+    gap_collapse_axis_norm = _normalize_gap_collapse_axis_safe(gap_collapse_axis)
+    gap_collapse_active = bool(
+        gap_collapse_axis_norm is not None and int(max(0, int(gap_collapse_max_run_px))) > 0
+    )
+    if gap_collapse_active and soft_enabled:
+        soft_enabled = False
+        soft_fx_seed = None
+        soft_fy_seed = None
+    if gap_collapse_active:
+        cx_seed, cy_seed, w, h, gap_collapse_info = _raster.collapse_empty_center_gaps(
+            cx=cx_seed,
+            cy=cy_seed,
+            w=int(w),
+            h=int(h),
+            axis=gap_collapse_axis_norm,
+            max_gap_run_px=int(gap_collapse_max_run_px),
+            logger=None,
+            context="cache_embedding_image(legacy)",
+        )
+    else:
+        gap_collapse_info = {
+            "applied": False,
+            "axis": gap_collapse_axis_norm,
+            "max_gap_run_px": int(max(0, int(gap_collapse_max_run_px))),
+        }
 
     def _compute_alpha_from_values(values, arange=(0.1, 1.0), clip=None, invert=False):
         v = np.asarray(values, dtype=float)
@@ -1424,6 +2348,8 @@ def _cache_embedding_image_legacy(
             closing_radius=int(fill_radius),
             external_radius=int(external_radius),
             fill_holes=bool(runtime_fill_holes),
+            use_observed_pixels=bool(int(s) == 1),
+            persistent_store=getattr(adata, "uns", None),
             logger=None,
             context="cache_embedding_image(legacy)",
         )
@@ -1502,7 +2428,7 @@ def _cache_embedding_image_legacy(
             w=int(w),
             h=int(h),
         )
-    elif downsample_factor and downsample_factor > 1.0 and resolve_center_collisions:
+    elif downsample_factor and downsample_factor > 1.0 and collision_info is not None and bool(collision_info.get("applied", False)):
         factor = int(max(1, round(float(downsample_factor))))
         cx = np.clip((cx_seed // factor).astype(np.int32, copy=False), 0, max(0, w - 1))
         cy = np.clip((cy_seed // factor).astype(np.int32, copy=False), 0, max(0, h - 1))
@@ -1628,12 +2554,15 @@ def _cache_embedding_image_legacy(
             "runtime_fill_closing_radius": int(max(0, int(runtime_fill_closing_radius))),
             "runtime_fill_external_radius": int(max(0, int(runtime_fill_external_radius))),
             "runtime_fill_holes": bool(runtime_fill_holes),
+            "gap_collapse_axis": gap_collapse_axis_norm,
+            "gap_collapse_max_run_px": int(max(0, int(gap_collapse_max_run_px))),
             "soft_rasterization": bool(soft_enabled),
-            "resolve_center_collisions": bool(resolve_center_collisions),
+            "resolve_center_collisions": _raster.normalize_collision_mode(resolve_center_collisions),
             "center_collision_radius": int(center_collision_radius),
             **plot_kwargs,
         },
         "runtime_fill": runtime_fill_info,
+        "gap_collapse": dict(gap_collapse_info),
     }
 
     if plot_boundaries and label_img is not None and boundary_method == "pixel":
@@ -1825,6 +2754,8 @@ def rebuild_cached_image_from_obsm(
             closing_radius=int(fill_radius),
             external_radius=int(external_radius),
             fill_holes=bool(plot_params.get("runtime_fill_holes", runtime_fill_cfg.get("fill_holes", True))),
+            use_observed_pixels=bool(int(s) == 1),
+            persistent_store=getattr(adata, "uns", None),
             logger=None,
             context="rebuild_cached_image_from_obsm",
         )
@@ -1834,15 +2765,27 @@ def rebuild_cached_image_from_obsm(
     out_cache["embedding_key"] = emb_key
     out_cache["dimensions"] = list(dims)
     out_cache["total_pixels"] = int(h * w)
-    out_cache.setdefault("history", []).append({
+    history = out_cache.get("history", [])
+    if isinstance(history, np.ndarray):
+        history = history.tolist()
+    if not isinstance(history, list):
+        history = [history]
+    history.append({
         "op": "rebuild_image",
         "embedding": emb_key,
         "dims": list(dims),
     })
+    out_cache["history"] = history
     out_plot_params = dict(out_cache.get("image_plot_params", {}) or {})
     out_plot_params["brighten_applied"] = bool(brighten_applied)
     out_cache["image_plot_params"] = out_plot_params
     out_cache.pop("img_preview", None)
+    img_path = out_cache.get("img_path", None)
+    cache_storage = out_cache.get("cache_storage", "memory")
+    if img_path and cache_storage != "memory":
+        _write_cache_image_to_disk(img, img_path, str(cache_storage))
+        if str(cache_storage) != "float32_memmap":
+            out_cache["img"] = None
 
     if not in_place and out_key:
         adata.uns[out_key] = out_cache
@@ -1925,7 +2868,10 @@ def list_cached_images(adata) -> List[str]:
         return keys
     for k, v in adata.uns.items():
         try:
-            if isinstance(v, dict) and "img" in v and isinstance(v["img"], np.ndarray) and v["img"].ndim == 3:
+            if isinstance(v, dict) and (
+                (isinstance(v.get("img", None), np.ndarray) and v["img"].ndim == 3)
+                or (v.get("img_path", None) is not None and int(v.get("channels", 0)) > 0)
+            ):
                 keys.append(k)
         except Exception:
             continue
@@ -1940,16 +2886,14 @@ def summarize_cached_overlap(
     if key not in adata.uns:
         raise KeyError(f"No cached image under adata.uns['{key}']")
     cache = adata.uns[key]
-    img = np.asarray(cache.get("img"))
-    if img.ndim != 3:
-        raise ValueError("Cached object does not contain a 3D image array.")
+    img_shape = get_cached_image_shape(cache)
     support_mask = np.asarray(cache.get("support_mask"), dtype=bool)
     cx = np.asarray(cache.get("cx"), dtype=np.int32).ravel()
     cy = np.asarray(cache.get("cy"), dtype=np.int32).ravel()
     n_tiles = int(min(cx.size, cy.size))
     if n_tiles <= 0:
         raise ValueError("Cached image does not contain cx/cy tile centers.")
-    flat = cy.astype(np.int64, copy=False) * np.int64(max(1, img.shape[1])) + cx.astype(np.int64, copy=False)
+    flat = cy.astype(np.int64, copy=False) * np.int64(max(1, img_shape[1])) + cx.astype(np.int64, copy=False)
     unique, counts = np.unique(flat, return_counts=True)
     unique_centers = int(unique.size)
     collided_tiles = int(n_tiles - unique_centers)
@@ -1957,7 +2901,7 @@ def summarize_cached_overlap(
     canvas_pixels = int(support_mask.size)
     out = {
         "key": str(key),
-        "shape": tuple(int(x) for x in img.shape),
+        "shape": tuple(int(x) for x in img_shape),
         "n_tiles": int(n_tiles),
         "unique_centers": int(unique_centers),
         "collided_tiles": int(collided_tiles),
@@ -1997,11 +2941,14 @@ def show_cached_image(
     if key not in adata.uns:
         raise KeyError(f"No cached image under adata.uns['{key}']")
     cache = adata.uns[key]
-    # Prefer preview with boundaries if available
-    if prefer_preview and ("img_preview" in cache):
+    use_preview = bool(prefer_preview and ("img_preview" in cache) and channels is None)
+    # Prefer preview with boundaries if available only for default RGB display.
+    if use_preview:
         img = np.asarray(cache.get("img_preview"))
+        display_channels = None
     else:
-        img = np.asarray(cache.get("img"))
+        img = np.asarray(get_cached_image_channels(cache, channels=channels))
+        display_channels = None if channels is not None else channels
     if img.ndim != 3:
         raise ValueError("Cached object does not contain a 3D image array.")
 
@@ -2027,10 +2974,10 @@ def show_cached_image(
     already_applied = bool(plot_params.get("brighten_applied", False)) and cache_channels == 3
 
     plt.figure(figsize=figsize, dpi=fig_dpi)
-    if img.shape[2] == 1 and cmap is not None and channels is None:
+    if img.shape[2] == 1 and cmap is not None and display_channels is None:
         plt.imshow(img[:, :, 0], origin="lower", cmap=cmap, interpolation="nearest")
     else:
-        rgb = _prepare_display_image(img, channels=channels)
+        rgb = _prepare_display_image(img, channels=display_channels)
         if apply_brighten and not already_applied:
             rgb = _apply_brighten_continuous_rgb(rgb, gamma)
         plt.imshow(rgb, origin="lower", interpolation="nearest")
@@ -2042,7 +2989,7 @@ def show_cached_image(
         if channels is not None and len(channels) > 0:
             used_ch = list(channels)
         else:
-            c = img.shape[2]
+            c = cache_channels
             if c >= 3:
                 used_ch = [0, 1, 2]
             elif c == 2:
@@ -2052,7 +2999,7 @@ def show_cached_image(
         raster_dpi = cache.get("raster_dpi", cache.get("effective_dpi", None))
         total_px = cache.get("total_pixels", img.shape[0] * img.shape[1])
         title = (
-            f"{key} | {img.shape[1]}x{img.shape[0]} C={img.shape[2]} "
+            f"{key} | {img.shape[1]}x{img.shape[0]} C={cache_channels} "
             f"| emb={emb} "
             f"| ch=[{','.join(map(str,used_ch))}] "
             f"| dpi={raster_dpi} | px={total_px}"
@@ -2096,10 +3043,13 @@ def show_all_cached_images(
         r, c = divmod(i, cols)
         ax = axes[r, c]
         cache = adata.uns[k]
-        if prefer_preview and ("img_preview" in cache):
+        use_preview = bool(prefer_preview and ("img_preview" in cache) and channels is None)
+        if use_preview:
             img = np.asarray(cache.get("img_preview"))
+            display_channels = None
         else:
-            img = np.asarray(cache.get("img"))
+            img = np.asarray(get_cached_image_channels(cache, channels=channels))
+            display_channels = None if channels is not None else channels
         if img.ndim != 3:
             ax.set_visible(False)
             continue
@@ -2116,10 +3066,10 @@ def show_all_cached_images(
         )
         cache_channels = int(cache.get("channels", img.shape[2]))
         already_applied = bool(plot_params.get("brighten_applied", False)) and cache_channels == 3
-        if img.shape[2] == 1 and cmap is not None and channels is None:
+        if img.shape[2] == 1 and cmap is not None and display_channels is None:
             ax.imshow(img[:, :, 0], origin="lower", cmap=cmap, interpolation="nearest")
         else:
-            rgb = _prepare_display_image(img, channels=channels)
+            rgb = _prepare_display_image(img, channels=display_channels)
             if apply_brighten and not already_applied:
                 rgb = _apply_brighten_continuous_rgb(rgb, gamma)
             ax.imshow(rgb, origin="lower", interpolation="nearest")
@@ -2127,9 +3077,10 @@ def show_all_cached_images(
         dims = cache.get("dimensions", [])
         raster_dpi = cache.get("raster_dpi", cache.get("effective_dpi", None))
         total_px = cache.get("total_pixels", img.shape[0] * img.shape[1])
+        cache_channels = int(cache.get("channels", img.shape[2]))
         tile_fs = _auto_title_fontsize_from_figsize((fig_w / cols, fig_h / rows))
         ax.set_title(
-            f"{k}\n{img.shape[1]}x{img.shape[0]} C={img.shape[2]} | emb={emb} | dpi={raster_dpi} | px={total_px}",
+            f"{k}\n{img.shape[1]}x{img.shape[0]} C={cache_channels} | emb={emb} | dpi={raster_dpi} | px={total_px}",
             fontsize=tile_fs,
         )
         ax.axis("off")

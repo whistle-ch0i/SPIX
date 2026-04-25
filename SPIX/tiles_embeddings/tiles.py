@@ -1014,20 +1014,27 @@ def generate_tiles(
         if verbose:
             logging.info("Tiles have been stored in adata.uns['tiles'] (coords mode).")
         # Subset adata based on tiles (robust to dtype mismatches)
-        filtered_barcodes = tiles["barcode"].unique()
         initial_obs = adata.n_obs
         try:
-            # Compare as strings to avoid label/positional ambiguity when obs_names are ints
-            obs_names_str = adata.obs_names.astype(str)
-            keep_mask = obs_names_str.isin(pd.Index(filtered_barcodes).astype(str))
-            if keep_mask.size == initial_obs and bool(np.all(keep_mask)):
+            # Fast path: if index identity/order is unchanged, skip the expensive
+            # barcode membership pass over all observations.
+            if len(tiles) == initial_obs and tiles.index.equals(adata.obs.index):
                 # Nothing was filtered; avoid an expensive full AnnData copy.
                 if verbose:
                     logging.info("No observations were filtered in coords mode; skipping adata subsetting copy.")
             else:
-                adata = adata[keep_mask, :].copy()
+                filtered_barcodes = tiles["barcode"].unique()
+                # Compare as strings to avoid label/positional ambiguity when obs_names are ints
+                obs_names_str = adata.obs_names.astype(str)
+                keep_mask = obs_names_str.isin(pd.Index(filtered_barcodes).astype(str))
+                if keep_mask.size == initial_obs and bool(np.all(keep_mask)):
+                    if verbose:
+                        logging.info("No observations were filtered in coords mode; skipping adata subsetting copy.")
+                else:
+                    adata = adata[keep_mask, :].copy()
         except Exception:
             # Fallback to label-based selection; may raise if types differ
+            filtered_barcodes = tiles["barcode"].unique()
             adata = adata[filtered_barcodes, :].copy()
         final_obs = adata.n_obs
         if verbose:

@@ -7,7 +7,6 @@ try:
     from sklearn.decomposition import MiniBatchNMF  # sklearn >= 1.1
 except Exception:  # pragma: no cover - optional
     MiniBatchNMF = None
-from sklearn.preprocessing import MinMaxScaler
 from concurrent.futures import ProcessPoolExecutor
 import logging
 from contextlib import contextmanager
@@ -21,6 +20,7 @@ import hashlib
 import scipy
 from scipy.sparse import csr_matrix
 from typing import Optional
+from types import SimpleNamespace
 
 try:
     from threadpoolctl import threadpool_limits, threadpool_info
@@ -76,6 +76,7 @@ def _thread_cap_enabled() -> bool:
 
 
 _LOG_NORM_CACHE_KEY = "_spix_log_norm_cache"
+_LAPACK_INT32_MAX = np.iinfo(np.int32).max
 
 
 def _var_names_signature(var_names: pd.Index) -> str:
@@ -83,6 +84,343 @@ def _var_names_signature(var_names: pd.Index) -> str:
     values = pd.Index(var_names).astype(str).to_numpy(dtype=str, copy=False)
     joined = "\x1f".join(values.tolist())
     return hashlib.sha1(joined.encode("utf-8")).hexdigest()
+
+
+def _minmax_scale_dense(X: np.ndarray) -> np.ndarray:
+    """Min-max scale a dense array in-place when possible."""
+    arr = np.asarray(X, dtype=np.float32)
+    if not arr.flags.writeable:
+        arr = np.array(arr, dtype=np.float32, copy=True)
+    mins = np.min(arr, axis=0, keepdims=True)
+    maxs = np.max(arr, axis=0, keepdims=True)
+    denom = maxs - mins
+    denom[denom == 0] = 1.0
+    arr -= mins
+    arr /= denom
+    return arr
+
+
+def _sparse_pca_lapack_overflow_risk(adata: AnnData, n_comps: int) -> bool:
+    """
+    Detect sparse PCA shapes that can overflow LP64 LAPACK indexing in SciPy's
+    ARPACK-backed centered PCA path.
+    """
+    if not scipy.sparse.issparse(adata.X):
+        return False
+    try:
+        k = int(n_comps)
+    except Exception:
+        return False
+    if k <= 0:
+        return False
+    largest_dim = max(int(adata.n_obs), int(adata.n_vars))
+    return largest_dim * k > _LAPACK_INT32_MAX
+
+
+def _supports_centered_covariance_pca(
+    adata_proc: AnnData,
+    n_comps: int,
+    max_vars: int,
+) -> bool:
+    """Whether exact centered covariance PCA is a practical sparse fallback."""
+    return (
+        scipy.sparse.issparse(adata_proc.X)
+        and int(adata_proc.n_obs) > 1
+        and int(adata_proc.n_vars) > 1
+        and 0 < int(n_comps) < int(adata_proc.n_vars)
+        and int(adata_proc.n_vars) <= max(1, int(max_vars))
+    )
+
+
+def _resolve_sparse_pca_strategy(
+    adata_proc: AnnData,
+    n_comps: int,
+    sparse_strategy: str,
+    centered_covariance_max_vars: int,
+) -> str:
+    """
+    Resolve sparse PCA execution mode.
+
+    Modes:
+    - 'auto': use Scanpy by default; switch to exact centered covariance PCA when
+      the ARPACK/LAPACK sparse path would overflow and the feature count is small
+      enough; otherwise fall back to uncentered randomized SVD.
+    - 'scanpy': always use Scanpy defaults.
+    - 'uncentered': force zero_center=False randomized SVD.
+    - 'centered_covariance': force exact centered covariance/eigendecomposition.
+    """
+    strategy = str(sparse_strategy or "auto").strip().lower()
+    valid = {"auto", "scanpy", "uncentered", "centered_covariance"}
+    if strategy not in valid:
+        raise ValueError(
+            f"Unrecognized pca_sparse_strategy={sparse_strategy!r}. Expected one of {sorted(valid)}."
+        )
+    if not scipy.sparse.issparse(adata_proc.X):
+        return "scanpy"
+    if strategy != "auto":
+        if strategy == "centered_covariance" and not _supports_centered_covariance_pca(
+            adata_proc,
+            n_comps=n_comps,
+            max_vars=centered_covariance_max_vars,
+        ):
+            raise ValueError(
+                "pca_sparse_strategy='centered_covariance' requires sparse input with "
+                f"1 < n_comps < n_vars <= {centered_covariance_max_vars}."
+            )
+        return strategy
+    if _sparse_pca_lapack_overflow_risk(adata_proc, n_comps):
+        if _supports_centered_covariance_pca(
+            adata_proc,
+            n_comps=n_comps,
+            max_vars=centered_covariance_max_vars,
+        ):
+            return "centered_covariance"
+        return "uncentered"
+    return "scanpy"
+
+
+def _score_dense_from_sparse_components(
+    X: scipy.sparse.spmatrix,
+    components_t: np.ndarray,
+    mean_projection: np.ndarray,
+    chunk_rows: int = 200_000,
+) -> np.ndarray:
+    """Project sparse rows onto dense components in chunks to avoid large temporaries."""
+    n_obs = int(X.shape[0])
+    n_comps = int(components_t.shape[1])
+    scores = np.empty((n_obs, n_comps), dtype=np.float32)
+    chunk_rows = max(1, int(chunk_rows))
+    for start in range(0, n_obs, chunk_rows):
+        stop = min(n_obs, start + chunk_rows)
+        block_scores = X[start:stop] @ components_t
+        block_scores = np.asarray(block_scores, dtype=np.float32)
+        block_scores -= mean_projection[None, :]
+        scores[start:stop] = block_scores
+    return scores
+
+
+def _run_centered_covariance_pca(
+    adata_proc: AnnData,
+    n_comps: int,
+    blas_threads: Optional[int],
+    feature_mask: Optional[np.ndarray] = None,
+    verbose: bool = True,
+    log_prefix: str = "PCA",
+) -> None:
+    """
+    Exact centered PCA via covariance eigendecomposition for sparse HVG matrices.
+
+    This avoids the sparse ARPACK -> LAPACK path that can overflow on extremely
+    large ``n_obs`` while preserving the centered PCA objective.
+    """
+    X = adata_proc.X
+    if not scipy.sparse.issparse(X):
+        raise ValueError("Centered covariance PCA fallback requires sparse input.")
+    feature_mask_bool = None
+    if feature_mask is not None:
+        feature_mask_bool = np.asarray(feature_mask, dtype=bool)
+        if feature_mask_bool.shape[0] != int(adata_proc.n_vars):
+            raise ValueError("feature_mask length must match adata_proc.n_vars.")
+        if not np.any(feature_mask_bool):
+            raise ValueError("feature_mask selected zero variables.")
+        X = X[:, feature_mask_bool]
+    X = X.tocsr().astype(np.float32, copy=False)
+    n_obs = int(X.shape[0])
+    n_vars = int(X.shape[1])
+    if n_obs <= 1:
+        raise ValueError("Centered covariance PCA requires at least 2 observations.")
+    if not (0 < int(n_comps) < n_vars):
+        raise ValueError("Centered covariance PCA requires 0 < n_comps < n_vars.")
+
+    if verbose:
+        logging.info(
+            "%s sparse path selected with exact centered covariance eigendecomposition "
+            "(shape=%s x %s, n_comps=%s, blas_threads=%s).",
+            log_prefix,
+            n_obs,
+            n_vars,
+            n_comps,
+            blas_threads,
+        )
+
+    with _limit_blas_openmp(blas_threads):
+        mean = np.asarray(X.sum(axis=0)).ravel().astype(np.float32, copy=False) / np.float32(n_obs)
+        xtx = X.T @ X
+        if scipy.sparse.issparse(xtx):
+            cov = xtx.toarray().astype(np.float32, copy=False)
+        else:
+            cov = np.asarray(xtx, dtype=np.float32)
+        cov -= np.float32(n_obs) * np.outer(mean, mean)
+        cov /= np.float32(n_obs - 1)
+        cov = 0.5 * (cov + cov.T)
+
+        lo = max(0, n_vars - int(n_comps))
+        try:
+            eigvals, eigvecs = scipy.linalg.eigh(
+                cov,
+                subset_by_index=(lo, n_vars - 1),
+                driver="evr",
+                check_finite=False,
+            )
+        except Exception:
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            eigvals = eigvals[lo:]
+            eigvecs = eigvecs[:, lo:]
+        order = np.argsort(eigvals)[::-1]
+        eigvals = np.maximum(np.asarray(eigvals[order], dtype=np.float32), 0.0)
+        components = np.asarray(eigvecs[:, order], dtype=np.float32)
+        projected_mean = np.asarray(mean @ components, dtype=np.float32)
+        scores = _score_dense_from_sparse_components(
+            X,
+            components_t=components,
+            mean_projection=projected_mean,
+        )
+
+    total_variance = float(np.trace(cov, dtype=np.float64))
+    variance_ratio = (
+        np.asarray(eigvals / total_variance, dtype=np.float64)
+        if total_variance > 0
+        else np.zeros_like(eigvals, dtype=np.float64)
+    )
+    adata_proc.obsm["X_pca"] = scores
+    if feature_mask_bool is None:
+        adata_proc.varm["PCs"] = components
+    else:
+        pcs_full = np.zeros((int(adata_proc.n_vars), int(n_comps)), dtype=np.float32)
+        pcs_full[feature_mask_bool, :] = components
+        adata_proc.varm["PCs"] = pcs_full
+    adata_proc.uns["pca"] = {
+        "variance": np.asarray(eigvals, dtype=np.float64),
+        "variance_ratio": variance_ratio,
+        "params": {
+            "zero_center": True,
+            "fallback": "centered_covariance",
+            "used_feature_mask": bool(feature_mask_bool is not None),
+        },
+    }
+
+
+def _run_scanpy_pca(
+    adata_proc: AnnData,
+    n_comps: int,
+    blas_threads: Optional[int],
+    sparse_strategy: str = "auto",
+    centered_covariance_max_vars: int = 4096,
+    feature_mask: Optional[np.ndarray] = None,
+    verbose: bool = True,
+    log_prefix: str = "PCA",
+) -> None:
+    """
+    Run PCA with guarded sparse fallbacks for very large matrices.
+    """
+    is_sparse = scipy.sparse.issparse(adata_proc.X)
+    effective_n_vars = int(adata_proc.n_vars)
+    strategy_proxy = adata_proc
+    if feature_mask is not None:
+        effective_mask = np.asarray(feature_mask, dtype=bool)
+        effective_n_vars = int(np.count_nonzero(effective_mask))
+        strategy_proxy = SimpleNamespace(
+            X=adata_proc.X,
+            n_obs=int(adata_proc.n_obs),
+            n_vars=effective_n_vars,
+        )
+    resolved_sparse_strategy = _resolve_sparse_pca_strategy(
+        strategy_proxy,
+        n_comps=n_comps,
+        sparse_strategy=sparse_strategy,
+        centered_covariance_max_vars=centered_covariance_max_vars,
+    )
+
+    if verbose and is_sparse:
+        if resolved_sparse_strategy == "centered_covariance":
+            logging.info(
+                "%s sparse path selected with exact centered covariance fallback "
+                "(shape=%s x %s, n_comps=%s, blas_threads=%s).",
+                log_prefix,
+                adata_proc.n_obs,
+                effective_n_vars,
+                n_comps,
+                blas_threads,
+            )
+        elif resolved_sparse_strategy == "uncentered":
+            logging.info(
+                "%s sparse path selected with zero_center=False and svd_solver='randomized' "
+                "(shape=%s x %s, n_comps=%s, blas_threads=%s).",
+                log_prefix,
+                adata_proc.n_obs,
+                effective_n_vars,
+                n_comps,
+                blas_threads,
+            )
+        else:
+            logging.info(
+                "%s sparse path selected (shape=%s x %s, scanpy defaults preserved, blas_threads=%s).",
+                log_prefix,
+                adata_proc.n_obs,
+                effective_n_vars,
+                blas_threads,
+            )
+
+    if resolved_sparse_strategy == "centered_covariance":
+        _run_centered_covariance_pca(
+            adata_proc,
+            n_comps=n_comps,
+            blas_threads=blas_threads,
+            feature_mask=feature_mask,
+            verbose=False,
+            log_prefix=log_prefix,
+        )
+        return
+
+    with _limit_blas_openmp(blas_threads):
+        if resolved_sparse_strategy == "uncentered":
+            sc.tl.pca(
+                adata_proc,
+                n_comps=n_comps,
+                zero_center=False,
+                svd_solver='randomized',
+                dtype='float32',
+            )
+            return
+        try:
+            sc.tl.pca(adata_proc, n_comps=n_comps)
+        except ValueError as e:
+            if is_sparse and "integer overflow in LAPACK" in str(e):
+                overflow_proxy = strategy_proxy
+                overflow_strategy = (
+                    "centered_covariance"
+                    if _supports_centered_covariance_pca(
+                        overflow_proxy,
+                        n_comps=n_comps,
+                        max_vars=centered_covariance_max_vars,
+                    )
+                    else "uncentered"
+                )
+                if verbose:
+                    logging.warning(
+                        "%s sparse PCA hit LAPACK int32 overflow; retrying with %s fallback.",
+                        log_prefix,
+                        overflow_strategy,
+                    )
+                if overflow_strategy == "centered_covariance":
+                    _run_centered_covariance_pca(
+                        adata_proc,
+                        n_comps=n_comps,
+                        blas_threads=blas_threads,
+                        feature_mask=feature_mask,
+                        verbose=False,
+                        log_prefix=log_prefix,
+                    )
+                else:
+                    sc.tl.pca(
+                        adata_proc,
+                        n_comps=n_comps,
+                        zero_center=False,
+                        svd_solver='randomized',
+                        dtype='float32',
+                    )
+            else:
+                raise
 
 
 def _cache_log_norm_hvg(
@@ -236,6 +574,8 @@ def generate_embeddings(
     nmf_batch_size: Optional[int] = None,
     nmf_threads: Optional[int] = None,         # control BLAS/OpenMP threads
     pca_blas_threads: Optional[int] = None,    # optional BLAS/OpenMP threads during PCA
+    pca_sparse_strategy: str = 'auto',         # 'auto'|'scanpy'|'uncentered'|'centered_covariance'
+    pca_centered_covariance_max_vars: int = 4096,
 ) -> AnnData:
     """
     Generate embeddings for the given AnnData object using specified parameters.
@@ -367,6 +707,14 @@ def generate_embeddings(
     pca_blas_threads : int or None, optional (default=None)
         Optional BLAS/OpenMP thread cap applied only during PCA. `None` preserves
         previous behavior; set to `1` if you need the most conservative/stable PCA path.
+    pca_sparse_strategy : str, optional (default='auto')
+        Sparse PCA execution strategy. 'auto' preserves Scanpy defaults unless a
+        sparse centered PCA call would overflow LAPACK indexing, in which case it
+        prefers exact centered covariance PCA when ``n_vars`` is small enough and
+        otherwise falls back to ``zero_center=False`` randomized SVD.
+    pca_centered_covariance_max_vars : int, optional (default=4096)
+        Maximum feature count allowed for the exact centered covariance sparse
+        PCA fallback.
 
     """
     _coerce_string_indices_inplace(adata)
@@ -492,6 +840,8 @@ def generate_embeddings(
             nmf_batch_size=nmf_batch_size,
             nmf_threads=nmf_threads,
             pca_blas_threads=pca_blas_threads,
+            pca_sparse_strategy=pca_sparse_strategy,
+            pca_centered_covariance_max_vars=pca_centered_covariance_max_vars,
         )
 
     # Store embeddings in AnnData object
@@ -646,6 +996,8 @@ def embed_latent_space(
     nmf_batch_size: Optional[int] = None,
     nmf_threads: Optional[int] = None,
     pca_blas_threads: Optional[int] = None,
+    pca_sparse_strategy: str = 'auto',
+    pca_centered_covariance_max_vars: int = 4096,
 ) -> np.ndarray:
     """
     Embed the processed data into a latent space using specified dimensionality reduction.
@@ -677,6 +1029,11 @@ def embed_latent_space(
         See generate_embeddings docstring for details.
     pca_blas_threads : int or None
         Optional BLAS/OpenMP thread cap applied only during PCA.
+    pca_sparse_strategy : str, optional
+        Sparse PCA execution strategy. See generate_embeddings docstring.
+    pca_centered_covariance_max_vars : int, optional
+        Maximum feature count allowed for the exact centered covariance sparse
+        PCA fallback.
     
     Returns
     -------
@@ -694,27 +1051,48 @@ def embed_latent_space(
 
     if dim_reduction == 'PCA':
         # Optionally restrict to HVGs
+        hv_mask = None
         if use_hvg_only and 'highly_variable' in adata_proc.var:
             hv_mask = adata_proc.var['highly_variable'].values
             if hv_mask.any():
-                # Force an explicit copy to avoid lazy view materialization variance.
-                adata_proc = adata_proc[:, hv_mask].copy()
-        effective_pca_threads = pca_blas_threads if pca_blas_threads is not None else pca_threads
-        if scipy.sparse.issparse(adata_proc.X):
-            if verbose:
-                logging.info(
-                    "Sparse PCA path selected (shape=%s x %s, scanpy defaults preserved, blas_threads=%s).",
-                    adata_proc.n_obs,
-                    adata_proc.n_vars,
-                    effective_pca_threads,
+                strategy_proxy = SimpleNamespace(
+                    X=adata_proc.X,
+                    n_obs=int(adata_proc.n_obs),
+                    n_vars=int(np.count_nonzero(hv_mask)),
                 )
-        with _limit_blas_openmp(effective_pca_threads):
-            sc.tl.pca(adata_proc, n_comps=dimensions)
+                resolved_pca_strategy = _resolve_sparse_pca_strategy(
+                    strategy_proxy,
+                    n_comps=dimensions,
+                    sparse_strategy=pca_sparse_strategy,
+                    centered_covariance_max_vars=pca_centered_covariance_max_vars,
+                )
+                if resolved_pca_strategy != "centered_covariance":
+                    # Non-centered-covariance paths still rely on a physical HVG subset.
+                    adata_proc = adata_proc[:, hv_mask].copy()
+                    hv_mask = None
+        effective_pca_threads = pca_blas_threads if pca_blas_threads is not None else pca_threads
+        _run_scanpy_pca(
+            adata_proc,
+            n_comps=dimensions,
+            blas_threads=effective_pca_threads,
+            sparse_strategy=pca_sparse_strategy,
+            centered_covariance_max_vars=pca_centered_covariance_max_vars,
+            feature_mask=hv_mask,
+            verbose=verbose,
+            log_prefix="PCA",
+        )
         embeds = adata_proc.obsm['X_pca']
-        embeds = MinMaxScaler().fit_transform(embeds)
+        embeds = _minmax_scale_dense(embeds)
     elif dim_reduction == 'PCA_L':
-        with _limit_blas_openmp(pca_threads):
-            sc.tl.pca(adata_proc, n_comps=dimensions)
+        _run_scanpy_pca(
+            adata_proc,
+            n_comps=dimensions,
+            blas_threads=pca_threads,
+            sparse_strategy=pca_sparse_strategy,
+            centered_covariance_max_vars=pca_centered_covariance_max_vars,
+            verbose=verbose,
+            log_prefix="PCA_L",
+        )
         loadings = adata_proc.varm['PCs']
         counts = adata_proc.X
 
@@ -730,12 +1108,12 @@ def embed_latent_space(
             total=counts.shape[0]
         )
         embeds = np.array(embeds_list)
-        embeds = MinMaxScaler().fit_transform(embeds)
+        embeds = _minmax_scale_dense(embeds)
     elif dim_reduction == 'UMAP':
         sc.pp.neighbors(adata_proc, n_pcs=dimensions)
         sc.tl.umap(adata_proc, n_components=3)
         embeds = adata_proc.obsm['X_umap']
-        embeds = MinMaxScaler().fit_transform(embeds)
+        embeds = _minmax_scale_dense(embeds)
     elif dim_reduction == 'LSI':
         embeds = run_lsi(adata_proc, n_components=dimensions, remove_first=remove_lsi_1)
     elif dim_reduction == 'LSI_UMAP':
@@ -744,7 +1122,7 @@ def embed_latent_space(
         sc.pp.neighbors(adata_proc, use_rep='X_lsi')
         sc.tl.umap(adata_proc, n_components=3)
         embeds = adata_proc.obsm['X_umap']
-        embeds = MinMaxScaler().fit_transform(embeds)
+        embeds = _minmax_scale_dense(embeds)
     elif dim_reduction == 'NMF':
         # Optionally restrict to HVGs to reduce problem size
         if use_hvg_only and 'highly_variable' in adata_proc.var:
@@ -805,7 +1183,7 @@ def embed_latent_space(
         with _limit_blas_openmp(threads):
             W = nmf_model.fit_transform(X)
 
-        embeds = MinMaxScaler().fit_transform(W)
+        embeds = _minmax_scale_dense(W)
     elif dim_reduction == 'Harmony':
         # Optionally restrict to HVGs
         if use_hvg_only and 'highly_variable' in adata_proc.var:
@@ -813,13 +1191,20 @@ def embed_latent_space(
             if hv_mask.any():
                 adata_proc = adata_proc[:, hv_mask].copy()
         # Perform PCA before Harmony integration
-        with _limit_blas_openmp(pca_threads):
-            sc.tl.pca(adata_proc, n_comps=dimensions)
+        _run_scanpy_pca(
+            adata_proc,
+            n_comps=dimensions,
+            blas_threads=pca_threads,
+            sparse_strategy=pca_sparse_strategy,
+            centered_covariance_max_vars=pca_centered_covariance_max_vars,
+            verbose=verbose,
+            log_prefix="Harmony PCA",
+        )
         # Run Harmony integration using 'library_id' as the batch key
         sc.external.pp.harmony_integrate(adata_proc, key=library_id)
         # Retrieve the Harmony integrated embeddings; these are stored in 'X_pca_harmony'
         embeds = adata_proc.obsm['X_pca_harmony']
-        embeds = MinMaxScaler().fit_transform(embeds)
+        embeds = _minmax_scale_dense(embeds)
     elif dim_reduction in ('RAW', 'RAW_HVG'):
         # No dimensionality reduction: use processed counts as embedding
         # Optionally restrict to HVGs
@@ -839,7 +1224,7 @@ def embed_latent_space(
         X = adata_proc.X
         if scipy.sparse.issparse(X):
             X = X.toarray()
-        embeds = MinMaxScaler().fit_transform(X.astype('float32'))
+        embeds = _minmax_scale_dense(X.astype('float32', copy=False))
     else:
         raise ValueError(f"Dimensionality reduction method '{dim_reduction}' is not recognized.")
 

@@ -799,6 +799,10 @@ def perform_pseudo_bulk_analysis(
                 A = adata.obsp['spatial_connectivities']
                 if not issparse(A):
                     A = csr_matrix(A)
+                # Work with undirected spot contacts when collapsing to
+                # segment-level spatial graphs. Squidpy generic KNN graphs can
+                # be directed, but segment adjacency is interpreted as contact.
+                A = A.maximum(A.T)
 
                 # Categories aligned to new_adata.obs_names
                 seg_codes = pd.Categorical(segments, categories=new_adata.obs_names).codes
@@ -841,7 +845,8 @@ def perform_pseudo_bulk_analysis(
                                                                        shape=(n_segs, n_segs)).tocsr()
                 else:
                     # Fast collapse via COO builder + sum_duplicates in SciPy (avoids Python sorting)
-                    A_coo = A.tocoo()
+                    A_work = A
+                    A_coo = A_work.tocoo()
                     row = A_coo.row; col = A_coo.col; w = A_coo.data.astype(np.float32, copy=False)
                     # Use only upper-triangular edges to avoid double counting
                     mask = row < col
@@ -863,27 +868,31 @@ def perform_pseudo_bulk_analysis(
                     if collapse_compute_distances and ('spatial_distances' in adata.obsp):
                         D = adata.obsp['spatial_distances']
                         if issparse(D):
-                            D = D.tocoo()
-                            drow = D.row; dcol = D.col; dv = D.data.astype(np.float32, copy=False)
-                            dmask = drow < dcol
-                            drow = drow[dmask]; dcol = dcol[dmask]; dv = dv[dmask]
+                            # Average distances over the same undirected
+                            # spot-level adjacency edges used to build B.
+                            A_dist = A_work.tocoo()
+                            dmask = A_dist.row < A_dist.col
+                            drow = A_dist.row[dmask]
+                            dcol = A_dist.col[dmask]
+                            D_csr = D.tocsr()
+                            dv = np.asarray(D_csr[drow, dcol]).reshape(-1).astype(np.float32, copy=False)
                             sr = seg_codes[drow]; segc = seg_codes[dcol]
                             vmask = (sr >= 0) & (segc >= 0) & (sr != segc)
                             if np.any(vmask):
                                 sr = sr[vmask]; segc = segc[vmask]; dv = dv[vmask]
                                 from scipy.sparse import coo_matrix as _coo
                                 D_dir = _coo((dv, (sr, segc)), shape=(n_segs, n_segs)).tocsr()
+                                C_dir = _coo((np.ones_like(dv, dtype=np.float32), (sr, segc)), shape=(n_segs, n_segs)).tocsr()
                                 D_sum = (D_dir + D_dir.T)
-                                # counts per segment pair from adjacency (binary)
-                                B_bin = B.copy(); B_bin.data = np.ones_like(B_bin.data)
-                                # Compute mean distances by dividing where counts>0
-                                # Align data arrays via conversion to COO and mapping indices
-                                Dc = D_sum.tocoo(); Bc = B_bin.tocoo()
+                                C_sum = (C_dir + C_dir.T)
+                                # Compute mean distances by dividing by the
+                                # number of spot-level adjacency edges per
+                                # segment pair, not by collapsed-pair presence.
+                                Dc = D_sum.tocoo(); Bc = C_sum.tocoo()
                                 keyD = (Dc.row.astype(np.int64) * n_segs + Dc.col.astype(np.int64))
                                 keyB = (Bc.row.astype(np.int64) * n_segs + Bc.col.astype(np.int64))
                                 order = np.argsort(keyB)
                                 keyB_sorted = keyB[order]; cnt_sorted = Bc.data[order]
-                                from bisect import bisect_left
                                 k2p = {int(k): int(i) for i, k in enumerate(keyB_sorted.tolist())}
                                 m_rows, m_cols, m_vals = [], [], []
                                 for r, c, val, kd in zip(Dc.row, Dc.col, Dc.data, keyD):

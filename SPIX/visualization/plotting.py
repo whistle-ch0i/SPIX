@@ -53,6 +53,24 @@ logging.basicConfig(
 )
 
 
+def _normalize_gap_collapse_axis_safe(axis):
+    normalize_fn = getattr(_raster, "normalize_gap_collapse_axis", None)
+    if callable(normalize_fn):
+        return normalize_fn(axis)
+    if axis is None:
+        return None
+    text = str(axis).strip().lower()
+    if text in {"", "none", "off", "false", "no", "0"}:
+        return None
+    if text in {"y", "row", "rows", "vertical"}:
+        return "y"
+    if text in {"x", "col", "cols", "column", "columns", "horizontal"}:
+        return "x"
+    if text in {"both", "xy", "yx"}:
+        return "both"
+    return None
+
+
 def _infer_regular_grid_step(values, *, q: float = 0.05, max_samples: int = 200_000):
     """Infer a 1D lattice step from integer-like coordinates (raster-expanded tiles)."""
     vals = np.asarray(values, dtype=float)
@@ -127,6 +145,431 @@ def _apply_axis_crop(ax, *, xlim=None, ylim=None):
             descending = bool(cur[1] < cur[0])
             y0, y1 = float(y[0]), float(y[1])
             ax.set_ylim(y1, y0) if descending else ax.set_ylim(y0, y1)
+
+
+def _freeze_plot_cache_value(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, np.ndarray):
+        return tuple(_freeze_plot_cache_value(v) for v in value.tolist())
+    if isinstance(value, (list, tuple, set)):
+        return tuple(_freeze_plot_cache_value(v) for v in value)
+    if isinstance(value, dict):
+        return tuple(
+            sorted((str(k), _freeze_plot_cache_value(v)) for k, v in value.items())
+        )
+    return repr(value)
+
+
+def _sanitize_plot_cache_component(value, *, fallback: str) -> str:
+    text = re.sub(r"[^0-9A-Za-z_]+", "_", str(value or "")).strip("_")
+    return text or str(fallback)
+
+
+def _default_plot_image_cache_key(
+    *,
+    embedding,
+    dimensions,
+    origin,
+    color_by=None,
+    alpha_by=None,
+    plot_boundaries: bool = False,
+) -> str:
+    emb_tag = _sanitize_plot_cache_component(embedding, fallback="embedding")
+    dims_tag = "_".join(str(int(d)) for d in np.asarray(dimensions, dtype=int).tolist())
+    mode_tag = "origin" if bool(origin) else "tiles"
+    parts = ["__spix_plot_cache", emb_tag, mode_tag, f"dims_{dims_tag}"]
+    if color_by is not None:
+        parts.append(f"color_{_sanitize_plot_cache_component(color_by, fallback='obs')}")
+    if alpha_by is not None:
+        parts.append(f"alpha_{_sanitize_plot_cache_component(alpha_by, fallback='alpha')}")
+    if plot_boundaries:
+        parts.append("boundaries")
+    return "__".join(parts)
+
+
+def _build_plot_cache_request(**cache_kwargs):
+    return {
+        "embedding": str(cache_kwargs.get("embedding", "")),
+        "dimensions": tuple(
+            int(d) for d in np.asarray(cache_kwargs.get("dimensions", []), dtype=int).tolist()
+        ),
+        "origin": bool(cache_kwargs.get("origin", True)),
+        "coordinate_mode": str(cache_kwargs.get("coordinate_mode", "spatial")),
+        "array_row_key": str(cache_kwargs.get("array_row_key", "array_row")),
+        "array_col_key": str(cache_kwargs.get("array_col_key", "array_col")),
+        "color_by": cache_kwargs.get("color_by", None),
+        "palette": _freeze_plot_cache_value(cache_kwargs.get("palette", None)),
+        "alpha_by": cache_kwargs.get("alpha_by", None),
+        "alpha_range": _freeze_plot_cache_value(cache_kwargs.get("alpha_range", None)),
+        "alpha_clip": _freeze_plot_cache_value(cache_kwargs.get("alpha_clip", None)),
+        "alpha_invert": bool(cache_kwargs.get("alpha_invert", False)),
+        "prioritize_high_values": bool(cache_kwargs.get("prioritize_high_values", False)),
+        "overlap_priority": cache_kwargs.get("overlap_priority", None),
+        "segment_color_by_major": bool(cache_kwargs.get("segment_color_by_major", False)),
+        "use_imshow": bool(cache_kwargs.get("use_imshow", True)),
+        "brighten_continuous": bool(cache_kwargs.get("brighten_continuous", False)),
+        "continuous_gamma": float(cache_kwargs.get("continuous_gamma", 0.8)),
+        "plot_boundaries": bool(cache_kwargs.get("plot_boundaries", False)),
+        "boundary_method": str(cache_kwargs.get("boundary_method", "pixel")),
+        "boundary_color": cache_kwargs.get("boundary_color", "black"),
+        "boundary_linewidth": float(cache_kwargs.get("boundary_linewidth", 1.0)),
+        "boundary_style": str(cache_kwargs.get("boundary_style", "solid")),
+        "boundary_alpha": float(cache_kwargs.get("boundary_alpha", 0.7)),
+        "pixel_smoothing_sigma": float(cache_kwargs.get("pixel_smoothing_sigma", 0.0)),
+        "highlight_segments": _freeze_plot_cache_value(cache_kwargs.get("highlight_segments", None)),
+        "highlight_boundary_color": cache_kwargs.get("highlight_boundary_color", None),
+        "highlight_linewidth": cache_kwargs.get("highlight_linewidth", None),
+        "highlight_brighten_factor": float(cache_kwargs.get("highlight_brighten_factor", 1.2)),
+        "dim_other_segments": float(cache_kwargs.get("dim_other_segments", 0.3)),
+        "dim_to_grey": bool(cache_kwargs.get("dim_to_grey", True)),
+        "segment_key": cache_kwargs.get("segment_key", "Segment"),
+        "imshow_tile_size": cache_kwargs.get("imshow_tile_size", None),
+        "imshow_scale_factor": float(cache_kwargs.get("imshow_scale_factor", 1.0)),
+        "imshow_tile_size_mode": str(cache_kwargs.get("imshow_tile_size_mode", "auto")),
+        "imshow_tile_size_quantile": cache_kwargs.get("imshow_tile_size_quantile", None),
+        "imshow_tile_size_rounding": str(cache_kwargs.get("imshow_tile_size_rounding", "floor")),
+        "imshow_tile_size_shrink": float(cache_kwargs.get("imshow_tile_size_shrink", 0.98)),
+        "pixel_perfect": bool(cache_kwargs.get("pixel_perfect", False)),
+        "pixel_shape": str(cache_kwargs.get("pixel_shape", "square")),
+        "runtime_fill_from_boundary": bool(cache_kwargs.get("runtime_fill_from_boundary", False)),
+        "runtime_fill_closing_radius": int(cache_kwargs.get("runtime_fill_closing_radius", 1)),
+        "runtime_fill_external_radius": int(cache_kwargs.get("runtime_fill_external_radius", 0)),
+        "runtime_fill_holes": bool(cache_kwargs.get("runtime_fill_holes", True)),
+        "gap_collapse_axis": _freeze_plot_cache_value(cache_kwargs.get("gap_collapse_axis", None)),
+        "gap_collapse_max_run_px": int(cache_kwargs.get("gap_collapse_max_run_px", 1)),
+        "soft_rasterization": bool(cache_kwargs.get("soft_rasterization", False)),
+        "resolve_center_collisions": _freeze_plot_cache_value(cache_kwargs.get("resolve_center_collisions", "auto")),
+        "center_collision_radius": int(cache_kwargs.get("center_collision_radius", 2)),
+    }
+
+
+def _dims_subset_of_cache(request_dims, cache_dims) -> bool:
+    req = tuple(int(d) for d in request_dims)
+    have = tuple(int(d) for d in cache_dims)
+    have_set = set(have)
+    return all(int(d) in have_set for d in req)
+
+
+def _cache_matches_plot_request(cache, request) -> bool:
+    if not isinstance(cache, dict):
+        return False
+
+    cache_dims = tuple(int(d) for d in cache.get("dimensions", []) or [])
+    if not cache_dims or not _dims_subset_of_cache(request["dimensions"], cache_dims):
+        return False
+    if str(cache.get("embedding_key", "")) != str(request["embedding"]):
+        return False
+    if bool(cache.get("origin", True)) != bool(request["origin"]):
+        return False
+    if str(cache.get("coordinate_mode", "spatial")) != str(request["coordinate_mode"]):
+        return False
+    if str(cache.get("array_row_key", "array_row")) != str(request["array_row_key"]):
+        return False
+    if str(cache.get("array_col_key", "array_col")) != str(request["array_col_key"]):
+        return False
+
+    plot_params = cache.get("image_plot_params", {}) or {}
+    keys_to_compare = [
+        "color_by",
+        "palette",
+        "alpha_by",
+        "alpha_range",
+        "alpha_clip",
+        "alpha_invert",
+        "prioritize_high_values",
+        "overlap_priority",
+        "segment_color_by_major",
+        "use_imshow",
+        "brighten_continuous",
+        "continuous_gamma",
+        "plot_boundaries",
+        "boundary_method",
+        "boundary_color",
+        "boundary_linewidth",
+        "boundary_style",
+        "boundary_alpha",
+        "pixel_smoothing_sigma",
+        "highlight_segments",
+        "highlight_boundary_color",
+        "highlight_linewidth",
+        "highlight_brighten_factor",
+        "dim_other_segments",
+        "dim_to_grey",
+        "segment_key",
+        "runtime_fill_from_boundary",
+        "runtime_fill_closing_radius",
+        "runtime_fill_external_radius",
+        "runtime_fill_holes",
+        "gap_collapse_axis",
+        "gap_collapse_max_run_px",
+        "soft_rasterization",
+        "resolve_center_collisions",
+        "center_collision_radius",
+    ]
+    for key in keys_to_compare:
+        cache_value = plot_params.get(key, None)
+        if key == "segment_key" and cache_value is None:
+            cache_value = cache.get("segment_key_requested", cache.get("segment_key", None))
+        if _freeze_plot_cache_value(cache_value) != _freeze_plot_cache_value(request.get(key, None)):
+            return False
+    return True
+
+
+def _find_compatible_plot_cache(adata, request):
+    for key, value in getattr(adata, "uns", {}).items():
+        if _cache_matches_plot_request(value, request):
+            return str(key), value
+    return None, None
+
+
+def _prepare_plot_image_cache(
+    adata,
+    *,
+    cache_image: bool,
+    image_cache_key,
+    refresh_image_cache: bool,
+    verbose: bool,
+    **cache_kwargs,
+):
+    request = _build_plot_cache_request(**cache_kwargs)
+
+    if (not cache_image) and (image_cache_key is None):
+        found_key, found_cache = _find_compatible_plot_cache(adata, request)
+        if found_cache is not None:
+            if verbose:
+                print(f"[plot cache] Auto-reusing compatible cached image from adata.uns['{found_key}']")
+            return found_cache
+        return None
+
+    from SPIX.image_processing.image_cache import cache_embedding_image
+
+    key = str(
+        image_cache_key
+        or _default_plot_image_cache_key(
+            embedding=cache_kwargs.get("embedding", "X_embedding"),
+            dimensions=cache_kwargs.get("dimensions", [0, 1, 2]),
+            origin=cache_kwargs.get("origin", True),
+            color_by=cache_kwargs.get("color_by", None),
+            alpha_by=cache_kwargs.get("alpha_by", None),
+            plot_boundaries=cache_kwargs.get("plot_boundaries", False),
+        )
+    )
+
+    signature = {"version": 2, **request}
+
+    existing = adata.uns.get(key, None)
+    if (
+        isinstance(existing, dict)
+        and (not refresh_image_cache)
+        and (
+            existing.get("plot_cache_signature", None) == signature
+            or _cache_matches_plot_request(existing, request)
+        )
+    ):
+        if verbose:
+            print(f"[plot cache] Reusing cached image under adata.uns['{key}']")
+        return existing
+
+    cache = cache_embedding_image(
+        adata,
+        embedding=cache_kwargs.get("embedding", "X_embedding"),
+        dimensions=list(cache_kwargs.get("dimensions", [0, 1, 2])),
+        origin=bool(cache_kwargs.get("origin", True)),
+        key=key,
+        coordinate_mode=cache_kwargs.get("coordinate_mode", "spatial"),
+        array_row_key=cache_kwargs.get("array_row_key", "array_row"),
+        array_col_key=cache_kwargs.get("array_col_key", "array_col"),
+        figsize=None,
+        fig_dpi=None,
+        imshow_tile_size=cache_kwargs.get("imshow_tile_size", None),
+        imshow_scale_factor=float(cache_kwargs.get("imshow_scale_factor", 1.0)),
+        imshow_tile_size_mode=cache_kwargs.get("imshow_tile_size_mode", "auto"),
+        imshow_tile_size_quantile=cache_kwargs.get("imshow_tile_size_quantile", None),
+        imshow_tile_size_rounding=cache_kwargs.get("imshow_tile_size_rounding", "floor"),
+        imshow_tile_size_shrink=float(cache_kwargs.get("imshow_tile_size_shrink", 0.98)),
+        pixel_perfect=bool(cache_kwargs.get("pixel_perfect", False)),
+        pixel_shape=cache_kwargs.get("pixel_shape", "square"),
+        chunk_size=int(cache_kwargs.get("chunk_size", 50000)),
+        verbose=bool(verbose),
+        show=False,
+        color_by=cache_kwargs.get("color_by", None),
+        palette=cache_kwargs.get("palette", "tab20"),
+        alpha_by=cache_kwargs.get("alpha_by", None),
+        alpha_range=cache_kwargs.get("alpha_range", (0.1, 1.0)),
+        alpha_clip=cache_kwargs.get("alpha_clip", None),
+        alpha_invert=bool(cache_kwargs.get("alpha_invert", False)),
+        prioritize_high_values=bool(cache_kwargs.get("prioritize_high_values", False)),
+        overlap_priority=cache_kwargs.get("overlap_priority", None),
+        segment_color_by_major=bool(cache_kwargs.get("segment_color_by_major", False)),
+        title=cache_kwargs.get("title", None),
+        use_imshow=bool(cache_kwargs.get("use_imshow", True)),
+        brighten_continuous=bool(cache_kwargs.get("brighten_continuous", False)),
+        continuous_gamma=float(cache_kwargs.get("continuous_gamma", 0.8)),
+        plot_boundaries=bool(cache_kwargs.get("plot_boundaries", False)),
+        boundary_method=cache_kwargs.get("boundary_method", "pixel"),
+        boundary_color=cache_kwargs.get("boundary_color", "black"),
+        boundary_linewidth=float(cache_kwargs.get("boundary_linewidth", 1.0)),
+        boundary_style=cache_kwargs.get("boundary_style", "solid"),
+        boundary_alpha=float(cache_kwargs.get("boundary_alpha", 0.7)),
+        pixel_smoothing_sigma=float(cache_kwargs.get("pixel_smoothing_sigma", 0.0)),
+        highlight_segments=cache_kwargs.get("highlight_segments", None),
+        highlight_boundary_color=cache_kwargs.get("highlight_boundary_color", None),
+        highlight_linewidth=cache_kwargs.get("highlight_linewidth", None),
+        highlight_brighten_factor=float(cache_kwargs.get("highlight_brighten_factor", 1.2)),
+        dim_other_segments=float(cache_kwargs.get("dim_other_segments", 0.3)),
+        dim_to_grey=bool(cache_kwargs.get("dim_to_grey", True)),
+        segment_key=cache_kwargs.get("segment_key", "Segment"),
+        runtime_fill_from_boundary=bool(cache_kwargs.get("runtime_fill_from_boundary", False)),
+        runtime_fill_closing_radius=int(cache_kwargs.get("runtime_fill_closing_radius", 1)),
+        runtime_fill_external_radius=int(cache_kwargs.get("runtime_fill_external_radius", 0)),
+        runtime_fill_holes=bool(cache_kwargs.get("runtime_fill_holes", True)),
+        gap_collapse_axis=cache_kwargs.get("gap_collapse_axis", None),
+        gap_collapse_max_run_px=int(cache_kwargs.get("gap_collapse_max_run_px", 1)),
+        soft_rasterization=bool(cache_kwargs.get("soft_rasterization", False)),
+        resolve_center_collisions=cache_kwargs.get("resolve_center_collisions", "auto"),
+        center_collision_radius=int(cache_kwargs.get("center_collision_radius", 2)),
+    )
+    try:
+        cache["plot_cache_signature"] = signature
+        adata.uns[key] = cache
+    except Exception:
+        pass
+    if verbose:
+        print(f"[plot cache] Cached image under adata.uns['{key}']")
+    return cache
+
+
+def _cached_preview_matches_dimensions(cache, requested_dimensions) -> bool:
+    if "img_preview" not in cache:
+        return False
+    cache_dims = tuple(int(d) for d in cache.get("dimensions", []) or [])
+    req = tuple(int(d) for d in requested_dimensions)
+    if not cache_dims:
+        return False
+    if len(cache_dims) >= 3:
+        return tuple(cache_dims[:3]) == req
+    return cache_dims == req
+
+
+def _cached_display_image(cache, *, requested_dimensions, prefer_preview: bool = True):
+    from SPIX.image_processing.image_cache import get_cached_image_channels
+
+    use_preview = bool(
+        prefer_preview and _cached_preview_matches_dimensions(cache, requested_dimensions)
+    )
+    cache_dims = tuple(int(d) for d in cache.get("dimensions", []) or [])
+    req = tuple(int(d) for d in requested_dimensions)
+    if not cache_dims:
+        cache_dims = tuple(range(int(cache.get("channels", 0))))
+    channel_idx = None
+    if req:
+        dim_to_idx = {int(dim): i for i, dim in enumerate(cache_dims)}
+        if not all(int(dim) in dim_to_idx for dim in req):
+            raise ValueError("Requested display dimensions are not present in cached image.")
+        channel_idx = [int(dim_to_idx[int(dim)]) for dim in req]
+
+    img = (
+        np.asarray(cache.get("img_preview"))
+        if use_preview
+        else np.asarray(get_cached_image_channels(cache, channels=channel_idx))
+    )
+    if img.ndim != 3:
+        raise ValueError("Cached image must be 3D for display.")
+    if img.shape[2] >= 3:
+        return np.asarray(img[:, :, :3], dtype=np.float32)
+    if img.shape[2] == 2:
+        return np.stack(
+            [img[:, :, 0], img[:, :, 1], np.zeros_like(img[:, :, 0])],
+            axis=2,
+        ).astype(np.float32)
+    return np.repeat(np.asarray(img, dtype=np.float32), 3, axis=2)
+
+
+def _render_plot_cache_fast(
+    *,
+    cache,
+    requested_dimensions,
+    title,
+    figsize,
+    fig_dpi,
+    xlim=None,
+    ylim=None,
+    show_axes: bool = False,
+    background_img=None,
+    background_extent=None,
+    background_origin=None,
+    background_alpha: float = 1.0,
+):
+    display_img = _cached_display_image(
+        cache,
+        requested_dimensions=requested_dimensions,
+        prefer_preview=bool(cache.get("image_plot_params", {}).get("plot_boundaries", False)),
+    )
+    extent = [
+        float(cache["x_min_eff"]),
+        float(cache["x_max_eff"]),
+        float(cache["y_min_eff"]),
+        float(cache["y_max_eff"]),
+    ]
+
+    if figsize is None:
+        figsize = (10, 10)
+    if fig_dpi is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig, ax = plt.subplots(figsize=figsize, dpi=fig_dpi)
+
+    if background_img is not None:
+        kwargs = {"extent": background_extent, "alpha": float(background_alpha)}
+        if background_origin is not None:
+            kwargs["origin"] = background_origin
+        ax.imshow(background_img, **kwargs)
+
+    ax.imshow(
+        display_img,
+        origin="lower",
+        extent=extent,
+        interpolation="nearest",
+    )
+    _apply_axis_crop(ax, xlim=xlim, ylim=ylim)
+    ax.set_aspect("equal")
+    if not show_axes:
+        ax.axis("off")
+    ax.set_title(title, fontsize=figsize[0] * 1.5)
+    plt.show()
+    return fig, ax
+
+
+def _can_render_plot_cache_fast(
+    *,
+    cache,
+    requested_dimensions,
+    show_colorbar: bool,
+    show_legend: bool,
+    segment_show_pie: bool = False,
+    fill_boundaries: bool = False,
+    plot_boundaries: bool = False,
+    boundary_method: str = "pixel",
+    use_imshow: bool = True,
+):
+    if cache is None or (not use_imshow):
+        return False
+    if show_colorbar or show_legend or segment_show_pie or fill_boundaries:
+        return False
+    if plot_boundaries and str(boundary_method) != "pixel":
+        return False
+    if not _dims_subset_of_cache(
+        tuple(int(d) for d in requested_dimensions),
+        tuple(int(d) for d in cache.get("dimensions", []) or []),
+    ):
+        return False
+    plot_params = cache.get("image_plot_params", {}) or {}
+    if plot_boundaries and ("img_preview" not in cache) and bool(plot_params.get("plot_boundaries", False)):
+        return False
+    if plot_boundaries and (not _cached_preview_matches_dimensions(cache, requested_dimensions)):
+        return False
+    return True
 
 
 def _string_index_no_copy(values):
@@ -665,8 +1108,10 @@ def _resolve_plot_raster_state(
     pixel_perfect: bool,
     pixel_shape: str,
     coord_mode: str = "spatial",
+    gap_collapse_axis: str | None = None,
+    gap_collapse_max_run_px: int = 1,
     soft_rasterization: bool = False,
-    resolve_center_collisions: bool = False,
+    resolve_center_collisions: bool | str = "auto",
     center_collision_radius: int = 2,
     logger=None,
     verbose: bool = False,
@@ -730,22 +1175,77 @@ def _resolve_plot_raster_state(
         x_min_eff_out, x_max_eff_out = float(x0) - 0.5, float(x1) + 0.5
         y_min_eff_out, y_max_eff_out = float(y0) - 0.5, float(y1) + 0.5
 
-    if resolve_center_collisions and not soft_enabled:
+    collision_info = None
+    apply_collision_resolve, collision_stats, _ = _raster.should_resolve_center_collisions(
+        resolve_center_collisions,
+        cx=cx,
+        cy=cy,
+        w=int(w_eff),
+        h=int(h_eff),
+        tile_px=int(s_eff),
+        pixel_perfect=bool(pixel_perfect),
+        soft_enabled=bool(soft_enabled),
+        logger=logger if verbose else None,
+        context=context,
+    )
+    if apply_collision_resolve:
+        collision_radius_eff = _raster.resolve_collision_search_radius(
+            resolve_center_collisions,
+            base_radius=int(center_collision_radius),
+            collision_stats=collision_stats,
+            logger=logger if verbose else None,
+            context=context,
+        )
         cx, cy, collision_info = _raster.resolve_center_collisions(
             cx,
             cy,
             w=int(w_eff),
             h=int(h_eff),
-            max_radius=int(center_collision_radius),
+            max_radius=int(collision_radius_eff),
             logger=logger if verbose else None,
             context=context,
         )
-    elif resolve_center_collisions and soft_enabled:
-        collision_info = None
+    elif collision_stats is not None:
+        collision_info = {
+            "applied": False,
+            "enabled": _raster.normalize_collision_mode(resolve_center_collisions) != "never",
+            "search_radius": int(max(0, center_collision_radius)),
+            "n_tiles": int(collision_stats["n_tiles"]),
+            "n_unique_centers_before": int(collision_stats["n_unique_centers"]),
+            "n_unique_centers_after": int(collision_stats["n_unique_centers"]),
+            "collision_fraction_before": float(collision_stats["collision_fraction"]),
+            "collision_fraction_after": float(collision_stats["collision_fraction"]),
+            "n_collided_tiles_before": int(collision_stats["n_collided_tiles"]),
+            "n_collided_tiles_after": int(collision_stats["n_collided_tiles"]),
+            "n_reassigned_tiles": 0,
+            "max_stack_before": int(collision_stats["max_stack"]),
+            "max_stack_after": int(collision_stats["max_stack"]),
+            "unresolved_tiles": int(collision_stats["n_collided_tiles"]),
+        }
+
+    gap_collapse_axis_norm = _normalize_gap_collapse_axis_safe(gap_collapse_axis)
+    gap_collapse_active = bool(
+        gap_collapse_axis_norm is not None and int(max(0, int(gap_collapse_max_run_px))) > 0
+    )
+    if gap_collapse_active and soft_enabled:
         if verbose and logger is not None:
-            logger.info("%s: ignoring resolve_center_collisions because soft_rasterization=True.", context)
-    else:
-        collision_info = None
+            logger.warning(
+                "gap_collapse is currently incompatible with soft_rasterization; falling back to hard rasterization."
+            )
+        soft_enabled = False
+        soft_fx = None
+        soft_fy = None
+    if gap_collapse_active:
+        cx, cy, w_eff, h_eff, _ = _raster.collapse_empty_center_gaps(
+            cx=cx,
+            cy=cy,
+            w=int(w_eff),
+            h=int(h_eff),
+            axis=gap_collapse_axis_norm,
+            max_gap_run_px=int(gap_collapse_max_run_px),
+            logger=logger if verbose else None,
+            context=context,
+        )
 
     return {
         "cx": np.asarray(cx, dtype=np.int32),
@@ -786,6 +1286,7 @@ def _rasterize_rgba_and_label_buffer(
     runtime_fill_external_radius: int = 0,
     runtime_fill_holes: bool = True,
     chunk_size: int = 50000,
+    persistent_store=None,
     logger=None,
     verbose: bool = False,
     context: str = "image_plot",
@@ -802,7 +1303,7 @@ def _rasterize_rgba_and_label_buffer(
     label_img = None if label_codes is None else np.full((int(h), int(w)), -1, dtype=int)
     label_codes_arr = None if label_codes is None else np.asarray(label_codes, dtype=np.int32)
     alpha_chunk = None if alpha_arr is None else np.asarray(alpha_arr, dtype=np.float32)
-    value_buf = np.full((int(h), int(w)), -np.inf, dtype=np.float32)
+    value_buf = None
 
     ox, oy = _raster.tile_pixel_offsets(int(s), pixel_shape=pixel_shape)
     pixels_per_tile = int(ox.size)
@@ -810,6 +1311,7 @@ def _rasterize_rgba_and_label_buffer(
     chunk_n = int(max(1, min(int(chunk_size), int(max(1, target_pixels // max(1, pixels_per_tile))))))
 
     if soft_enabled:
+        value_buf = np.full((int(h), int(w)), -np.inf, dtype=np.float32) if label_img is not None else None
         if prioritize_high_values and verbose and logger is not None:
             logger.warning("soft_rasterization does not support prioritize_high_values; using weighted blending instead.")
         seed_rgba = np.empty((cols_arr.shape[0], 4), dtype=np.float32)
@@ -848,6 +1350,8 @@ def _rasterize_rgba_and_label_buffer(
                         value_buf[py[mask_upd], px[mask_upd]] = pw[mask_upd]
     else:
         vals_arr = None if vals is None else np.asarray(vals, dtype=np.float32)
+        if prioritize_high_values:
+            value_buf = np.full((int(h), int(w)), -np.inf, dtype=np.float32)
         for i in range(0, cx_arr.size, chunk_n):
             end = min(i + chunk_n, cx_arr.size)
             chunk_cx = cx_arr[i:end]
@@ -857,17 +1361,29 @@ def _rasterize_rgba_and_label_buffer(
             chunk_vals = None if vals_arr is None else vals_arr[i:end]
 
             if not prioritize_high_values:
-                all_x = np.clip((chunk_cx[:, None] + ox[None, :]).ravel(), 0, int(w) - 1)
-                all_y = np.clip((chunk_cy[:, None] + oy[None, :]).ravel(), 0, int(h) - 1)
-                cols_rep = np.repeat(chunk_cols, pixels_per_tile, axis=0)
-                img[all_y, all_x, :3] = cols_rep
-                if chunk_alpha is not None:
-                    img[all_y, all_x, 3] = np.repeat(chunk_alpha, pixels_per_tile, axis=0)
+                if pixels_per_tile == 1:
+                    px = np.clip(chunk_cx, 0, int(w) - 1)
+                    py = np.clip(chunk_cy, 0, int(h) - 1)
+                    img[py, px, :3] = chunk_cols
+                    if chunk_alpha is not None:
+                        img[py, px, 3] = chunk_alpha
+                    else:
+                        img[py, px, 3] = float(alpha_point)
+                    paint_mask[py, px] = True
+                    if label_img is not None:
+                        label_img[py, px] = label_codes_arr[i:end]
                 else:
-                    img[all_y, all_x, 3] = float(alpha_point)
-                paint_mask[all_y, all_x] = True
-                if label_img is not None:
-                    label_img[all_y, all_x] = np.repeat(label_codes_arr[i:end], pixels_per_tile, axis=0)
+                    all_x = np.clip((chunk_cx[:, None] + ox[None, :]).ravel(), 0, int(w) - 1)
+                    all_y = np.clip((chunk_cy[:, None] + oy[None, :]).ravel(), 0, int(h) - 1)
+                    cols_rep = np.repeat(chunk_cols, pixels_per_tile, axis=0)
+                    img[all_y, all_x, :3] = cols_rep
+                    if chunk_alpha is not None:
+                        img[all_y, all_x, 3] = np.repeat(chunk_alpha, pixels_per_tile, axis=0)
+                    else:
+                        img[all_y, all_x, 3] = float(alpha_point)
+                    paint_mask[all_y, all_x] = True
+                    if label_img is not None:
+                        label_img[all_y, all_x] = np.repeat(label_codes_arr[i:end], pixels_per_tile, axis=0)
             else:
                 if chunk_vals is None:
                     chunk_vals = np.arange(i, end, dtype=np.float32)
@@ -905,6 +1421,8 @@ def _rasterize_rgba_and_label_buffer(
             closing_radius=int(fill_radius),
             external_radius=int(external_radius),
             fill_holes=bool(runtime_fill_holes),
+            use_observed_pixels=bool(int(s) == 1),
+            persistent_store=persistent_store,
             logger=logger if verbose else None,
             context=context,
         )
@@ -1018,9 +1536,15 @@ def image_plot(
     runtime_fill_closing_radius: int = 1,
     runtime_fill_external_radius: int = 0,
     runtime_fill_holes: bool = True,
+    gap_collapse_axis: str | None = None,
+    gap_collapse_max_run_px: int = 1,
     soft_rasterization: bool = False,
-    resolve_center_collisions: bool = False,
+    resolve_center_collisions: bool | str = "auto",
     center_collision_radius: int = 2,
+    cache_image: bool = False,
+    image_cache_key: str | None = None,
+    refresh_image_cache: bool = False,
+    show_axes: bool = False,
     xlim=None,
     ylim=None,
 ):
@@ -1035,14 +1559,18 @@ def image_plot(
         If True, snap the internal raster scale so the estimated tile pitch becomes an
         integer number of pixels, and use rounded pixel centers. This makes tiles look
         "packed" (no visible seams/gaps) across different ``figsize``/DPI settings.
-    resolve_center_collisions : bool, optional (default ``False``)
-        If True, locally reassign duplicate raster centers onto nearby empty
-        pixels before painting/filling.
+    resolve_center_collisions : bool or {"auto"}, optional (default ``"auto"``)
+        ``True`` always reassigns duplicate raster centers onto nearby empty
+        pixels before painting/filling. ``"auto"`` enables the same behavior
+        only for dense one-pixel rasters with substantial center collisions.
     soft_rasterization : bool, optional (default ``False``)
         If True, use bilinear splatting for the image raster instead of hard
         one-pixel assignment. Currently supported only for
         ``pixel_perfect=True``, ``tile_px==1``, ``pixel_shape='square'``, and
         the standard imshow raster path.
+    gap_collapse_axis / gap_collapse_max_run_px : optional
+        Optionally collapse short fully-empty raster row/column gaps before
+        rendering.
     """
     # Create a local logger
     logger = logging.getLogger("image_plot")
@@ -1060,6 +1588,95 @@ def image_plot(
 
     if len(dimensions) not in [1, 3]:
         raise ValueError("Visualization requires 1D or 3D embeddings.")
+
+    plot_cache = _prepare_plot_image_cache(
+        adata,
+        cache_image=cache_image,
+        image_cache_key=image_cache_key,
+        refresh_image_cache=refresh_image_cache,
+        verbose=bool(verbose),
+        embedding=embedding,
+        dimensions=dimensions,
+        origin=origin,
+        coordinate_mode=coordinate_mode,
+        array_row_key=array_row_key,
+        array_col_key=array_col_key,
+        color_by=color_by,
+        palette=palette,
+        alpha_by=alpha_by,
+        alpha_range=alpha_range,
+        alpha_clip=alpha_clip,
+        alpha_invert=alpha_invert,
+        prioritize_high_values=prioritize_high_values,
+        overlap_priority=overlap_priority,
+        segment_color_by_major=segment_color_by_major,
+        title=title,
+        use_imshow=use_imshow,
+        brighten_continuous=brighten_continuous,
+        continuous_gamma=continuous_gamma,
+        plot_boundaries=plot_boundaries,
+        boundary_method=boundary_method,
+        boundary_color=boundary_color,
+        boundary_linewidth=boundary_linewidth,
+        boundary_style=boundary_style,
+        boundary_alpha=alpha,
+        pixel_smoothing_sigma=pixel_smoothing_sigma,
+        highlight_segments=highlight_segments,
+        highlight_boundary_color=highlight_boundary_color,
+        highlight_linewidth=highlight_linewidth,
+        highlight_brighten_factor=highlight_brighten_factor,
+        dim_other_segments=dim_other_segments,
+        dim_to_grey=dim_to_grey,
+        segment_key=segment_key,
+        imshow_tile_size=imshow_tile_size,
+        imshow_scale_factor=imshow_scale_factor,
+        imshow_tile_size_mode=imshow_tile_size_mode,
+        imshow_tile_size_quantile=imshow_tile_size_quantile,
+        imshow_tile_size_rounding=imshow_tile_size_rounding,
+        imshow_tile_size_shrink=imshow_tile_size_shrink,
+        pixel_perfect=pixel_perfect,
+        pixel_shape=pixel_shape,
+        chunk_size=chunk_size,
+        runtime_fill_from_boundary=runtime_fill_from_boundary,
+        runtime_fill_closing_radius=runtime_fill_closing_radius,
+        runtime_fill_external_radius=runtime_fill_external_radius,
+        runtime_fill_holes=runtime_fill_holes,
+        gap_collapse_axis=gap_collapse_axis,
+        gap_collapse_max_run_px=gap_collapse_max_run_px,
+        soft_rasterization=soft_rasterization,
+        resolve_center_collisions=resolve_center_collisions,
+        center_collision_radius=center_collision_radius,
+    )
+
+    if _can_render_plot_cache_fast(
+        cache=plot_cache,
+        requested_dimensions=dimensions,
+        show_colorbar=bool(show_colorbar),
+        show_legend=bool(show_legend),
+        segment_show_pie=bool(segment_show_pie),
+        fill_boundaries=bool(fill_boundaries),
+        plot_boundaries=bool(plot_boundaries),
+        boundary_method=str(boundary_method),
+        use_imshow=bool(use_imshow),
+    ):
+        title_text = (
+            f"{embedding} - Dims = {', '.join(map(str, dimensions))}"
+            if title is None
+            else title
+        )
+        if verbose:
+            logger.info("image_plot: rendering directly from cached image.")
+        _render_plot_cache_fast(
+            cache=plot_cache,
+            requested_dimensions=dimensions,
+            title=title_text,
+            figsize=figsize,
+            fig_dpi=fig_dpi,
+            xlim=xlim,
+            ylim=ylim,
+            show_axes=bool(show_axes),
+        )
+        return
 
     # Extract embedding
     if embedding not in adata.obsm:
@@ -1266,6 +1883,7 @@ def image_plot(
             n_points=int(n_points_eff),
             logger=logger,
             context="image_plot(auto-size)",
+            persistent_store=getattr(adata, "uns", None),
         )
         s_data_units_for_imshow = float(raster_canvas_for_imshow["s_data_units"])
         figsize = raster_canvas_for_imshow["figsize"]
@@ -1343,7 +1961,8 @@ def image_plot(
                     ax.set_ylim(y_min_eff, y_max_eff)
                     _apply_axis_crop(ax, xlim=xlim, ylim=ylim)
                     ax.set_aspect("equal")
-                    ax.axis("off")
+                    if not show_axes:
+                        ax.axis("off")
                     title_text = (
                         f"{embedding} - Dims = {', '.join(map(str, dimensions))}"
                         if title is None
@@ -1414,22 +2033,76 @@ def image_plot(
             y_min_eff, y_max_eff = float(y0) - 0.5, float(y1) + 0.5
         if verbose:
             logger.info("Scaled tile size (in pixels): %d", int(s))
-        if resolve_center_collisions and not soft_enabled:
+        collision_info = None
+        apply_collision_resolve, collision_stats, _ = _raster.should_resolve_center_collisions(
+            resolve_center_collisions,
+            cx=cx,
+            cy=cy,
+            w=int(w),
+            h=int(h),
+            tile_px=int(s),
+            pixel_perfect=bool(pixel_perfect),
+            soft_enabled=bool(soft_enabled),
+            logger=logger if verbose else None,
+            context="image_plot",
+        )
+        if apply_collision_resolve:
+            collision_radius_eff = _raster.resolve_collision_search_radius(
+                resolve_center_collisions,
+                base_radius=int(center_collision_radius),
+                collision_stats=collision_stats,
+                logger=logger if verbose else None,
+                context="image_plot",
+            )
             cx, cy, collision_info = _raster.resolve_center_collisions(
                 cx,
                 cy,
                 w=int(w),
                 h=int(h),
-                max_radius=int(center_collision_radius),
+                max_radius=int(collision_radius_eff),
                 logger=logger if verbose else None,
                 context="image_plot",
             )
-        elif resolve_center_collisions and soft_enabled:
-            collision_info = None
+        elif collision_stats is not None:
+            collision_info = {
+                "applied": False,
+                "enabled": _raster.normalize_collision_mode(resolve_center_collisions) != "never",
+                "search_radius": int(max(0, center_collision_radius)),
+                "n_tiles": int(collision_stats["n_tiles"]),
+                "n_unique_centers_before": int(collision_stats["n_unique_centers"]),
+                "n_unique_centers_after": int(collision_stats["n_unique_centers"]),
+                "collision_fraction_before": float(collision_stats["collision_fraction"]),
+                "collision_fraction_after": float(collision_stats["collision_fraction"]),
+                "n_collided_tiles_before": int(collision_stats["n_collided_tiles"]),
+                "n_collided_tiles_after": int(collision_stats["n_collided_tiles"]),
+                "n_reassigned_tiles": 0,
+                "max_stack_before": int(collision_stats["max_stack"]),
+                "max_stack_after": int(collision_stats["max_stack"]),
+                "unresolved_tiles": int(collision_stats["n_collided_tiles"]),
+            }
+        gap_collapse_axis_norm = _normalize_gap_collapse_axis_safe(gap_collapse_axis)
+        gap_collapse_active = bool(
+            gap_collapse_axis_norm is not None and int(max(0, int(gap_collapse_max_run_px))) > 0
+        )
+        if gap_collapse_active and soft_enabled:
             if verbose:
-                logger.info("image_plot: ignoring resolve_center_collisions because soft_rasterization=True.")
-        else:
-            collision_info = None
+                logger.warning(
+                    "gap_collapse is currently incompatible with soft_rasterization; falling back to hard rasterization."
+                )
+            soft_enabled = False
+            soft_fx = None
+            soft_fy = None
+        if gap_collapse_active:
+            cx, cy, w, h, _ = _raster.collapse_empty_center_gaps(
+                cx=cx,
+                cy=cy,
+                w=int(w),
+                h=int(h),
+                axis=gap_collapse_axis_norm,
+                max_gap_run_px=int(gap_collapse_max_run_px),
+                logger=logger if verbose else None,
+                context="image_plot",
+            )
 
         img = np.zeros((h, w, 4), dtype=np.float32)
         paint_mask = np.zeros((h, w), dtype=bool)
@@ -1478,6 +2151,8 @@ def image_plot(
                 closing_radius=int(fill_radius),
                 external_radius=int(external_radius),
                 fill_holes=bool(runtime_fill_holes),
+                use_observed_pixels=bool(int(s) == 1),
+                persistent_store=getattr(adata, "uns", None),
                 logger=logger if verbose else None,
                 context="image_plot",
             )
@@ -1496,7 +2171,8 @@ def image_plot(
         )
         _apply_axis_crop(ax, xlim=xlim, ylim=ylim)
         ax.set_aspect("equal")
-        ax.axis("off")
+        if not show_axes:
+            ax.axis("off")
         title_text = (
             f"{embedding} - Dims = {', '.join(map(str, dimensions))}"
             if title is None
@@ -1858,6 +2534,7 @@ def image_plot(
             n_points=int(n_points_eff),
             logger=logger,
             context="image_plot(auto-size)",
+            persistent_store=getattr(adata, "uns", None),
         )
         s_data_units_for_imshow = float(raster_canvas_for_imshow["s_data_units"])
         figsize = raster_canvas_for_imshow["figsize"]
@@ -2032,6 +2709,7 @@ def image_plot(
                 n_points=int(n_points_eff),
                 logger=logger,
                 context=raster_context,
+                persistent_store=getattr(adata, "uns", None),
             )
         s_data_units = float(raster_canvas["s_data_units"])
         x_min_eff = float(raster_canvas["x_min_eff"])
@@ -2108,22 +2786,76 @@ def image_plot(
             y_min_eff, y_max_eff = float(y0) - 0.5, float(y1) + 0.5
         if verbose:
             logger.info("Scaled tile size (in pixels): %d", int(s))
-        if resolve_center_collisions and not soft_enabled:
+        collision_info = None
+        apply_collision_resolve, collision_stats, _ = _raster.should_resolve_center_collisions(
+            resolve_center_collisions,
+            cx=cx,
+            cy=cy,
+            w=int(w),
+            h=int(h),
+            tile_px=int(s),
+            pixel_perfect=bool(pixel_perfect),
+            soft_enabled=bool(soft_enabled),
+            logger=logger if verbose else None,
+            context="image_plot",
+        )
+        if apply_collision_resolve:
+            collision_radius_eff = _raster.resolve_collision_search_radius(
+                resolve_center_collisions,
+                base_radius=int(center_collision_radius),
+                collision_stats=collision_stats,
+                logger=logger if verbose else None,
+                context="image_plot",
+            )
             cx, cy, collision_info = _raster.resolve_center_collisions(
                 cx,
                 cy,
                 w=int(w),
                 h=int(h),
-                max_radius=int(center_collision_radius),
+                max_radius=int(collision_radius_eff),
                 logger=logger if verbose else None,
                 context="image_plot",
             )
-        elif resolve_center_collisions and soft_enabled:
-            collision_info = None
+        elif collision_stats is not None:
+            collision_info = {
+                "applied": False,
+                "enabled": _raster.normalize_collision_mode(resolve_center_collisions) != "never",
+                "search_radius": int(max(0, center_collision_radius)),
+                "n_tiles": int(collision_stats["n_tiles"]),
+                "n_unique_centers_before": int(collision_stats["n_unique_centers"]),
+                "n_unique_centers_after": int(collision_stats["n_unique_centers"]),
+                "collision_fraction_before": float(collision_stats["collision_fraction"]),
+                "collision_fraction_after": float(collision_stats["collision_fraction"]),
+                "n_collided_tiles_before": int(collision_stats["n_collided_tiles"]),
+                "n_collided_tiles_after": int(collision_stats["n_collided_tiles"]),
+                "n_reassigned_tiles": 0,
+                "max_stack_before": int(collision_stats["max_stack"]),
+                "max_stack_after": int(collision_stats["max_stack"]),
+                "unresolved_tiles": int(collision_stats["n_collided_tiles"]),
+            }
+        gap_collapse_axis_norm = _normalize_gap_collapse_axis_safe(gap_collapse_axis)
+        gap_collapse_active = bool(
+            gap_collapse_axis_norm is not None and int(max(0, int(gap_collapse_max_run_px))) > 0
+        )
+        if gap_collapse_active and soft_enabled:
             if verbose:
-                logger.info("image_plot: ignoring resolve_center_collisions because soft_rasterization=True.")
-        else:
-            collision_info = None
+                logger.warning(
+                    "gap_collapse is currently incompatible with soft_rasterization; falling back to hard rasterization."
+                )
+            soft_enabled = False
+            soft_fx = None
+            soft_fy = None
+        if gap_collapse_active:
+            cx, cy, w, h, _ = _raster.collapse_empty_center_gaps(
+                cx=cx,
+                cy=cy,
+                w=int(w),
+                h=int(h),
+                axis=gap_collapse_axis_norm,
+                max_gap_run_px=int(gap_collapse_max_run_px),
+                logger=logger if verbose else None,
+                context="image_plot",
+            )
 
         # 4) RGBA buffer + depth buffer
         img = np.zeros((h, w, 4), dtype=np.float32)  # start fully transparent
@@ -2242,6 +2974,8 @@ def image_plot(
                 closing_radius=int(fill_radius),
                 external_radius=int(external_radius),
                 fill_holes=bool(runtime_fill_holes),
+                use_observed_pixels=bool(int(s) == 1),
+                persistent_store=getattr(adata, "uns", None),
                 logger=logger if verbose else None,
                 context="image_plot",
             )
@@ -2618,7 +3352,8 @@ def image_plot(
                         )
 
     ax.set_aspect("equal")
-    ax.axis("off")
+    if not show_axes:
+        ax.axis("off")
     title_text = (
         f"{embedding} - Dims = {', '.join(map(str, dimensions))}"
         if title is None
@@ -3097,9 +3832,15 @@ def image_plot_with_spatial_image(
     runtime_fill_closing_radius: int = 1,
     runtime_fill_external_radius: int = 0,
     runtime_fill_holes: bool = True,
+    gap_collapse_axis: str | None = None,
+    gap_collapse_max_run_px: int = 1,
     soft_rasterization: bool = False,
-    resolve_center_collisions: bool = False,
+    resolve_center_collisions: bool | str = "auto",
     center_collision_radius: int = 2,
+    cache_image: bool = False,
+    image_cache_key: str | None = None,
+    refresh_image_cache: bool = False,
+    show_axes: bool = False,
 ):
     """
     Visualize embeddings as an image with optional segment boundaries and background image overlay.
@@ -3122,6 +3863,65 @@ def image_plot_with_spatial_image(
 
     if len(dimensions) not in [1, 3]:
         raise ValueError("Only 1 or 3 dimensions can be used for visualization.")
+
+    plot_cache = _prepare_plot_image_cache(
+        adata,
+        cache_image=cache_image,
+        image_cache_key=image_cache_key,
+        refresh_image_cache=refresh_image_cache,
+        verbose=bool(verbose),
+        embedding=embedding,
+        dimensions=dimensions,
+        origin=origin,
+        coordinate_mode=coordinate_mode,
+        array_row_key=array_row_key,
+        array_col_key=array_col_key,
+        color_by=color_by,
+        palette=palette,
+        alpha_by=alpha_by,
+        alpha_range=alpha_range,
+        alpha_clip=alpha_clip,
+        alpha_invert=alpha_invert,
+        prioritize_high_values=prioritize_high_values,
+        overlap_priority=overlap_priority,
+        segment_color_by_major=segment_color_by_major,
+        title=title,
+        use_imshow=use_imshow,
+        brighten_continuous=brighten_continuous,
+        continuous_gamma=continuous_gamma,
+        plot_boundaries=plot_boundaries,
+        boundary_method=boundary_method,
+        boundary_color=boundary_color,
+        boundary_linewidth=boundary_linewidth,
+        boundary_style=boundary_style,
+        boundary_alpha=alpha,
+        pixel_smoothing_sigma=pixel_smoothing_sigma,
+        highlight_segments=highlight_segments,
+        highlight_boundary_color=highlight_boundary_color,
+        highlight_linewidth=highlight_linewidth,
+        highlight_brighten_factor=highlight_brighten_factor,
+        dim_other_segments=dim_other_segments,
+        dim_to_grey=dim_to_grey,
+        segment_key=segment_key,
+        imshow_tile_size=imshow_tile_size,
+        imshow_scale_factor=imshow_scale_factor,
+        imshow_tile_size_mode=imshow_tile_size_mode,
+        imshow_tile_size_quantile=imshow_tile_size_quantile,
+        imshow_tile_size_rounding=imshow_tile_size_rounding,
+        imshow_tile_size_shrink=imshow_tile_size_shrink,
+        pixel_perfect=pixel_perfect,
+        pixel_shape=pixel_shape,
+        chunk_size=chunk_size,
+        runtime_fill_from_boundary=runtime_fill_from_boundary,
+        runtime_fill_closing_radius=runtime_fill_closing_radius,
+        runtime_fill_external_radius=runtime_fill_external_radius,
+        runtime_fill_holes=runtime_fill_holes,
+        gap_collapse_axis=gap_collapse_axis,
+        gap_collapse_max_run_px=gap_collapse_max_run_px,
+        soft_rasterization=soft_rasterization,
+        resolve_center_collisions=resolve_center_collisions,
+        center_collision_radius=center_collision_radius,
+    )
 
     # Extract embeddings
     if embedding not in adata.obsm:
@@ -3154,6 +3954,53 @@ def image_plot_with_spatial_image(
         except Exception:
             img_origin_x = 0.0
             img_origin_y = 0.0
+
+    if _can_render_plot_cache_fast(
+        cache=plot_cache,
+        requested_dimensions=dimensions,
+        show_colorbar=bool(show_colorbar),
+        show_legend=bool(show_legend),
+        segment_show_pie=bool(segment_show_pie),
+        fill_boundaries=bool(fill_boundaries),
+        plot_boundaries=bool(plot_boundaries),
+        boundary_method=str(boundary_method),
+        use_imshow=bool(use_imshow),
+    ):
+        title_text = (
+            f"{embedding} - Dims = {', '.join(map(str, dimensions))}"
+            if title is None
+            else title
+        )
+        background_extent = None
+        background_origin = None
+        orientation = str(display_orientation or "image").lower()
+        if orientation not in {"image", "cartesian"}:
+            orientation = "image"
+        if img is not None:
+            y_max_img, x_max_img = img.shape[:2]
+            if orientation == "cartesian":
+                background_extent = [0, x_max_img, 0, y_max_img]
+                background_origin = "lower"
+            else:
+                background_extent = [0, x_max_img, y_max_img, 0]
+                background_origin = None
+        if verbose:
+            logger.info("image_plot_with_spatial_image: rendering directly from cached image.")
+        _render_plot_cache_fast(
+            cache=plot_cache,
+            requested_dimensions=dimensions,
+            title=title_text,
+            figsize=figsize,
+            fig_dpi=fig_dpi,
+            xlim=xlim,
+            ylim=ylim,
+            show_axes=bool(show_axes),
+            background_img=img,
+            background_extent=background_extent,
+            background_origin=background_origin,
+            background_alpha=alpha_img,
+        )
+        return
 
     # Extract spatial coordinates
     use_direct_origin_spatial = False
@@ -3571,6 +4418,7 @@ def image_plot_with_spatial_image(
             n_points=int(n_points_eff),
             logger=logger,
             context="image_plot_with_spatial_image(auto-size)",
+            persistent_store=getattr(adata, "uns", None),
         )
         s_data_units_for_imshow = float(raster_canvas_for_imshow["s_data_units"])
         figsize = raster_canvas_for_imshow["figsize"]
@@ -3789,6 +4637,7 @@ def image_plot_with_spatial_image(
                 n_points=int(n_points_eff),
                 logger=logger,
                 context=raster_context,
+                persistent_store=getattr(adata, "uns", None),
             )
         s_data_units = float(raster_canvas["s_data_units"])
         x_min_eff = float(raster_canvas["x_min_eff"])
@@ -3815,6 +4664,8 @@ def image_plot_with_spatial_image(
             pixel_perfect=bool(pixel_perfect),
             pixel_shape=pixel_shape,
             coord_mode=coord_mode,
+            gap_collapse_axis=gap_collapse_axis,
+            gap_collapse_max_run_px=gap_collapse_max_run_px,
             soft_rasterization=soft_rasterization,
             resolve_center_collisions=resolve_center_collisions,
             center_collision_radius=center_collision_radius,
@@ -3859,6 +4710,7 @@ def image_plot_with_spatial_image(
             runtime_fill_external_radius=int(runtime_fill_external_radius),
             runtime_fill_holes=bool(runtime_fill_holes),
             chunk_size=int(chunk_size),
+            persistent_store=getattr(adata, "uns", None),
             logger=logger,
             verbose=verbose,
             context="image_plot_with_spatial_image",
@@ -4025,6 +4877,7 @@ def image_plot_with_spatial_image(
                     n_points=int(len(pts)),
                     logger=logger if verbose else None,
                     context="image_plot_with_spatial_image(scatter-boundaries)",
+                    persistent_store=getattr(adata, "uns", None),
                 )
                 raster_state = _resolve_plot_raster_state(
                     pts,
@@ -4039,6 +4892,8 @@ def image_plot_with_spatial_image(
                     pixel_perfect=bool(pixel_perfect),
                     pixel_shape=pixel_shape,
                     coord_mode=coord_mode,
+                    gap_collapse_axis=gap_collapse_axis,
+                    gap_collapse_max_run_px=gap_collapse_max_run_px,
                     soft_rasterization=soft_rasterization,
                     resolve_center_collisions=resolve_center_collisions,
                     center_collision_radius=center_collision_radius,
@@ -4069,6 +4924,7 @@ def image_plot_with_spatial_image(
                     runtime_fill_external_radius=int(runtime_fill_external_radius),
                     runtime_fill_holes=bool(runtime_fill_holes),
                     chunk_size=int(chunk_size),
+                    persistent_store=getattr(adata, "uns", None),
                     logger=logger,
                     verbose=verbose,
                     context="image_plot_with_spatial_image(scatter-boundaries)",
@@ -4300,6 +5156,8 @@ def image_plot_with_spatial_image(
         title_text = f"{embedding} - Dims = {', '.join(map(str, dimensions))}"
     else:
         title_text = title
+    if not show_axes:
+        ax.axis("off")
     ax.set_title(title_text, fontsize=figsize[0] * 1.5)
     if show_colorbar and len(dimensions) == 1 and not use_categorical:
         cm = plt.get_cmap(cmap if cmap is not None else "Greys")

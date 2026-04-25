@@ -20,6 +20,8 @@ shapely
 tqdm
 alphashape
 igraph
+zarr
+numcodecs
 
 [harmony]
 harmonypy

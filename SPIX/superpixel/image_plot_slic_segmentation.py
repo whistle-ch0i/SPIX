@@ -1,6 +1,7 @@
 import numpy as np
 import logging
 import os
+import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -11,6 +12,25 @@ from skimage.segmentation import slic
 from skimage.transform import resize
 
 from SPIX.visualization import raster as _raster
+from SPIX.image_processing.image_cache import get_cached_image
+
+
+def _normalize_gap_collapse_axis_safe(axis) -> Optional[str]:
+    normalize_fn = getattr(_raster, "normalize_gap_collapse_axis", None)
+    if callable(normalize_fn):
+        return normalize_fn(axis)
+    if axis is None:
+        return None
+    text = str(axis).strip().lower()
+    if text in {"", "none", "off", "false", "no", "0"}:
+        return None
+    if text in {"y", "row", "rows", "vertical"}:
+        return "y"
+    if text in {"x", "col", "cols", "column", "columns", "horizontal"}:
+        return "x"
+    if text in {"both", "xy", "yx"}:
+        return "both"
+    return None
 
 
 def _apply_brighten_continuous_rgb(rgb: np.ndarray, continuous_gamma: float) -> np.ndarray:
@@ -327,8 +347,10 @@ def image_plot_slic_segmentation(
     runtime_fill_closing_radius: int = 1,
     runtime_fill_external_radius: int = 0,
     runtime_fill_holes: bool = True,
+    gap_collapse_axis: str | None = None,
+    gap_collapse_max_run_px: int = 1,
     soft_rasterization: bool = False,
-    resolve_center_collisions: bool = False,
+    resolve_center_collisions: bool | str = "auto",
     center_collision_radius: int = 2,
     show_image: bool = False,
     verbose: bool = True,
@@ -340,6 +362,7 @@ def image_plot_slic_segmentation(
     match_requested_segments: bool = False,
     max_segment_tuning_steps: int = 4,
     return_raster_meta: bool = False,
+    persistent_store=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     """CPU-based SLIC segmentation on embeddings with chunked image creation.
 
@@ -366,15 +389,20 @@ def image_plot_slic_segmentation(
     runtime_fill_holes : bool, optional (default ``True``)
         Whether to fill enclosed holes in the raster occupancy mask when
         ``runtime_fill_from_boundary=True``.
+    gap_collapse_axis : {"x", "y", "both"} or None, optional (default ``None``)
+        Collapse short fully-empty raster row/column gaps before SLIC.
+    gap_collapse_max_run_px : int, optional (default ``1``)
+        Maximum empty run length that will be removed when
+        ``gap_collapse_axis`` is enabled.
     soft_rasterization : bool, optional (default ``False``)
         If ``True``, rasterize each spot with bilinear splatting and read SLIC
         labels back with bilinear voting instead of hard one-pixel assignment.
         Currently supported only for ``pixel_perfect=True``, ``tile_px==1`` and
         ``pixel_shape='square'``.
-    resolve_center_collisions : bool, optional (default ``False``)
-        If ``True``, locally reassign duplicate raster centers onto nearby free
-        pixels before painting/fill/label lookup. Useful for dense origin-based
-        rasterization when many spots quantize onto the same pixel.
+    resolve_center_collisions : bool or {"auto"}, optional (default ``"auto"``)
+        ``True`` always reassigns duplicate raster centers onto nearby free
+        pixels before painting/fill/label lookup. ``"auto"`` applies the same
+        step only for dense one-pixel rasters with substantial collisions.
     center_collision_radius : int, optional (default ``2``)
         Search radius in raster pixels used when
         ``resolve_center_collisions=True``.
@@ -427,11 +455,6 @@ def image_plot_slic_segmentation(
     scaler = MinMaxScaler()
     cols = scaler.fit_transform(embeddings.astype(np.float32))
 
-    if log is not None:
-        log.info("Creating image with chunking (chunk size: %d)...", int(chunk_size))
-    img = np.ones((h, w, dims), dtype=np.float32)
-    paint_mask = np.zeros((h, w), dtype=bool)
-
     dx, dy = _raster.tile_pixel_offsets(int(s), pixel_shape=pixel_shape)
 
     soft_enabled = bool(soft_rasterization)
@@ -463,19 +486,96 @@ def image_plot_slic_segmentation(
             w=int(w),
             h=int(h),
         )
+    w_output = int(w)
+    h_output = int(h)
+    cx_seed_output = np.asarray(cx_seed, dtype=np.int32, copy=True)
+    cy_seed_output = np.asarray(cy_seed, dtype=np.int32, copy=True)
     collision_info = None
-    if resolve_center_collisions and not soft_enabled:
+    apply_collision_resolve, collision_stats, _ = _raster.should_resolve_center_collisions(
+        resolve_center_collisions,
+        cx=cx_seed,
+        cy=cy_seed,
+        w=int(w),
+        h=int(h),
+        tile_px=int(s),
+        pixel_perfect=bool(pixel_perfect),
+        soft_enabled=bool(soft_enabled),
+        logger=log,
+        context="image_plot_slic_segmentation",
+    )
+    if apply_collision_resolve:
+        collision_radius_eff = _raster.resolve_collision_search_radius(
+            resolve_center_collisions,
+            base_radius=int(center_collision_radius),
+            collision_stats=collision_stats,
+            logger=log,
+            context="image_plot_slic_segmentation",
+        )
         cx_seed, cy_seed, collision_info = _raster.resolve_center_collisions(
             cx_seed,
             cy_seed,
             w=int(w),
             h=int(h),
-            max_radius=int(center_collision_radius),
+            max_radius=int(collision_radius_eff),
             logger=log,
             context="image_plot_slic_segmentation",
         )
-    elif resolve_center_collisions and soft_enabled and log is not None:
-        log.info("image_plot_slic_segmentation: ignoring resolve_center_collisions because soft_rasterization=True.")
+    elif collision_stats is not None:
+        collision_info = {
+            "applied": False,
+            "enabled": _raster.normalize_collision_mode(resolve_center_collisions) != "never",
+            "search_radius": int(max(0, center_collision_radius)),
+            "n_tiles": int(collision_stats["n_tiles"]),
+            "n_unique_centers_before": int(collision_stats["n_unique_centers"]),
+            "n_unique_centers_after": int(collision_stats["n_unique_centers"]),
+            "collision_fraction_before": float(collision_stats["collision_fraction"]),
+            "collision_fraction_after": float(collision_stats["collision_fraction"]),
+            "n_collided_tiles_before": int(collision_stats["n_collided_tiles"]),
+            "n_collided_tiles_after": int(collision_stats["n_collided_tiles"]),
+            "n_reassigned_tiles": 0,
+            "max_stack_before": int(collision_stats["max_stack"]),
+            "max_stack_after": int(collision_stats["max_stack"]),
+            "unresolved_tiles": int(collision_stats["n_collided_tiles"]),
+        }
+
+    gap_collapse_axis_norm = _normalize_gap_collapse_axis_safe(gap_collapse_axis)
+    gap_collapse_active = bool(gap_collapse_axis_norm is not None and int(max(0, int(gap_collapse_max_run_px))) > 0)
+    gap_collapse_info = {
+        "applied": False,
+        "axis": gap_collapse_axis_norm,
+        "max_gap_run_px": int(max(0, int(gap_collapse_max_run_px))),
+        "rows_removed": 0,
+        "cols_removed": 0,
+        "row_runs_removed": 0,
+        "col_runs_removed": 0,
+        "w_before": int(w),
+        "h_before": int(h),
+        "w_after": int(w),
+        "h_after": int(h),
+    }
+    if gap_collapse_active and soft_enabled:
+        if log is not None:
+            log.warning(
+                "gap_collapse is currently incompatible with soft_rasterization; falling back to hard rasterization."
+            )
+        soft_enabled = False
+        soft_fx_seed = None
+        soft_fy_seed = None
+    if gap_collapse_active:
+        cx_seed, cy_seed, w, h, gap_collapse_info = _raster.collapse_empty_center_gaps(
+            cx=cx_seed,
+            cy=cy_seed,
+            w=int(w),
+            h=int(h),
+            axis=gap_collapse_axis_norm,
+            max_gap_run_px=int(gap_collapse_max_run_px),
+            logger=log,
+            context="image_plot_slic_segmentation",
+        )
+    if log is not None:
+        log.info("Creating image with chunking (chunk size: %d)...", int(chunk_size))
+    img = np.ones((h, w, dims), dtype=np.float32)
+    paint_mask = np.zeros((h, w), dtype=bool)
 
     if soft_enabled:
         _raster.rasterize_soft_bilinear(
@@ -516,6 +616,8 @@ def image_plot_slic_segmentation(
             closing_radius=int(fill_radius),
             external_radius=int(external_radius),
             fill_holes=bool(runtime_fill_holes),
+            use_observed_pixels=bool(int(s) == 1),
+            persistent_store=persistent_store,
             logger=log,
             context="image_plot_slic_segmentation",
         )
@@ -539,7 +641,7 @@ def image_plot_slic_segmentation(
                 w=int(w),
                 h=int(h),
             )
-        elif resolve_center_collisions:
+        elif gap_collapse_active or (collision_info is not None and bool(collision_info.get("applied", False))):
             factor = int(max(1, round(float(downsample_factor))))
             cx = np.clip((cx_seed // factor).astype(np.int32, copy=False), 0, max(0, w - 1))
             cy = np.clip((cy_seed // factor).astype(np.int32, copy=False), 0, max(0, h - 1))
@@ -656,6 +758,23 @@ def image_plot_slic_segmentation(
             display_source_img = slic_img
     if log is not None:
         log.info("CPU SLIC complete.")
+    display_label_img = label_img
+    support_mask_output = np.asarray(support_mask, dtype=bool, copy=True)
+    if gap_collapse_active:
+        label_img_output = np.full((int(h_output), int(w_output)), -1, dtype=np.int32)
+        support_mask_output = np.zeros((int(h_output), int(w_output)), dtype=bool)
+        tile_value_count = int(len(dx))
+        for i in range(0, num_tiles, chunk_size):
+            chunk_end = min(i + chunk_size, num_tiles)
+            chunk_indices = np.arange(i, chunk_end)
+            out_x = np.clip((cx_seed_output[chunk_indices, None] + dx[None, :]).ravel(), 0, max(0, int(w_output) - 1))
+            out_y = np.clip((cy_seed_output[chunk_indices, None] + dy[None, :]).ravel(), 0, max(0, int(h_output) - 1))
+            tile_labels = np.repeat(np.asarray(labels[chunk_indices], dtype=np.int32), tile_value_count)
+            label_img_output[out_y, out_x] = tile_labels
+            support_mask_output[out_y, out_x] = True
+        label_img = label_img_output
+    else:
+        label_img = np.asarray(label_img, dtype=np.int32)
     if show_image:
         import matplotlib.pyplot as plt
 
@@ -678,11 +797,11 @@ def image_plot_slic_segmentation(
 
         from matplotlib.colors import ListedColormap
 
-        valid_labels = label_img[label_img >= 0]
+        valid_labels = display_label_img[display_label_img >= 0]
         max_label = int(valid_labels.max()) if valid_labels.size > 0 else 0
         rng = np.random.default_rng(0)
         rand_cmap = ListedColormap(rng.random((max_label + 1, 3)))
-        display_labels = np.ma.masked_where(label_img < 0, label_img)
+        display_labels = np.ma.masked_where(display_label_img < 0, display_label_img)
 
         plt.figure(figsize=figsize, dpi=fig_dpi if fig_dpi is not None else None)
         plt.imshow(display_labels, origin="lower", cmap="nipy_spectral", interpolation="nearest")
@@ -697,18 +816,21 @@ def image_plot_slic_segmentation(
         "x_max_eff": float(x_max_eff),
         "y_min_eff": float(y_min_eff),
         "y_max_eff": float(y_max_eff),
-        "w": int(w),
-        "h": int(h),
-        "support_mask": np.asarray(support_mask, dtype=bool, copy=True),
+        "w": int(label_img.shape[1]),
+        "h": int(label_img.shape[0]),
+        "support_mask": np.asarray(support_mask_output, dtype=bool, copy=True),
         "mask_background": bool(mask_background),
         "runtime_fill_from_boundary": bool(runtime_fill_from_boundary),
         "runtime_fill_closing_radius": int(runtime_fill_closing_radius),
         "runtime_fill_external_radius": int(runtime_fill_external_radius),
         "runtime_fill_holes": bool(runtime_fill_holes),
-        "resolve_center_collisions": bool(resolve_center_collisions),
+        "resolve_center_collisions": _raster.normalize_collision_mode(resolve_center_collisions),
         "center_collision_radius": int(center_collision_radius),
         "pixel_shape": str(pixel_shape),
         "pixel_perfect": bool(pixel_perfect),
+        "gap_collapse_axis": gap_collapse_axis_norm,
+        "gap_collapse_max_run_px": int(max(0, int(gap_collapse_max_run_px))),
+        "gap_collapse_info": dict(gap_collapse_info),
     }
     if return_raster_meta:
         return labels, label_img, display_source_img, raster_meta
@@ -732,6 +854,7 @@ def slic_segmentation_from_cached_image(
     match_requested_segments: bool = False,
     max_segment_tuning_steps: int = 4,
     return_raster_meta: bool = False,
+    sample_take: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, dict]:
     """Run SLIC on a precomputed cached image dict.
 
@@ -739,12 +862,21 @@ def slic_segmentation_from_cached_image(
     Returns tile-level labels (aligned to the cached tile order) and the label image.
     """
     logger.setLevel(logging.INFO if verbose else logging.WARNING)
-    img = np.asarray(cache.get("img"))
+    t_load0 = time.perf_counter()
+    img = np.asarray(get_cached_image(cache))
     if img.ndim != 3:
         raise ValueError("Cached image must have shape (H, W, C).")
 
     support_mask = cache.get("support_mask", None)
     support_mask_arr = None if support_mask is None else np.asarray(support_mask, dtype=bool)
+    t_load1 = time.perf_counter()
+    if verbose:
+        logger.info(
+            "Loaded cached image and support mask in %.3fs (img_shape=%s, has_mask=%s).",
+            float(t_load1 - t_load0),
+            tuple(int(x) for x in img.shape),
+            bool(support_mask_arr is not None),
+        )
 
     cx = np.asarray(cache.get("cx"), dtype=int)
     cy = np.asarray(cache.get("cy"), dtype=int)
@@ -769,20 +901,48 @@ def slic_segmentation_from_cached_image(
     slic_img = img
     slic_cx = np.asarray(cx, dtype=np.int32)
     slic_cy = np.asarray(cy, dtype=np.int32)
+    sample_idx = None if sample_take is None else np.asarray(sample_take, dtype=np.int64).ravel()
+    if sample_idx is None:
+        sample_cx = slic_cx
+        sample_cy = slic_cy
+    else:
+        sample_cx = slic_cx[sample_idx]
+        sample_cy = slic_cy[sample_idx]
+    if bool(cache.get("soft_rasterization", False)):
+        soft_fx_arr = np.asarray(soft_fx, dtype=np.float32)
+        soft_fy_arr = np.asarray(soft_fy, dtype=np.float32)
+        sample_soft_fx = soft_fx_arr if sample_idx is None else soft_fx_arr[sample_idx]
+        sample_soft_fy = soft_fy_arr if sample_idx is None else soft_fy_arr[sample_idx]
     masked_mode = str(masked_slic_mode or "strict").lower()
     if masked_mode not in {"strict", "fast_fill"}:
         masked_mode = "strict"
     if bool(match_requested_segments) or (slic_mask is not None and masked_mode == "strict"):
+        if verbose and slic_mask is not None:
+            logger.info(
+                "Running cached masked SLIC in strict mode (mask loaded from cache; support_pixels=%d).",
+                int(np.count_nonzero(slic_mask)),
+            )
         if bool(cache.get("soft_rasterization", False)):
             sample_labels_fn = lambda arr: _raster.sample_labels_soft_bilinear(
                 arr,
-                slic_cx,
-                slic_cy,
-                np.asarray(soft_fx, dtype=np.float32),
-                np.asarray(soft_fy, dtype=np.float32),
+                sample_cx,
+                sample_cy,
+                sample_soft_fx,
+                sample_soft_fy,
             ).astype(int, copy=False)
         else:
-            sample_labels_fn = lambda arr: arr[slic_cy, slic_cx].astype(int)
+            sample_labels_fn = lambda arr: arr[sample_cy, sample_cx].astype(int)
+        if bool(cache.get("soft_rasterization", False)):
+            sample_labels_fn = lambda arr: _raster.sample_labels_soft_bilinear(
+                arr,
+                sample_cx,
+                sample_cy,
+                sample_soft_fx,
+                sample_soft_fy,
+            ).astype(int, copy=False)
+        else:
+            sample_labels_fn = lambda arr: arr[sample_cy, sample_cx].astype(int)
+        t_slic0 = time.perf_counter()
         label_img = slic(
             slic_img,
             n_segments=int(n_segments),
@@ -793,18 +953,21 @@ def slic_segmentation_from_cached_image(
             channel_axis=-1,
             enforce_connectivity=bool(enforce_connectivity),
         )
+        t_slic1 = time.perf_counter()
         label_img = np.asarray(label_img, dtype=np.int32)
         if slic_mask is not None and slic_mask.shape == label_img.shape:
             label_img[~slic_mask] = -1
         raw_labels = np.asarray(sample_labels_fn(label_img), dtype=np.int32)
         display_source_img = slic_img
-        point_features = np.asarray(slic_img[slic_cy, slic_cx], dtype=np.float32)
+        point_features = np.asarray(slic_img[sample_cy, sample_cx], dtype=np.float32)
+        t_adjust0 = time.perf_counter()
         labels = _enforce_requested_observed_count(
             raw_labels,
             requested_n_segments=int(n_segments),
-            spatial_coords=np.column_stack([slic_cx, slic_cy]).astype(np.float32, copy=False),
+            spatial_coords=np.column_stack([sample_cx, sample_cy]).astype(np.float32, copy=False),
             embeddings=point_features,
         )
+        t_adjust1 = time.perf_counter()
         if verbose:
             logger.info(
                 "Adjusted observed cached segment count to %d (raw=%d, adjusted=%d).",
@@ -812,20 +975,29 @@ def slic_segmentation_from_cached_image(
                 int(_count_observed_segments(np.asarray(raw_labels, dtype=np.int32))),
                 int(_count_observed_segments(labels)),
             )
+            logger.info(
+                "Cached strict masked SLIC timings: slic=%.3fs | adjust=%.3fs.",
+                float(t_slic1 - t_slic0),
+                float(t_adjust1 - t_adjust0),
+            )
     else:
         if bool(cache.get("soft_rasterization", False)):
             sample_labels_fn = lambda arr: _raster.sample_labels_soft_bilinear(
                 arr,
-                slic_cx,
-                slic_cy,
-                np.asarray(soft_fx, dtype=np.float32),
-                np.asarray(soft_fy, dtype=np.float32),
+                sample_cx,
+                sample_cy,
+                sample_soft_fx,
+                sample_soft_fy,
             ).astype(int, copy=False)
         else:
-            sample_labels_fn = lambda arr: arr[slic_cy, slic_cx].astype(int)
+            sample_labels_fn = lambda arr: arr[sample_cy, sample_cx].astype(int)
         if slic_mask is not None:
             if verbose:
-                logger.info("Running fast masked cached SLIC via nearest-support fill...")
+                logger.info(
+                    "Running fast masked cached SLIC via nearest-support fill (mask loaded from cache; support_pixels=%d).",
+                    int(np.count_nonzero(slic_mask)),
+                )
+            t_fast0 = time.perf_counter()
             labels, label_img, display_source_img = _run_fast_masked_slic(
                 img=slic_img,
                 support_mask=slic_mask,
@@ -834,6 +1006,9 @@ def slic_segmentation_from_cached_image(
                 enforce_connectivity=bool(enforce_connectivity),
                 sample_labels_fn=sample_labels_fn,
             )
+            t_fast1 = time.perf_counter()
+            if verbose:
+                logger.info("Cached fast masked SLIC timing: total=%.3fs.", float(t_fast1 - t_fast0))
         else:
             run_n_segments, est_info = _estimate_internal_n_segments(
                 requested_n_segments=int(n_segments),
@@ -849,6 +1024,7 @@ def slic_segmentation_from_cached_image(
                     float(est_info["support_fraction"]),
                     float(est_info["unique_center_fraction"]),
                 )
+            t_slic0 = time.perf_counter()
             label_img = slic(
                 slic_img,
                 n_segments=int(run_n_segments),
@@ -859,9 +1035,12 @@ def slic_segmentation_from_cached_image(
                 channel_axis=-1,
                 enforce_connectivity=bool(enforce_connectivity),
             )
+            t_slic1 = time.perf_counter()
             label_img = np.asarray(label_img, dtype=np.int32)
             labels = np.asarray(sample_labels_fn(label_img), dtype=np.int32)
             display_source_img = slic_img
+            if verbose:
+                logger.info("Cached unmasked SLIC timing: slic=%.3fs.", float(t_slic1 - t_slic0))
 
     if show_image:
         import matplotlib.pyplot as plt
