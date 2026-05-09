@@ -14,7 +14,7 @@ _TILE_SIZE_CACHE_MAX = 16
 _RASTER_CANVAS_CACHE_MAX = 16
 _PERSISTENT_RASTER_CANVAS_CACHE_MAX = 64
 _PERSISTENT_RASTER_CANVAS_BUCKET_KEY = "_spix_raster_canvas_cache_v1"
-_RASTER_CANVAS_CACHE_VERSION = "20260417_persist_v1"
+_RASTER_CANVAS_CACHE_VERSION = "20260426_tilepx1_noforce_v1"
 _FILL_ASSIGNMENT_CACHE_MAX = 16
 _PERSISTENT_FILL_CACHE_MAX = 32
 _PERSISTENT_FILL_CACHE_BUCKET_KEY = "_spix_raster_fill_cache_v1"
@@ -640,7 +640,7 @@ def maybe_boost_canvas_for_unique_centers(
         )
     )
     force_target_unique = str(
-        os.environ.get("SPIX_PLOT_FORCE_TARGET_UNIQUE_CENTERS", "1")
+        os.environ.get("SPIX_PLOT_FORCE_TARGET_UNIQUE_CENTERS", "0")
     ).strip().lower() not in {"0", "false", "no"}
     force_max_boost = float(
         np.clip(
@@ -1152,7 +1152,7 @@ def resolve_raster_canvas(
                 np.clip(
                     tile_px_target,
                     1,
-                    int(max(1, int(os.environ.get("SPIX_PLOT_DISPLAY_MAX_TILE_PX", "4")))),
+                    int(max(1, int(os.environ.get("SPIX_PLOT_DISPLAY_MAX_TILE_PX", "1")))),
                 )
             )
             if tile_px_target > int(tile_px):

@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import io
 import logging
-from typing import List, Dict, Optional, Tuple
+from typing import Iterable, List, Dict, Optional, Tuple
 import seaborn as sns
 import matplotlib.pyplot as plt
 
@@ -21,6 +21,37 @@ if not logger.handlers:
 
 # Disable propagation to avoid duplicate logs
 logger.propagate = False
+
+
+COAD_ENRICHMENT_DATABASES = [
+    "DisGeNET",
+    "Jensen_DISEASES",
+    "GWAS_Catalog_2023",
+    "KEGG_2021_Human",
+    "Reactome_2022",
+    "MSigDB_Hallmark_2020",
+    "GO_Biological_Process_2023",
+]
+
+COAD_ENRICHMENT_KEYWORDS = [
+    "coad",
+    "colon",
+    "colorectal",
+    "rectal",
+    "bowel",
+    "large intestine",
+    "intestinal cancer",
+    "crc",
+]
+
+PAN_CANCER_ENRICHMENT_KEYWORDS = [
+    "adenocarcinoma",
+    "carcinoma",
+    "cancer",
+    "tumor",
+    "tumour",
+    "neoplasm",
+]
 
 def set_logger_verbosity(verbose: bool) -> None:
     """
@@ -398,6 +429,218 @@ def get_enrichment_dataframe(
     logger.debug(f"Enrichment results loaded into DataFrame with {df.shape[0]} terms.")
 
     return df
+
+
+def _clean_gene_symbols(genes: Iterable[str], uppercase: bool = False) -> List[str]:
+    """Return unique, non-empty gene symbols while preserving input order."""
+    if genes is None:
+        return []
+    clean_genes = []
+    seen = set()
+    for gene in list(genes):
+        if pd.isna(gene):
+            continue
+        symbol = str(gene).strip()
+        if not symbol:
+            continue
+        if uppercase:
+            symbol = symbol.upper()
+        if symbol not in seen:
+            seen.add(symbol)
+            clean_genes.append(symbol)
+    return clean_genes
+
+
+def _standardize_enrichment_dataframe(df: pd.DataFrame, database: str) -> pd.DataFrame:
+    """Normalize Enrichr/SpeedRICHr outputs to a shared column layout."""
+    out = df.copy()
+    if "Term" not in out.columns and out.index.name == "Term":
+        out = out.reset_index()
+    if "Term" not in out.columns:
+        out["Term"] = out.index.astype(str)
+
+    if "Genes" in out.columns:
+        out["Genes"] = out["Genes"].apply(
+            lambda x: ";".join(map(str, x)) if isinstance(x, (list, tuple, set)) else x
+        )
+
+    for col in ["P-value", "Adjusted P-value", "Odds Ratio", "Combined Score"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    out["database"] = database
+
+    preferred = [
+        "database",
+        "Term",
+        "Adjusted P-value",
+        "P-value",
+        "Combined Score",
+        "Odds Ratio",
+        "Genes",
+    ]
+    cols = [col for col in preferred if col in out.columns]
+    cols += [col for col in out.columns if col not in cols]
+    out = out.loc[:, cols]
+
+    sort_cols = [col for col in ["Adjusted P-value", "P-value"] if col in out.columns]
+    if sort_cols:
+        out = out.sort_values(sort_cols, kind="mergesort")
+    return out.reset_index(drop=True)
+
+
+def _filter_enrichment_terms_by_keywords(
+    enrichment_df: pd.DataFrame,
+    keywords: Iterable[str],
+) -> pd.DataFrame:
+    """Filter enrichment rows whose term names contain any keyword."""
+    if enrichment_df.empty:
+        return enrichment_df.copy()
+    keyword_list = [str(k).lower() for k in keywords if str(k).strip()]
+    if not keyword_list:
+        return enrichment_df.copy()
+    term_text = enrichment_df["Term"].astype(str).str.lower()
+    mask = term_text.apply(lambda value: any(keyword in value for keyword in keyword_list))
+    return enrichment_df.loc[mask].reset_index(drop=True)
+
+
+def enrich_coad_terms(
+    genes: Iterable[str],
+    *,
+    adata=None,
+    background: Optional[Iterable[str]] = None,
+    use_background: bool = True,
+    databases: Optional[List[str]] = None,
+    coad_keywords: Optional[List[str]] = None,
+    include_pan_cancer_terms: bool = False,
+    adjusted_pvalue_cutoff: Optional[float] = None,
+    top_n: Optional[int] = None,
+    uppercase: bool = False,
+    verbose: bool = True,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Run enrichment for a gene list and return COAD/CRC-related terms separately.
+
+    This is a convenience wrapper around the existing Enrichr/SpeedRICHr helpers.
+    If ``adata`` is supplied and ``use_background=True``, ``adata.var_names`` is
+    used as the background universe, which is usually the right comparison for
+    genes selected from a dataset-specific Moran/rank table.
+
+    Parameters
+    ----------
+    genes : Iterable[str]
+        Gene symbols to test.
+    adata : AnnData, optional
+        AnnData object used to infer ``background=adata.var_names``.
+    background : Iterable[str], optional
+        Background gene universe. Overrides ``adata.var_names`` when supplied.
+    use_background : bool, optional
+        If True and a background is available, use SpeedRICHr background
+        enrichment. Otherwise use standard Enrichr enrichment.
+    databases : List[str], optional
+        Enrichr/SpeedRICHr library names. Defaults to COAD-relevant disease,
+        pathway, and GO libraries.
+    coad_keywords : List[str], optional
+        Keywords used to filter COAD/CRC-related terms. Defaults to strict
+        colon/colorectal/rectal/CRC terms.
+    include_pan_cancer_terms : bool, optional
+        If True, also include broad cancer keywords such as carcinoma, tumor,
+        and neoplasm in the COAD-filtered table.
+    adjusted_pvalue_cutoff : float, optional
+        If supplied, filter both returned tables by adjusted p-value.
+    top_n : int, optional
+        If supplied, keep the top N rows per database before concatenating.
+    uppercase : bool, optional
+        Convert genes/background to uppercase before submission.
+    verbose : bool, optional
+        Enable enrichment logger output.
+
+    Returns
+    -------
+    Tuple[pd.DataFrame, pd.DataFrame]
+        ``(all_results, coad_results)``. ``all_results`` contains all tested
+        terms. ``coad_results`` contains only terms whose names match the COAD
+        keyword filter.
+    """
+    set_logger_verbosity(verbose)
+    gene_list = _clean_gene_symbols(genes, uppercase=uppercase)
+    if len(gene_list) == 0:
+        raise ValueError("genes is empty after cleaning.")
+
+    if databases is None:
+        databases = COAD_ENRICHMENT_DATABASES
+    if coad_keywords is None:
+        coad_keywords = list(COAD_ENRICHMENT_KEYWORDS)
+    if include_pan_cancer_terms:
+        coad_keywords = list(coad_keywords) + list(PAN_CANCER_ENRICHMENT_KEYWORDS)
+
+    background_list = None
+    if background is not None:
+        background_list = _clean_gene_symbols(background, uppercase=uppercase)
+    elif adata is not None and hasattr(adata, "var_names"):
+        background_list = _clean_gene_symbols(adata.var_names, uppercase=uppercase)
+
+    if background_list is not None:
+        background_set = set(background_list)
+        submitted_genes = [gene for gene in gene_list if gene in background_set]
+        missing = len(gene_list) - len(submitted_genes)
+        if missing and verbose:
+            logger.warning(
+                "%d genes were not found in the background and will be skipped.",
+                missing,
+            )
+        gene_list = submitted_genes
+        if len(gene_list) == 0:
+            raise ValueError("No input genes remain after intersecting with background.")
+
+    use_background_now = bool(use_background and background_list)
+    result_frames = []
+    failed = {}
+
+    for database in databases:
+        try:
+            if use_background_now:
+                df = write_background_enrichment(
+                    genes=gene_list,
+                    background=background_list,
+                    database=database,
+                    verbose=verbose,
+                )
+            else:
+                df = get_enrichment_dataframe(
+                    genes=gene_list,
+                    database=database,
+                    verbose=verbose,
+                )
+            df = _standardize_enrichment_dataframe(df, database)
+            if adjusted_pvalue_cutoff is not None and "Adjusted P-value" in df.columns:
+                df = df[df["Adjusted P-value"] <= adjusted_pvalue_cutoff]
+            if top_n is not None:
+                df = df.head(int(top_n))
+            result_frames.append(df)
+        except Exception as exc:
+            failed[database] = str(exc)
+            logger.warning("Skipping enrichment database '%s': %s", database, exc)
+
+    if not result_frames:
+        detail = "; ".join(f"{db}: {err}" for db, err in failed.items())
+        raise RuntimeError(f"No enrichment databases returned results. {detail}")
+
+    all_results = pd.concat(result_frames, ignore_index=True, sort=False)
+    sort_cols = [col for col in ["Adjusted P-value", "P-value"] if col in all_results.columns]
+    if sort_cols:
+        all_results = all_results.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+
+    coad_results = _filter_enrichment_terms_by_keywords(all_results, coad_keywords)
+    if failed:
+        all_results.attrs["failed_databases"] = failed
+        coad_results.attrs["failed_databases"] = failed
+    all_results.attrs["submitted_genes"] = gene_list
+    coad_results.attrs["submitted_genes"] = gene_list
+    all_results.attrs["used_background"] = use_background_now
+    coad_results.attrs["used_background"] = use_background_now
+
+    return all_results, coad_results
 
 
 def generate_enrichment_results(

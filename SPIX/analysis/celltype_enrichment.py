@@ -636,6 +636,7 @@ def classify_gene_celltype_enrichment(
     celltype_col: str = "predicted_labels",
     layer: Optional[str] = "counts",
     target_sum: float = 1e4,
+    normalization_scope: str = "all_genes",
     min_cells: int = 15,
     alpha: float = 0.05,
     min_mean_diff: float = 0.10,
@@ -653,8 +654,10 @@ def classify_gene_celltype_enrichment(
     Notes
     -----
     - If `genes=None`, all genes in `adata.var_names` are used.
-    - Normalization and log1p are computed on the selected genes only (same intent
-      as normalizing `adata[:, genes]` before testing).
+    - Normalization and log1p are computed on the selected genes, but the default
+      count-normalization denominator is each cell's total expression across all
+      genes in ``layer``. Set ``normalization_scope='selected_genes'`` to normalize
+      by only the tested genes.
     - `mwu_backend='prerank'` is substantially faster than repeated SciPy MWU calls
       and matches `method='asymptotic'` when `tie_correction=True`.
     - Use `min_pct_overall > 0` to prefilter rarely expressed genes for speed.
@@ -665,6 +668,10 @@ def classify_gene_celltype_enrichment(
         raise ValueError("min_pct_overall must be in [0, 1].")
     if mwu_backend not in {"prerank", "scipy"}:
         raise ValueError("mwu_backend must be one of {'prerank', 'scipy'}.")
+    if normalization_scope not in {"all_genes", "selected_genes"}:
+        raise ValueError("normalization_scope must be one of {'all_genes', 'selected_genes'}.")
+    if pan_fraction <= 0:
+        raise ValueError("pan_fraction must be > 0.")
 
     if celltype_col not in adata.obs.columns:
         raise KeyError(f"'{celltype_col}' not found in adata.obs")
@@ -714,24 +721,34 @@ def classify_gene_celltype_enrichment(
     if is_sparse:
         X_csr = X_source.tocsr() if not sparse.isspmatrix_csr(X_source) else X_source
         if all_cells_selected and all_genes_selected:
+            X_kept = X_csr
             X_sel = X_csr
         elif all_cells_selected:
+            X_kept = X_csr
             X_sel = X_csr[:, gene_idx]
         elif all_genes_selected:
-            X_sel = X_csr[keep_cells]
+            X_kept = X_csr[keep_cells]
+            X_sel = X_kept
         else:
-            X_sel = X_csr[keep_cells][:, gene_idx]
+            X_kept = X_csr[keep_cells]
+            X_sel = X_kept[:, gene_idx]
         X_sel = X_sel.tocsr()
+        all_gene_row_sums = np.asarray(X_kept.sum(axis=1)).ravel().astype(np.float64, copy=False)
     else:
         X_dense = np.asarray(X_source)
         if all_cells_selected and all_genes_selected:
+            X_kept = X_dense
             X_sel = X_dense
         elif all_cells_selected:
+            X_kept = X_dense
             X_sel = X_dense[:, gene_idx]
         elif all_genes_selected:
-            X_sel = X_dense[keep_cells]
+            X_kept = X_dense[keep_cells]
+            X_sel = X_kept
         else:
-            X_sel = X_dense[keep_cells][:, gene_idx]
+            X_kept = X_dense[keep_cells]
+            X_sel = X_kept[:, gene_idx]
+        all_gene_row_sums = np.asarray(X_kept.sum(axis=1, dtype=np.float64)).ravel()
 
     if min_pct_overall > 0.0:
         if is_sparse:
@@ -752,7 +769,9 @@ def classify_gene_celltype_enrichment(
             genes_resolved = list(np.asarray(genes_resolved, dtype=object)[keep_gene_mask])
             n_genes = len(genes_resolved)
 
-    if is_sparse:
+    if normalization_scope == "all_genes":
+        row_sums = all_gene_row_sums
+    elif is_sparse:
         row_sums = np.asarray(X_sel.sum(axis=1)).ravel().astype(np.float64, copy=False)
     else:
         row_sums = np.asarray(X_sel.sum(axis=1, dtype=np.float64)).ravel()
@@ -1015,6 +1034,7 @@ def score_gene_celltype_specificity(
     celltype_col: str = "predicted_labels",
     layer: Optional[str] = "counts",
     target_sum: float = 1e4,
+    normalization_scope: str = "all_genes",
     min_cells: int | str = "auto",
     min_mean_diff: float = 0.05,
     min_pct_diff: float = 0.05,
@@ -1026,12 +1046,19 @@ def score_gene_celltype_specificity(
     """Effect-size-based gene-to-celltype specificity scoring.
 
     This is intended as a practical annotation tool when strict inference is either
-    unavailable or less useful than stable effect-size ranking.
+    unavailable or less useful than stable effect-size ranking. By default, count
+    normalization uses each cell's total expression across all genes in ``layer``;
+    set ``normalization_scope='selected_genes'`` to reproduce subset-only
+    normalization.
     """
     if celltype_col not in adata.obs.columns:
         raise KeyError(f"'{celltype_col}' not found in adata.obs")
     if len(score_weights) != 3:
         raise ValueError("score_weights must have length 3: (mean_diff, pct_diff, log2_fc).")
+    if normalization_scope not in {"all_genes", "selected_genes"}:
+        raise ValueError("normalization_scope must be one of {'all_genes', 'selected_genes'}.")
+    if pan_fraction <= 0:
+        raise ValueError("pan_fraction must be > 0.")
 
     if layer is not None:
         if layer not in adata.layers:
@@ -1074,13 +1101,17 @@ def score_gene_celltype_specificity(
     is_sparse = sparse.issparse(X_source)
     if is_sparse:
         X_csr = X_source.tocsr() if not sparse.isspmatrix_csr(X_source) else X_source
-        X_sel = X_csr[keep_cells][:, gene_idx].tocsr()
-        row_sums = np.asarray(X_sel.sum(axis=1)).ravel().astype(np.float64, copy=False)
+        X_kept = X_csr[keep_cells]
+        X_sel = X_kept[:, gene_idx].tocsr()
+        row_sum_source = X_kept if normalization_scope == "all_genes" else X_sel
+        row_sums = np.asarray(row_sum_source.sum(axis=1)).ravel().astype(np.float64, copy=False)
         raw_mat = X_sel.toarray()
     else:
         X_dense = np.asarray(X_source)
-        raw_mat = np.asarray(X_dense[keep_cells][:, gene_idx], dtype=np.float64)
-        row_sums = np.asarray(raw_mat.sum(axis=1, dtype=np.float64)).ravel()
+        X_kept = X_dense[keep_cells]
+        raw_mat = np.asarray(X_kept[:, gene_idx], dtype=np.float64)
+        row_sum_source = X_kept if normalization_scope == "all_genes" else raw_mat
+        row_sums = np.asarray(row_sum_source.sum(axis=1, dtype=np.float64)).ravel()
 
     size_factors = np.zeros_like(row_sums, dtype=np.float64)
     np.divide(float(target_sum), row_sums, out=size_factors, where=row_sums > 0)
@@ -1288,6 +1319,7 @@ def permutation_classify_gene_celltype_enrichment(
     celltype_col: str = "predicted_labels",
     layer: Optional[str] = "counts",
     target_sum: float = 1e4,
+    normalization_scope: str = "all_genes",
     min_cells: int | str = "auto",
     alpha: float = 0.05,
     min_mean_diff: Optional[float] = None,
@@ -1308,7 +1340,9 @@ def permutation_classify_gene_celltype_enrichment(
     -----
     This is intended for small to moderate gene lists when per-gene asymptotic tests
     feel too optimistic. It preserves celltype sizes and computes empirical p-values
-    for the observed mean log-expression difference.
+    for the observed mean log-expression difference. By default, count normalization
+    uses each cell's total expression across all genes in ``layer``; set
+    ``normalization_scope='selected_genes'`` to reproduce subset-only normalization.
     """
     if n_permutations < 1:
         raise ValueError("n_permutations must be >= 1.")
@@ -1320,6 +1354,10 @@ def permutation_classify_gene_celltype_enrichment(
         raise ValueError("correction_scope must be one of {'global', 'per_gene'}.")
     if use_effect_thresholds not in {"recommended", "standard", "raw", "none"}:
         raise ValueError("use_effect_thresholds must be one of {'recommended', 'standard', 'raw', 'none'}.")
+    if normalization_scope not in {"all_genes", "selected_genes"}:
+        raise ValueError("normalization_scope must be one of {'all_genes', 'selected_genes'}.")
+    if pan_fraction <= 0:
+        raise ValueError("pan_fraction must be > 0.")
     if celltype_col not in adata.obs.columns:
         raise KeyError(f"'{celltype_col}' not found in adata.obs")
 
@@ -1364,13 +1402,17 @@ def permutation_classify_gene_celltype_enrichment(
     is_sparse = sparse.issparse(X_source)
     if is_sparse:
         X_csr = X_source.tocsr() if not sparse.isspmatrix_csr(X_source) else X_source
-        X_sel = X_csr[keep_cells][:, gene_idx].tocsr()
-        row_sums = np.asarray(X_sel.sum(axis=1)).ravel().astype(np.float64, copy=False)
+        X_kept = X_csr[keep_cells]
+        X_sel = X_kept[:, gene_idx].tocsr()
+        row_sum_source = X_kept if normalization_scope == "all_genes" else X_sel
+        row_sums = np.asarray(row_sum_source.sum(axis=1)).ravel().astype(np.float64, copy=False)
         raw_mat = X_sel.toarray()
     else:
         X_dense = np.asarray(X_source)
-        raw_mat = np.asarray(X_dense[keep_cells][:, gene_idx], dtype=np.float64)
-        row_sums = np.asarray(raw_mat.sum(axis=1, dtype=np.float64)).ravel()
+        X_kept = X_dense[keep_cells]
+        raw_mat = np.asarray(X_kept[:, gene_idx], dtype=np.float64)
+        row_sum_source = X_kept if normalization_scope == "all_genes" else raw_mat
+        row_sums = np.asarray(row_sum_source.sum(axis=1, dtype=np.float64)).ravel()
 
     size_factors = np.zeros_like(row_sums, dtype=np.float64)
     np.divide(float(target_sum), row_sums, out=size_factors, where=row_sums > 0)
@@ -1559,13 +1601,53 @@ def permutation_classify_gene_celltype_enrichment(
             top_row = gdf_sorted.iloc[0]
             enriched_celltypes = ""
 
+        top_fail_reasons = []
+        if not bool(top_row["is_enriched"]):
+            if float(top_row["qvalue"]) > float(alpha):
+                top_fail_reasons.append("qvalue")
+            if use_effect_thresholds == "recommended":
+                rec_min_mean_diff = 0.05 if min_mean_diff is None else float(min_mean_diff)
+                rec_min_pct_diff = 0.03 if min_pct_diff is None else float(min_pct_diff)
+                if float(top_row["mean_diff"]) < rec_min_mean_diff:
+                    top_fail_reasons.append("mean_diff")
+                if float(top_row["pct_diff"]) < rec_min_pct_diff:
+                    top_fail_reasons.append("pct_diff")
+                if float(top_row["log2_fc"]) <= 0:
+                    top_fail_reasons.append("log2_fc")
+                if float(top_row["zscore"]) <= 0:
+                    top_fail_reasons.append("zscore")
+            elif use_effect_thresholds == "standard":
+                if float(top_row["zscore"]) < float(min_zscore):
+                    top_fail_reasons.append("zscore")
+                if float(top_row["log2_fc"]) < float(min_log2_fc):
+                    top_fail_reasons.append("log2_fc")
+            elif use_effect_thresholds == "raw":
+                if min_mean_diff is not None and float(top_row["mean_diff"]) < float(min_mean_diff):
+                    top_fail_reasons.append("mean_diff")
+                if min_pct_diff is not None and float(top_row["pct_diff"]) < float(min_pct_diff):
+                    top_fail_reasons.append("pct_diff")
+                if float(top_row["log2_fc"]) <= 0:
+                    top_fail_reasons.append("log2_fc")
+                if float(top_row["zscore"]) <= 0:
+                    top_fail_reasons.append("zscore")
+            else:
+                if float(top_row["log2_fc"]) <= 0:
+                    top_fail_reasons.append("log2_fc")
+                if float(top_row["zscore"]) <= 0:
+                    top_fail_reasons.append("zscore")
+
         summary_rows.append(
             {
                 "gene": gene,
                 "enrichment_class": enrichment_class,
                 "n_enriched_celltypes": n_enriched,
                 "top_celltype": top_row["celltype"],
+                "top_is_enriched": bool(top_row["is_enriched"]),
+                "top_fail_reasons": ",".join(top_fail_reasons),
+                "top_pvalue": float(top_row["pvalue"]),
                 "top_qvalue": float(top_row["qvalue"]),
+                "top_mean_diff": float(top_row["mean_diff"]),
+                "top_pct_diff": float(top_row["pct_diff"]),
                 "top_log2_fc": float(top_row["log2_fc"]),
                 "top_zscore": float(top_row["zscore"]),
                 "enriched_celltypes": enriched_celltypes,
@@ -1667,3 +1749,976 @@ def summarize_celltype_gene_set_enrichment(gene_celltype_stats: pd.DataFrame) ->
         ascending=[True, False, False],
     ).reset_index(drop=True)
     return out
+
+
+def classify_scale_group_gene_celltype_enrichment(
+    adata,
+    scale_svg_table: pd.DataFrame,
+    *,
+    group_col: str = "scale_group",
+    gene_col: str = "gene",
+    pass_col: Optional[str] = "passes_rule",
+    require_pass: bool = True,
+    top_n_per_group: Optional[int] = 100,
+    celltype_col: str = "predicted_labels",
+    layer: Optional[str] = "counts",
+    target_sum: float = 1e4,
+    normalization_scope: str = "all_genes",
+    min_cells: int | str = "auto",
+    alpha: float = 0.05,
+    min_mean_diff: Optional[float] = None,
+    min_pct_diff: Optional[float] = None,
+    min_zscore: float = 2.0,
+    min_log2_fc: float = 0.25,
+    use_effect_thresholds: str = "recommended",
+    pan_fraction: float = 1.0,
+    n_permutations: int = 2000,
+    n_jobs: int = 1,
+    permutation_batch_size: int = 128,
+    correction_scope: str = "global",
+    random_state: Optional[int] = 0,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Run gene-by-celltype enrichment separately for each scale-SVG group.
+
+    Returns
+    -------
+    gene_celltype_stats
+        One row per scale group, gene, and tested celltype.
+    gene_enrichment_summary
+        One row per scale group and gene, including ``single/multi/pan/none``.
+    group_class_summary
+        Scale-group level counts/fractions of enrichment classes.
+    group_celltype_summary
+        Scale-group by celltype counts of enriched genes.
+    """
+    from .scale_biology import make_scale_group_gene_sets
+
+    gene_sets = make_scale_group_gene_sets(
+        scale_svg_table,
+        group_col=group_col,
+        gene_col=gene_col,
+        pass_col=pass_col,
+        require_pass=require_pass,
+        top_n_per_group=top_n_per_group,
+    )
+    if not gene_sets:
+        empty = pd.DataFrame()
+        return empty, empty, empty, empty
+
+    stats_frames = []
+    gene_summary_frames = []
+    celltype_summary_frames = []
+    group_rows = []
+
+    for group, genes in gene_sets.items():
+        genes = [str(g) for g in genes]
+        if not genes:
+            continue
+        stats, gene_summary, celltype_summary, tested_celltypes = permutation_classify_gene_celltype_enrichment(
+            adata,
+            genes=genes,
+            celltype_col=celltype_col,
+            layer=layer,
+            target_sum=target_sum,
+            normalization_scope=normalization_scope,
+            min_cells=min_cells,
+            alpha=alpha,
+            min_mean_diff=min_mean_diff,
+            min_pct_diff=min_pct_diff,
+            min_zscore=min_zscore,
+            min_log2_fc=min_log2_fc,
+            use_effect_thresholds=use_effect_thresholds,
+            pan_fraction=pan_fraction,
+            n_permutations=n_permutations,
+            n_jobs=n_jobs,
+            permutation_batch_size=permutation_batch_size,
+            correction_scope=correction_scope,
+            random_state=random_state,
+        )
+        stats = stats.copy()
+        gene_summary = gene_summary.copy()
+        celltype_summary = celltype_summary.copy()
+        stats.insert(0, "scale_group", str(group))
+        gene_summary.insert(0, "scale_group", str(group))
+        if not celltype_summary.empty:
+            celltype_summary = celltype_summary.reset_index().rename(columns={"index": "celltype"})
+        else:
+            celltype_summary = pd.DataFrame(
+                columns=[
+                    "celltype",
+                    "n_enriched_lowres_genes",
+                    "n_single_genes",
+                    "n_multi_genes",
+                    "n_pan_genes",
+                ]
+            )
+        celltype_summary.insert(0, "scale_group", str(group))
+        celltype_summary["n_tested_group_genes"] = int(len(gene_summary))
+        celltype_summary["n_tested_celltypes"] = int(len(tested_celltypes))
+
+        class_counts = gene_summary["enrichment_class"].astype(str).value_counts()
+        n_genes = int(len(gene_summary))
+        group_rows.append(
+            {
+                "scale_group": str(group),
+                "n_tested_genes": n_genes,
+                "n_tested_celltypes": int(len(tested_celltypes)),
+                "n_single_genes": int(class_counts.get("single", 0)),
+                "n_multi_genes": int(class_counts.get("multi", 0)),
+                "n_pan_genes": int(class_counts.get("pan", 0)),
+                "n_none_genes": int(class_counts.get("none", 0)),
+                "fraction_single": float(class_counts.get("single", 0) / max(n_genes, 1)),
+                "fraction_multi": float(class_counts.get("multi", 0) / max(n_genes, 1)),
+                "fraction_pan": float(class_counts.get("pan", 0) / max(n_genes, 1)),
+                "fraction_none": float(class_counts.get("none", 0) / max(n_genes, 1)),
+                "n_any_enriched_genes": int(n_genes - class_counts.get("none", 0)),
+                "fraction_any_enriched": float((n_genes - class_counts.get("none", 0)) / max(n_genes, 1)),
+            }
+        )
+
+        stats_frames.append(stats)
+        gene_summary_frames.append(gene_summary)
+        celltype_summary_frames.append(celltype_summary)
+
+    gene_celltype_stats = pd.concat(stats_frames, ignore_index=True) if stats_frames else pd.DataFrame()
+    gene_enrichment_summary = pd.concat(gene_summary_frames, ignore_index=True) if gene_summary_frames else pd.DataFrame()
+    group_class_summary = pd.DataFrame(group_rows)
+    group_celltype_summary = pd.concat(celltype_summary_frames, ignore_index=True) if celltype_summary_frames else pd.DataFrame()
+
+    if not group_celltype_summary.empty and "n_enriched_lowres_genes" in group_celltype_summary.columns:
+        group_celltype_summary["fraction_enriched_group_genes"] = (
+            pd.to_numeric(group_celltype_summary["n_enriched_lowres_genes"], errors="coerce")
+            / pd.to_numeric(group_celltype_summary["n_tested_group_genes"], errors="coerce").replace(0, np.nan)
+        )
+        group_celltype_summary = group_celltype_summary.sort_values(
+            ["scale_group", "n_enriched_lowres_genes", "n_single_genes"],
+            ascending=[True, False, False],
+            kind="mergesort",
+        ).reset_index(drop=True)
+
+    return (
+        gene_celltype_stats,
+        gene_enrichment_summary,
+        group_class_summary,
+        group_celltype_summary,
+    )
+
+
+def plot_scale_group_celltype_enrichment_heatmap(
+    group_celltype_summary: pd.DataFrame,
+    *,
+    value_col: str = "n_enriched_lowres_genes",
+    max_celltypes: Optional[int] = 30,
+    group_order: Optional[Sequence[str]] = None,
+    celltype_order: Optional[Sequence[str]] = None,
+    title: str = "Celltype-enriched genes by scale group",
+    cmap: str = "viridis",
+    annotate: bool = True,
+    figsize: Optional[Tuple[float, float]] = None,
+):
+    """Plot scale-group by celltype enriched-gene counts/fractions."""
+    if group_celltype_summary is None or group_celltype_summary.empty:
+        raise ValueError("group_celltype_summary must be non-empty.")
+    required = {"scale_group", "celltype", value_col}
+    missing = required.difference(group_celltype_summary.columns)
+    if missing:
+        raise KeyError(f"group_celltype_summary is missing required columns: {sorted(missing)}")
+
+    import matplotlib.pyplot as plt
+
+    work = group_celltype_summary.copy()
+    work[value_col] = pd.to_numeric(work[value_col], errors="coerce").fillna(0.0)
+    if group_order is None:
+        group_order = work["scale_group"].astype(str).drop_duplicates().tolist()
+    else:
+        group_order = [str(x) for x in group_order]
+    if celltype_order is None:
+        top = (
+            work.groupby("celltype", observed=True)[value_col]
+            .sum()
+            .sort_values(ascending=False)
+        )
+        if max_celltypes is not None:
+            top = top.head(int(max_celltypes))
+        celltype_order = top.index.astype(str).tolist()
+    else:
+        celltype_order = [str(x) for x in celltype_order]
+
+    matrix = (
+        work.assign(scale_group=work["scale_group"].astype(str), celltype=work["celltype"].astype(str))
+        .pivot_table(index="celltype", columns="scale_group", values=value_col, aggfunc="max")
+        .reindex(index=celltype_order, columns=group_order)
+        .fillna(0.0)
+    )
+    if figsize is None:
+        figsize = (max(4.5, 1.35 * len(group_order) + 2.0), max(4.0, 0.32 * len(celltype_order) + 1.7))
+    fig, ax = plt.subplots(figsize=figsize)
+    im = ax.imshow(matrix.to_numpy(float), aspect="auto", interpolation="nearest", cmap=cmap)
+    ax.set_xticks(np.arange(matrix.shape[1]))
+    ax.set_xticklabels(matrix.columns.tolist(), rotation=0)
+    ax.set_yticks(np.arange(matrix.shape[0]))
+    ax.set_yticklabels(matrix.index.tolist(), fontsize=8)
+    ax.tick_params(axis="both", length=0)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.set_xticks(np.arange(-0.5, matrix.shape[1], 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, matrix.shape[0], 1), minor=True)
+    ax.grid(which="minor", color="white", linewidth=0.8)
+    ax.tick_params(which="minor", bottom=False, left=False)
+    if annotate:
+        vals = matrix.to_numpy(float)
+        vmax = float(np.nanmax(vals)) if vals.size else 1.0
+        for i in range(vals.shape[0]):
+            for j in range(vals.shape[1]):
+                val = vals[i, j]
+                if val <= 0:
+                    continue
+                color = "white" if val > 0.55 * max(vmax, 1.0) else "black"
+                label = f"{val:.2f}" if "fraction" in value_col else f"{int(round(val))}"
+                ax.text(j, i, label, ha="center", va="center", fontsize=7, color=color)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.025)
+    cbar.set_label(value_col)
+    ax.set_title(title, fontsize=12, fontweight="bold", pad=12)
+    fig.tight_layout()
+    return fig
+
+
+def plot_scale_group_celltype_enrichment_dotplot(
+    group_celltype_summary: pd.DataFrame,
+    *,
+    group_col: str = "scale_group",
+    celltype_col: str = "celltype",
+    size_col: str = "n_enriched_lowres_genes",
+    color_col: str = "fraction_enriched_group_genes",
+    group_order: Optional[Sequence[str]] = None,
+    celltype_order: Optional[Sequence[str]] = None,
+    max_celltypes: Optional[int] = 30,
+    min_size: float = 1.0,
+    order_by: str = "dominant_scale",
+    dot_min: float = 35.0,
+    dot_max: float = 420.0,
+    cmap: str = "viridis",
+    edgecolor: str = "#333333",
+    linewidth: float = 0.45,
+    annotate_counts: bool = False,
+    figsize: Optional[Tuple[float, float]] = None,
+    title: str = "Celltype-enriched genes by scale group",
+    size_legend_title: Optional[str] = None,
+    colorbar_title: Optional[str] = None,
+    pretty_group_labels: bool = True,
+    group_label_map: Optional[Mapping[str, str]] = None,
+    xtick_rotation: float = 0.0,
+    grid_color: str = "#e8e8e8",
+    panel_background: str = "white",
+    show_size_legend: bool = True,
+    show_colorbar: bool = True,
+    right_margin: float = 0.70,
+):
+    """Dotplot of celltype-enriched genes across scale groups.
+
+    The default visual mapping is intentionally simple: dot size is the number
+    of enriched group genes and dot color is the fraction of tested group genes.
+    Celltypes are ordered by their dominant scale group by default, which makes
+    scale-specific differences easier to read than an alphabetical order.
+    """
+    if group_celltype_summary is None or group_celltype_summary.empty:
+        raise ValueError("group_celltype_summary must be non-empty.")
+    required = {group_col, celltype_col, size_col, color_col}
+    missing = required.difference(group_celltype_summary.columns)
+    if missing:
+        raise KeyError(f"group_celltype_summary is missing required columns: {sorted(missing)}")
+
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    work = group_celltype_summary.copy()
+    work[group_col] = work[group_col].astype(str)
+    work[celltype_col] = work[celltype_col].astype(str)
+    work[size_col] = pd.to_numeric(work[size_col], errors="coerce").fillna(0.0)
+    work[color_col] = pd.to_numeric(work[color_col], errors="coerce").fillna(0.0)
+    work = work.loc[work[size_col] >= float(min_size)].copy()
+    if work.empty:
+        raise ValueError("No rows remain after applying min_size.")
+    default_group_label_map = {
+        "fine_hclust": "Fine",
+        "mid_hclust": "Mid",
+        "coarse_hclust": "Coarse",
+    }
+    if group_label_map is not None:
+        default_group_label_map.update({str(k): str(v) for k, v in group_label_map.items()})
+
+    if group_order is None:
+        canonical = ["fine_hclust", "mid_hclust", "coarse_hclust"]
+        present = work[group_col].drop_duplicates().astype(str).tolist()
+        if set(present).issubset(set(canonical)):
+            group_order = [g for g in canonical if g in present]
+        else:
+            group_order = present
+    else:
+        group_order = [str(x) for x in group_order]
+    group_rank = {g: i for i, g in enumerate(group_order)}
+    work = work.loc[work[group_col].isin(group_order)].copy()
+    if work.empty:
+        raise ValueError("No rows match group_order.")
+
+    if celltype_order is None:
+        pivot = (
+            work.pivot_table(index=celltype_col, columns=group_col, values=color_col, aggfunc="max", fill_value=0.0)
+            .reindex(columns=group_order, fill_value=0.0)
+        )
+        size_pivot = (
+            work.pivot_table(index=celltype_col, columns=group_col, values=size_col, aggfunc="max", fill_value=0.0)
+            .reindex(columns=group_order, fill_value=0.0)
+        )
+        mode = str(order_by).lower()
+        if mode in {"dominant_scale", "dominant", "scale"}:
+            dominant = pivot.idxmax(axis=1)
+            order_frame = pd.DataFrame(
+                {
+                    "_dominant_rank": dominant.map(group_rank).fillna(len(group_order)).astype(int),
+                    "_max_color": pivot.max(axis=1),
+                    "_total_size": size_pivot.sum(axis=1),
+                },
+                index=pivot.index,
+            )
+            order_frame = order_frame.sort_values(
+                ["_dominant_rank", "_max_color", "_total_size"],
+                ascending=[True, False, False],
+                kind="mergesort",
+            )
+            celltype_order = order_frame.index.astype(str).tolist()
+        elif mode == "max":
+            celltype_order = pivot.max(axis=1).sort_values(ascending=False).index.astype(str).tolist()
+        elif mode == "total":
+            celltype_order = size_pivot.sum(axis=1).sort_values(ascending=False).index.astype(str).tolist()
+        elif mode in {"alphabetical", "alpha", "name"}:
+            celltype_order = sorted(pivot.index.astype(str).tolist())
+        else:
+            raise ValueError("order_by must be 'dominant_scale', 'max', 'total', or 'alphabetical'.")
+        if max_celltypes is not None:
+            celltype_order = celltype_order[: int(max_celltypes)]
+    else:
+        celltype_order = [str(x) for x in celltype_order]
+    work = work.loc[work[celltype_col].isin(celltype_order)].copy()
+
+    x_map = {g: i for i, g in enumerate(group_order)}
+    y_map = {ct: i for i, ct in enumerate(celltype_order)}
+    work["_x"] = work[group_col].map(x_map)
+    work["_y"] = work[celltype_col].map(y_map)
+
+    max_size = float(work[size_col].max())
+    if max_size <= 0:
+        max_size = 1.0
+    sizes = dot_min + (work[size_col].to_numpy(float) / max_size) * (dot_max - dot_min)
+
+    if figsize is None:
+        figsize = (
+            max(7.2, 1.55 * len(group_order) + 3.8),
+            max(4.6, 0.42 * len(celltype_order) + 1.8),
+        )
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.set_facecolor(panel_background)
+    sc = ax.scatter(
+        work["_x"].to_numpy(float),
+        work["_y"].to_numpy(float),
+        s=sizes,
+        c=work[color_col].to_numpy(float),
+        cmap=cmap,
+        edgecolors=edgecolor,
+        linewidths=float(linewidth),
+    )
+    xticklabels = [
+        default_group_label_map.get(g, g) if pretty_group_labels else g
+        for g in group_order
+    ]
+    ax.set_xticks(np.arange(len(group_order)))
+    ax.set_xticklabels(
+        xticklabels,
+        rotation=float(xtick_rotation),
+        ha="right" if float(xtick_rotation) else "center",
+        fontweight="bold",
+    )
+    ax.set_yticks(np.arange(len(celltype_order)))
+    ax.set_yticklabels(celltype_order)
+    ax.set_xlim(-0.5, len(group_order) - 0.5)
+    ax.set_ylim(len(celltype_order) - 0.5, -0.5)
+    ax.set_xlabel("Scale group")
+    ax.set_ylabel("Celltype")
+    ax.set_title(title, fontweight="bold", pad=12)
+    ax.set_xticks(np.arange(-0.5, len(group_order), 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, len(celltype_order), 1), minor=True)
+    ax.grid(which="major", axis="y", color=grid_color, linewidth=0.8)
+    ax.grid(which="minor", axis="x", color=grid_color, linewidth=0.8)
+    ax.tick_params(which="minor", bottom=False, left=False)
+    ax.tick_params(axis="both", length=0)
+    ax.set_axisbelow(True)
+    for spine in ["top", "right", "left", "bottom"]:
+        ax.spines[spine].set_visible(False)
+
+    if annotate_counts:
+        for _, row in work.iterrows():
+            ax.text(
+                row["_x"],
+                row["_y"],
+                str(int(round(float(row[size_col])))),
+                ha="center",
+                va="center",
+                fontsize=7,
+                color="white",
+                fontweight="bold",
+            )
+
+    fig.subplots_adjust(right=float(right_margin))
+    if show_colorbar:
+        cax = fig.add_axes([float(right_margin) + 0.19, 0.18, 0.025, 0.43])
+        cbar = fig.colorbar(sc, cax=cax)
+        cbar.outline.set_visible(False)
+        cbar.set_label(colorbar_title or "Fraction of group genes", fontweight="bold")
+
+    legend_values = np.unique(
+        np.clip(
+            np.array([1, np.ceil(max_size / 3), np.ceil(2 * max_size / 3), np.ceil(max_size)], dtype=float),
+            1,
+            max_size,
+        ).astype(int)
+    )
+    handles = [
+        Line2D(
+            [],
+            [],
+            marker="o",
+            linestyle="",
+            markersize=np.sqrt(dot_min + (v / max_size) * (dot_max - dot_min)),
+            markerfacecolor="lightgray",
+            markeredgecolor=edgecolor,
+            markeredgewidth=float(linewidth),
+            label=str(int(v)),
+        )
+        for v in legend_values
+    ]
+    if handles and show_size_legend:
+        ax.legend(
+            handles=handles,
+            title=size_legend_title or "Enriched genes",
+            frameon=False,
+            bbox_to_anchor=(1.04, 0.98),
+            loc="upper left",
+            borderaxespad=0.0,
+            labelspacing=1.0,
+            handletextpad=1.2,
+        )
+    return fig, ax
+
+
+def plot_scale_group_celltype_enrichment_contrast_dotplot(
+    group_celltype_summary: pd.DataFrame,
+    *,
+    group_col: str = "scale_group",
+    celltype_col: str = "celltype",
+    size_col: str = "n_enriched_lowres_genes",
+    value_col: str = "fraction_enriched_group_genes",
+    group_order: Optional[Sequence[str]] = None,
+    group_label_map: Optional[Mapping[str, str]] = None,
+    max_celltypes: Optional[int] = 18,
+    min_size: float = 1.0,
+    min_contrast: float = 0.0,
+    contrast_mode: str = "row_relative",
+    dot_min: float = 28.0,
+    dot_max: float = 430.0,
+    cmap: str = "YlOrRd",
+    edgecolor: str = "#333333",
+    linewidth: float = 0.45,
+    figsize: Optional[Tuple[float, float]] = None,
+    title: str = "Scale-biased celltype enrichment",
+    annotate_counts: bool = False,
+    show_dominant_scale: bool = False,
+    size_legend_title: str = "Enriched genes",
+    colorbar_title: Optional[str] = None,
+    show_size_legend: bool = True,
+    show_colorbar: bool = True,
+    right_margin: float = 0.78,
+    legend_bbox_to_anchor: Tuple[float, float] = (1.04, 0.98),
+    colorbar_bbox: Tuple[float, float, float, float] = (0.86, 0.18, 0.025, 0.45),
+    font_scale: float = 1.0,
+):
+    """Contrast dotplot emphasizing which scale group dominates each celltype.
+
+    Dot size keeps the absolute support (number of enriched genes), while color
+    shows the within-celltype scale bias.  This is useful when the claim is not
+    just "which celltypes are enriched", but that enrichment differs across
+    fine/mid/coarse SVG groups.
+    """
+    if group_celltype_summary is None or group_celltype_summary.empty:
+        raise ValueError("group_celltype_summary must be non-empty.")
+    required = {group_col, celltype_col, size_col, value_col}
+    missing = required.difference(group_celltype_summary.columns)
+    if missing:
+        raise KeyError(f"group_celltype_summary is missing required columns: {sorted(missing)}")
+
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Rectangle
+
+    default_group_label_map = {
+        "fine_hclust": "Fine",
+        "mid_hclust": "Mid",
+        "coarse_hclust": "Coarse",
+    }
+    default_group_colors = {
+        "fine_hclust": "#4C78A8",
+        "mid_hclust": "#F28E2B",
+        "coarse_hclust": "#59A14F",
+    }
+    if group_label_map is not None:
+        default_group_label_map.update({str(k): str(v) for k, v in group_label_map.items()})
+    fs = float(font_scale)
+    if fs <= 0:
+        raise ValueError("font_scale must be positive.")
+    title_size = 13.0 * fs
+    label_size = 11.0 * fs
+    tick_size = 10.0 * fs
+    legend_size = 9.0 * fs
+    dominant_size = 8.0 * fs
+    annotation_size = 7.0 * fs
+
+    work = group_celltype_summary.copy()
+    work[group_col] = work[group_col].astype(str)
+    work[celltype_col] = work[celltype_col].astype(str)
+    work[size_col] = pd.to_numeric(work[size_col], errors="coerce").fillna(0.0)
+    work[value_col] = pd.to_numeric(work[value_col], errors="coerce").fillna(0.0)
+    work = work.loc[work[size_col] >= float(min_size)].copy()
+    if work.empty:
+        raise ValueError("No rows remain after applying min_size.")
+
+    if group_order is None:
+        canonical = ["fine_hclust", "mid_hclust", "coarse_hclust"]
+        present = work[group_col].drop_duplicates().astype(str).tolist()
+        group_order = [g for g in canonical if g in present] if set(present).issubset(set(canonical)) else present
+    else:
+        group_order = [str(x) for x in group_order]
+    group_rank = {g: i for i, g in enumerate(group_order)}
+    work = work.loc[work[group_col].isin(group_order)].copy()
+
+    value_mat = (
+        work.pivot_table(index=celltype_col, columns=group_col, values=value_col, aggfunc="max", fill_value=0.0)
+        .reindex(columns=group_order, fill_value=0.0)
+    )
+    size_mat = (
+        work.pivot_table(index=celltype_col, columns=group_col, values=size_col, aggfunc="max", fill_value=0.0)
+        .reindex(columns=group_order, fill_value=0.0)
+    )
+    if value_mat.empty:
+        raise ValueError("No values remain after filtering.")
+
+    vmax_row = value_mat.max(axis=1).replace(0, np.nan)
+    vmin_row = value_mat.min(axis=1)
+    contrast = (value_mat.max(axis=1) - vmin_row).fillna(0.0)
+    dominant = value_mat.idxmax(axis=1)
+    order_frame = pd.DataFrame(
+        {
+            "_dominant_rank": dominant.map(group_rank).fillna(len(group_order)).astype(int),
+            "_contrast": contrast,
+            "_max_value": value_mat.max(axis=1),
+            "_total_size": size_mat.sum(axis=1),
+        },
+        index=value_mat.index,
+    )
+    order_frame = order_frame.loc[order_frame["_contrast"] >= float(min_contrast)]
+    order_frame = order_frame.sort_values(
+        ["_dominant_rank", "_contrast", "_max_value", "_total_size"],
+        ascending=[True, False, False, False],
+        kind="mergesort",
+    )
+    if max_celltypes is not None:
+        order_frame = order_frame.head(int(max_celltypes))
+    celltype_order = order_frame.index.astype(str).tolist()
+    if not celltype_order:
+        raise ValueError("No celltypes remain after applying min_contrast/max_celltypes.")
+
+    value_mat = value_mat.reindex(index=celltype_order, columns=group_order).fillna(0.0)
+    size_mat = size_mat.reindex(index=celltype_order, columns=group_order).fillna(0.0)
+    dominant = value_mat.idxmax(axis=1)
+    mode = str(contrast_mode).lower()
+    if mode in {"row_relative", "relative", "rowmax"}:
+        color_mat = value_mat.div(value_mat.max(axis=1).replace(0, np.nan), axis=0).fillna(0.0)
+        color_label = colorbar_title or "Within-celltype relative enrichment"
+        vmin, vmax = 0.0, 1.0
+    elif mode in {"delta", "delta_from_min"}:
+        color_mat = value_mat.sub(value_mat.min(axis=1), axis=0)
+        color_label = colorbar_title or "Fraction difference from weakest scale"
+        vmin, vmax = 0.0, None
+    elif mode in {"absolute", "fraction"}:
+        color_mat = value_mat.copy()
+        color_label = colorbar_title or "Fraction of group genes"
+        vmin, vmax = 0.0, None
+    else:
+        raise ValueError("contrast_mode must be 'row_relative', 'delta', or 'absolute'.")
+
+    plot_rows = []
+    for y, ct in enumerate(celltype_order):
+        for x, group in enumerate(group_order):
+            plot_rows.append(
+                {
+                    "_x": x,
+                    "_y": y,
+                    group_col: group,
+                    celltype_col: ct,
+                    "_size": float(size_mat.loc[ct, group]),
+                    "_color": float(color_mat.loc[ct, group]),
+                    "_value": float(value_mat.loc[ct, group]),
+                }
+            )
+    plot_df = pd.DataFrame(plot_rows)
+    max_size = float(plot_df["_size"].max())
+    if max_size <= 0:
+        max_size = 1.0
+    dot_sizes = dot_min + (plot_df["_size"].to_numpy(float) / max_size) * (dot_max - dot_min)
+
+    if figsize is None:
+        figsize = (
+            max(7.8, 1.55 * len(group_order) + 4.0),
+            max(4.8, 0.44 * len(celltype_order) + 1.9),
+        )
+    fig, ax = plt.subplots(figsize=figsize)
+    sc = ax.scatter(
+        plot_df["_x"].to_numpy(float),
+        plot_df["_y"].to_numpy(float),
+        s=dot_sizes,
+        c=plot_df["_color"].to_numpy(float),
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        edgecolors=edgecolor,
+        linewidths=float(linewidth),
+    )
+    ax.set_xticks(np.arange(len(group_order)))
+    ax.set_xticklabels(
+        [default_group_label_map.get(g, g) for g in group_order],
+        fontweight="bold",
+        fontsize=tick_size,
+    )
+    ax.set_yticks(np.arange(len(celltype_order)))
+    ax.set_yticklabels(celltype_order, fontsize=tick_size, fontweight="bold")
+    ax.set_xlim(-0.5, len(group_order) - 0.5)
+    ax.set_ylim(len(celltype_order) - 0.5, -0.5)
+    ax.set_xlabel("Scale group", fontsize=label_size, fontweight="bold")
+    ax.set_ylabel("Celltype", fontsize=label_size, fontweight="bold")
+    ax.set_title(title, fontsize=title_size, fontweight="bold", pad=12)
+    ax.set_xticks(np.arange(-0.5, len(group_order), 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, len(celltype_order), 1), minor=True)
+    ax.grid(which="major", axis="y", color="#e6e6e6", linewidth=0.8)
+    ax.grid(which="minor", axis="x", color="#e6e6e6", linewidth=0.8)
+    ax.tick_params(axis="both", length=0)
+    ax.tick_params(which="minor", bottom=False, left=False)
+    ax.set_axisbelow(True)
+    for spine in ["top", "right", "left", "bottom"]:
+        ax.spines[spine].set_visible(False)
+
+    if show_dominant_scale:
+        strip_x = len(group_order) - 0.35
+        for y, ct in enumerate(celltype_order):
+            group = str(dominant.loc[ct])
+            ax.add_patch(
+                Rectangle(
+                    (strip_x, y - 0.34),
+                    0.10,
+                    0.68,
+                    color=default_group_colors.get(group, "#999999"),
+                    clip_on=False,
+                    linewidth=0,
+                )
+            )
+        ax.text(
+            strip_x + 0.05,
+            -0.85,
+            "dominant",
+            ha="center",
+            va="bottom",
+            fontsize=dominant_size,
+            rotation=90,
+            fontweight="bold",
+        )
+
+    if annotate_counts:
+        for _, row in plot_df.iterrows():
+            if row["_size"] <= 0:
+                continue
+            ax.text(
+                row["_x"],
+                row["_y"],
+                str(int(round(row["_size"]))),
+                ha="center",
+                va="center",
+                fontsize=annotation_size,
+                color="black" if row["_color"] < 0.65 else "white",
+                fontweight="bold",
+            )
+
+    fig.subplots_adjust(right=float(right_margin))
+    if show_colorbar:
+        cax = fig.add_axes(list(colorbar_bbox))
+        cbar = fig.colorbar(sc, cax=cax)
+        cbar.outline.set_visible(False)
+        cbar.set_label(color_label, fontsize=label_size, fontweight="bold")
+        cbar.ax.tick_params(labelsize=tick_size)
+
+    legend_values = np.unique(
+        np.clip(
+            np.array([1, np.ceil(max_size / 3), np.ceil(2 * max_size / 3), np.ceil(max_size)], dtype=float),
+            1,
+            max_size,
+        ).astype(int)
+    )
+    handles = [
+        Line2D(
+            [],
+            [],
+            marker="o",
+            linestyle="",
+            markersize=np.sqrt(dot_min + (v / max_size) * (dot_max - dot_min)),
+            markerfacecolor="lightgray",
+            markeredgecolor=edgecolor,
+            markeredgewidth=float(linewidth),
+            label=str(int(v)),
+        )
+        for v in legend_values
+    ]
+    if show_size_legend:
+        ax.legend(
+            handles=handles,
+            title=size_legend_title,
+            frameon=False,
+            bbox_to_anchor=legend_bbox_to_anchor,
+            loc="upper left",
+            borderaxespad=0.0,
+            labelspacing=1.0,
+            handletextpad=1.2,
+            fontsize=legend_size,
+            title_fontsize=label_size,
+        )
+    return fig, ax
+
+
+def plot_scale_group_enrichment_class_stacked_bar(
+    group_class_summary: pd.DataFrame,
+    *,
+    fraction: bool = True,
+    title: str = "Gene celltype-enrichment class by scale group",
+    figsize: Tuple[float, float] = (6.5, 3.6),
+    colors: Optional[Mapping[str, str]] = None,
+):
+    """Plot single/multi/pan/none composition for each scale group."""
+    if group_class_summary is None or group_class_summary.empty:
+        raise ValueError("group_class_summary must be non-empty.")
+    import matplotlib.pyplot as plt
+
+    classes = ["single", "multi", "pan", "none"]
+    default_colors = {
+        "single": "#4C78A8",
+        "multi": "#F28E2B",
+        "pan": "#59A14F",
+        "none": "#BAB0AC",
+    }
+    if colors is not None:
+        default_colors.update({str(k): str(v) for k, v in colors.items()})
+    work = group_class_summary.copy()
+    groups = work["scale_group"].astype(str).tolist()
+    fig, ax = plt.subplots(figsize=figsize)
+    x = np.arange(len(groups))
+    bottom = np.zeros(len(groups), dtype=float)
+    for cls in classes:
+        col = f"fraction_{cls}" if fraction else f"n_{cls}_genes"
+        vals = pd.to_numeric(work.get(col, 0), errors="coerce").fillna(0).to_numpy(float)
+        ax.bar(x, vals, bottom=bottom, label=cls, color=default_colors.get(cls, "#999999"))
+        bottom += vals
+    ax.set_xticks(x)
+    ax.set_xticklabels(groups, rotation=0)
+    ax.set_ylabel("Fraction of genes" if fraction else "Number of genes")
+    ax.set_ylim(0, 1.0 if fraction else max(bottom.max() * 1.08, 1.0))
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.legend(frameon=False, ncol=4, loc="upper center", bbox_to_anchor=(0.5, -0.14))
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+    fig.tight_layout()
+    return fig
+
+
+def classify_scale_group_gene_set_celltype_enrichment(
+    adata,
+    scale_svg_table: pd.DataFrame,
+    *,
+    group_col: str = "scale_group",
+    gene_col: str = "gene",
+    pass_col: Optional[str] = "passes_rule",
+    require_pass: bool = True,
+    top_n_per_group: Optional[int] = 100,
+    celltype_col: str = "predicted_labels",
+    layer: Optional[str] = "counts",
+    target_sum: float = 1e4,
+    min_cells: int = 15,
+    alpha: float = 0.05,
+    min_score_diff: float = 0.05,
+    n_permutations: int = 2000,
+    background_genes: Optional[Sequence[str]] = None,
+    match_expression: bool = True,
+    n_expression_bins: int = 20,
+    n_jobs: int = 1,
+    permutation_batch_size: int = 128,
+    random_state: Optional[int] = 0,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Test each scale group as a gene-set/module against celltypes.
+
+    This complements :func:`classify_scale_group_gene_celltype_enrichment`.
+    The per-gene classifier asks whether individual genes are celltype markers;
+    this function asks whether the whole group gene set has a higher module
+    score in a celltype than expression-matched random gene sets.
+    """
+    from .scale_biology import make_scale_group_gene_sets
+
+    gene_sets = make_scale_group_gene_sets(
+        scale_svg_table,
+        group_col=group_col,
+        gene_col=gene_col,
+        pass_col=pass_col,
+        require_pass=require_pass,
+        top_n_per_group=top_n_per_group,
+    )
+    if not gene_sets:
+        return pd.DataFrame(), pd.DataFrame()
+
+    stats_frames = []
+    summary_frames = []
+    for group, genes in gene_sets.items():
+        genes = [str(g) for g in genes]
+        if not genes:
+            continue
+        stats, tested_celltypes = permutation_celltype_gene_set_enrichment(
+            adata,
+            genes=genes,
+            celltype_col=celltype_col,
+            layer=layer,
+            target_sum=target_sum,
+            min_cells=int(min_cells),
+            alpha=alpha,
+            min_score_diff=min_score_diff,
+            n_permutations=n_permutations,
+            background_genes=background_genes,
+            match_expression=match_expression,
+            n_expression_bins=n_expression_bins,
+            n_jobs=n_jobs,
+            permutation_batch_size=permutation_batch_size,
+            random_state=random_state,
+        )
+        stats = stats.copy()
+        stats.insert(0, "scale_group", str(group))
+        stats["n_tested_celltypes"] = int(len(tested_celltypes))
+        summary = summarize_permutation_celltype_gene_set_enrichment(stats, pan_fraction=1.0)
+        summary = summary.copy()
+        summary.insert(0, "scale_group", str(group))
+        summary["gene_set_size"] = int(len(genes))
+        summary["n_tested_celltypes"] = int(len(tested_celltypes))
+        stats_frames.append(stats)
+        summary_frames.append(summary)
+
+    stats_out = pd.concat(stats_frames, ignore_index=True) if stats_frames else pd.DataFrame()
+    summary_out = pd.concat(summary_frames, ignore_index=True) if summary_frames else pd.DataFrame()
+    return stats_out, summary_out
+
+
+def plot_scale_group_gene_set_celltype_heatmap(
+    gene_set_celltype_stats: pd.DataFrame,
+    *,
+    value_col: str = "score_diff",
+    only_enriched: bool = False,
+    max_celltypes: Optional[int] = 30,
+    group_order: Optional[Sequence[str]] = None,
+    celltype_order: Optional[Sequence[str]] = None,
+    title: str = "Scale-group gene-set celltype enrichment",
+    cmap: str = "viridis",
+    annotate: bool = True,
+    figsize: Optional[Tuple[float, float]] = None,
+):
+    """Plot module-level scale-group celltype enrichment."""
+    if gene_set_celltype_stats is None or gene_set_celltype_stats.empty:
+        raise ValueError("gene_set_celltype_stats must be non-empty.")
+    required = {"scale_group", "celltype", value_col}
+    missing = required.difference(gene_set_celltype_stats.columns)
+    if missing:
+        raise KeyError(f"gene_set_celltype_stats is missing required columns: {sorted(missing)}")
+
+    import matplotlib.pyplot as plt
+
+    work = gene_set_celltype_stats.copy()
+    if only_enriched and "is_enriched" in work.columns:
+        work = work.loc[work["is_enriched"].astype(bool)].copy()
+    if work.empty:
+        raise ValueError("No rows remain after filtering.")
+    work[value_col] = pd.to_numeric(work[value_col], errors="coerce")
+    if group_order is None:
+        group_order = work["scale_group"].astype(str).drop_duplicates().tolist()
+    else:
+        group_order = [str(x) for x in group_order]
+    if celltype_order is None:
+        top = work.groupby("celltype", observed=True)[value_col].max().sort_values(ascending=False)
+        if max_celltypes is not None:
+            top = top.head(int(max_celltypes))
+        celltype_order = top.index.astype(str).tolist()
+    else:
+        celltype_order = [str(x) for x in celltype_order]
+
+    matrix = (
+        work.assign(scale_group=work["scale_group"].astype(str), celltype=work["celltype"].astype(str))
+        .pivot_table(index="celltype", columns="scale_group", values=value_col, aggfunc="max")
+        .reindex(index=celltype_order, columns=group_order)
+        .fillna(0.0)
+    )
+    if figsize is None:
+        figsize = (max(4.5, 1.35 * len(group_order) + 2.0), max(4.0, 0.32 * len(celltype_order) + 1.7))
+    fig, ax = plt.subplots(figsize=figsize)
+    im = ax.imshow(matrix.to_numpy(float), aspect="auto", interpolation="nearest", cmap=cmap)
+    ax.set_xticks(np.arange(matrix.shape[1]))
+    ax.set_xticklabels(matrix.columns.tolist())
+    ax.set_yticks(np.arange(matrix.shape[0]))
+    ax.set_yticklabels(matrix.index.tolist(), fontsize=8)
+    ax.tick_params(axis="both", length=0)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.set_xticks(np.arange(-0.5, matrix.shape[1], 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, matrix.shape[0], 1), minor=True)
+    ax.grid(which="minor", color="white", linewidth=0.8)
+    ax.tick_params(which="minor", bottom=False, left=False)
+    if annotate:
+        vals = matrix.to_numpy(float)
+        vmax = float(np.nanmax(vals)) if vals.size else 1.0
+        qmat = None
+        if "qvalue" in work.columns:
+            qmat = (
+                work.assign(scale_group=work["scale_group"].astype(str), celltype=work["celltype"].astype(str))
+                .pivot_table(index="celltype", columns="scale_group", values="qvalue", aggfunc="min")
+                .reindex(index=celltype_order, columns=group_order)
+                .to_numpy(float)
+            )
+        for i in range(vals.shape[0]):
+            for j in range(vals.shape[1]):
+                val = vals[i, j]
+                if val <= 0:
+                    continue
+                label = f"{val:.2f}"
+                if qmat is not None and np.isfinite(qmat[i, j]):
+                    if qmat[i, j] <= 0.001:
+                        label = "***"
+                    elif qmat[i, j] <= 0.01:
+                        label = "**"
+                    elif qmat[i, j] <= 0.05:
+                        label = "*"
+                    else:
+                        label = ""
+                if not label:
+                    continue
+                color = "white" if val > 0.55 * max(vmax, 1.0) else "black"
+                ax.text(j, i, label, ha="center", va="center", fontsize=8, color=color)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.025)
+    cbar.set_label(value_col)
+    ax.set_title(title, fontsize=12, fontweight="bold", pad=12)
+    fig.tight_layout()
+    return fig

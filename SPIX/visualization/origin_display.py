@@ -16,6 +16,7 @@ from .plotting import (
     _apply_axis_crop,
     _compute_alpha_from_values,
     _float_array_fast,
+    _finalize_image_plot_figure,
     _plot_boundaries_from_label_image,
     _rasterize_rgba_and_label_buffer,
     _rebalance_color_array,
@@ -492,6 +493,9 @@ def image_plot_with_spatial_image_display_boundaries(
     image_cache_key: str | None = None,
     refresh_image_cache: bool = False,
     show_axes: bool = False,
+    save=None,
+    save_kwargs=None,
+    return_fig=None,
 ):
     """
     Plot display coordinates and overlay segment boundaries re-rasterized on the displayed tiles.
@@ -501,6 +505,8 @@ def image_plot_with_spatial_image_display_boundaries(
     or H&E background. The function does not use origin-false support tiles for boundary geometry;
     instead, it re-rasterizes the segment labels stored in `adata.obs[segment_key]` on the chosen
     display coordinates.
+    Use ``save='path.png'`` to write the figure, ``show=False`` to suppress
+    display, and ``return_fig=True`` to force returning ``(fig, ax)``.
     """
     logger = logging.getLogger("image_plot_with_spatial_image_display_boundaries")
     logger.setLevel(logging.INFO if verbose else logging.WARNING)
@@ -598,6 +604,10 @@ def image_plot_with_spatial_image_display_boundaries(
             show_axes=show_axes,
             xlim=xlim,
             ylim=ylim,
+            show=show,
+            save=save,
+            save_kwargs=save_kwargs,
+            return_fig=return_fig,
         )
 
     from .plotting import (
@@ -703,7 +713,7 @@ def image_plot_with_spatial_image_display_boundaries(
             logger.info(
                 "image_plot_with_spatial_image_display_boundaries: rendering directly from cached image."
             )
-        _render_plot_cache_fast(
+        return _render_plot_cache_fast(
             cache=plot_cache,
             requested_dimensions=dimensions,
             title=title_text,
@@ -716,8 +726,11 @@ def image_plot_with_spatial_image_display_boundaries(
             background_extent=background_extent,
             background_origin=background_origin,
             background_alpha=alpha_img,
+            show=show,
+            save=save,
+            save_kwargs=save_kwargs,
+            return_fig=return_fig,
         )
-        return
 
     coordinates_df = _resolve_display_coordinates(
         adata,
@@ -1038,7 +1051,11 @@ def image_plot_with_spatial_image_display_boundaries(
     ax.set_title(title if title is not None else f"{embedding} - display boundaries", fontsize=figsize[0] * 1.5)
     if verbose:
         logger.info("image_plot_with_spatial_image_display_boundaries total time: %.3fs", perf_counter() - t_all)
-    if show:
-        plt.show()
-        return None
-    return fig, ax
+    return _finalize_image_plot_figure(
+        fig,
+        ax,
+        show=show,
+        save=save,
+        save_kwargs=save_kwargs,
+        return_fig=return_fig,
+    )

@@ -2966,6 +2966,26 @@ def precompute_multiscale_segments(
         )
 
     cache = adata.uns[image_cache_key]
+    cache_storage_kind = str(cache.get("cache_storage", "memory"))
+    preloaded_cache_image = False
+    if (
+        str(os.environ.get("SPIX_PRECOMPUTE_PRELOAD_CACHE", "1")).strip().lower()
+        not in {"0", "false", "no", "off"}
+        and cache.get("img", None) is None
+        and cache.get("img_path", None) is not None
+        and cache_storage_kind not in {"memory", "float32_memmap"}
+    ):
+        t_preload0 = time.perf_counter()
+        get_cached_image(cache, cache_in_memory=True)
+        if verbose:
+            shape_msg = get_cached_image_shape(cache)
+            print(
+                "[cache] preloaded cached image once for multiscale SLIC: "
+                f"storage={cache_storage_kind} shape={shape_msg} "
+                f"{time.perf_counter() - t_preload0:.3f}s",
+                flush=True,
+            )
+        preloaded_cache_image = True
     n_obs = int(adata.n_obs)
 
     tiles_all = adata.uns["tiles"]
@@ -2976,7 +2996,10 @@ def precompute_multiscale_segments(
         tiles_for_n = tiles_for_n.drop_duplicates("barcode")
 
     save_fn = np.savez_compressed if bool(save_compressed) else np.savez
-    native_available = bool(native_identity) and _native_identity_available(cache)
+    # The native scale is the original observation graph itself. It does not
+    # require a cache-to-observation one-to-one mapping because no raster
+    # segmentation is materialized for this scale.
+    native_available = bool(native_identity)
 
     reference_compactness: dict[float, dict[str, Any]] = {}
     if not manual_mode:
@@ -3056,9 +3079,48 @@ def precompute_multiscale_segments(
             "payload": payload,
         }
 
+    def _pack_native_identity_record(
+        *,
+        resolution: float,
+        sid: str,
+        compactness: float | None = None,
+        mode: str = "native_identity",
+    ) -> dict[str, Any]:
+        dt = 0.0
+        comp_value = np.nan if compactness is None else float(compactness)
+        return _pack_record(
+            sid=sid,
+            meta={
+                "mode": str(mode),
+                "resolution": float(resolution),
+                "compactness": comp_value,
+                "segment_method": "native_identity",
+                "pitch_um": float(pitch_um),
+                "reference_target_um": float(resolution),
+                "search_target_um": float(resolution),
+                "reference_compactness": np.nan,
+                "scaled_compactness": comp_value,
+                "requested_n_segments": int(n_obs),
+                "observed_tile_n_segments": int(n_obs),
+                "observed_obs_n_segments": int(n_obs),
+                "max_label": int(n_obs - 1),
+                "native_identity": True,
+                "origin": bool(origin),
+                "use_cached_image": False,
+                "seconds": float(dt),
+            },
+        )
+
     def _segment_manual(resolution: float, compactness: float) -> dict[str, Any]:
         t0 = time.perf_counter()
         sid = _precompute_scale_id(resolution, compactness=compactness)
+        if native_available and np.isclose(float(resolution), float(pitch_um), atol=float(native_tol)):
+            return _pack_native_identity_record(
+                resolution=float(resolution),
+                sid=sid,
+                compactness=float(compactness),
+                mode="native_identity",
+            )
         requested_n_segments = int(
             n_segments_from_size(
                 tiles_for_n,
@@ -3147,46 +3209,15 @@ def precompute_multiscale_segments(
         sid = _precompute_scale_id(resolution)
 
         if native_available and np.isclose(float(resolution), float(pitch_um), atol=float(native_tol)):
-            n_tiles = None
-            tile_obs_indices = cache.get("tile_obs_indices", None)
-            if tile_obs_indices is not None:
-                n_tiles = int(np.asarray(tile_obs_indices).size)
-            else:
-                n_tiles = int(len(cache.get("barcodes", [])))
-            labels_tile, label_img = _identity_segmentation_from_cache(cache, n_tiles=int(n_tiles))
-            seg_codes = _cached_tile_labels_to_obs_codes(
-                adata,
-                cache,
-                labels_tile,
-                image_cache_key=image_cache_key,
-            )
-            observed_tile_n_segments = int(labels_tile.shape[0])
-            observed_obs_n_segments = int(np.unique(seg_codes[seg_codes >= 0]).size)
-            dt = time.perf_counter() - t0
-            return _pack_record(
+            completed = _pack_native_identity_record(
+                resolution=float(resolution),
                 sid=sid,
-                meta={
-                    "mode": "native_identity",
-                    "resolution": float(resolution),
-                    "compactness": np.nan,
-                    "segment_method": str(segment_method),
-                    "pitch_um": float(pitch_um),
-                    "reference_target_um": float(resolution),
-                    "search_target_um": float(resolution),
-                    "reference_compactness": np.nan,
-                    "scaled_compactness": np.nan,
-                    "requested_n_segments": int(observed_tile_n_segments),
-                    "observed_tile_n_segments": int(observed_tile_n_segments),
-                    "observed_obs_n_segments": int(observed_obs_n_segments),
-                    "max_label": int(labels_tile.max(initial=-1)),
-                    "native_identity": True,
-                    "origin": bool(origin),
-                    "use_cached_image": bool(use_cached_image),
-                    "seconds": float(dt),
-                    "seg_codes": seg_codes,
-                    "label_img": label_img,
-                },
+                compactness=None,
+                mode="native_identity",
             )
+            completed["payload"]["seconds"] = float(time.perf_counter() - t0)
+            completed["record"]["seconds"] = float(completed["payload"]["seconds"])
+            return completed
 
         requested_n_segments = int(
             n_segments_from_size(
@@ -3316,11 +3347,14 @@ def precompute_multiscale_segments(
                 uns_records[sid] = payload
 
             if storage_mode in {"disk", "both"}:
-                path = os.path.join(str(out_dir), f"{filename_prefix}{sid}.npz")
-                save_fn(path, **payload)
-                record["path"] = path
+                if bool(record.get("native_identity", False)) or str(record.get("mode", "")) == "native_identity":
+                    record["path"] = "__native_identity__"
+                else:
+                    path = os.path.join(str(out_dir), f"{filename_prefix}{sid}.npz")
+                    save_fn(path, **payload)
+                    record["path"] = path
             else:
-                record["path"] = None
+                record["path"] = "__native_identity__" if bool(record.get("native_identity", False)) else None
 
             results.append(record)
             if verbose:
@@ -3357,6 +3391,10 @@ def precompute_multiscale_segments(
                             flush=True,
                         )
             gc.collect()
+
+    if preloaded_cache_image and isinstance(cache, dict):
+        cache["img"] = None
+        gc.collect()
 
     sort_cols = ["resolution", "compactness"] if ("compactness" in pd.DataFrame(results).columns) else ["resolution"]
     index_df = pd.DataFrame(results).sort_values(sort_cols, kind="mergesort").reset_index(drop=True)

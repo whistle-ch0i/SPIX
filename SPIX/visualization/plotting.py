@@ -53,6 +53,84 @@ logging.basicConfig(
 )
 
 
+def _save_image_plot_figure(fig, save, save_kwargs=None):
+    if save is None or save is False:
+        return
+    if save is True:
+        raise ValueError("`save` must be a file path, not True.")
+
+    kwargs = {"dpi": 300, "bbox_inches": "tight", "pad_inches": 0.03}
+    if save_kwargs:
+        kwargs.update(dict(save_kwargs))
+
+    path = os.fspath(save)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    fig.savefig(path, **kwargs)
+
+
+def _finalize_image_plot_figure(
+    fig,
+    ax,
+    *,
+    show=True,
+    save=None,
+    save_kwargs=None,
+    return_fig=None,
+):
+    _save_image_plot_figure(fig, save=save, save_kwargs=save_kwargs)
+    if show:
+        plt.show()
+    if return_fig is None:
+        return_fig = not bool(show)
+    if return_fig:
+        return fig, ax
+    return None
+
+
+def _coordinate_bounds_polygon(coordinates, *, context: str = "image_plot"):
+    if coordinates is None or len(coordinates) == 0:
+        raise ValueError(
+            f"{context}: no rows remain to plot. Check missing labels or filters "
+            "such as color_by/segment_key."
+        )
+    if "x" not in coordinates.columns or "y" not in coordinates.columns:
+        raise ValueError(f"{context}: coordinates must contain 'x' and 'y' columns.")
+
+    x = pd.to_numeric(coordinates["x"], errors="coerce").to_numpy(dtype=float)
+    y = pd.to_numeric(coordinates["y"], errors="coerce").to_numpy(dtype=float)
+    finite = np.isfinite(x) & np.isfinite(y)
+    if not finite.any():
+        raise ValueError(
+            f"{context}: no finite x/y coordinates remain to plot. Check coordinate "
+            "construction before calling the plotting helper."
+        )
+
+    x_min = float(np.min(x[finite]))
+    x_max = float(np.max(x[finite]))
+    y_min = float(np.min(y[finite]))
+    y_max = float(np.max(y[finite]))
+
+    if x_min == x_max:
+        pad = max(1.0, abs(x_min)) * 1e-9
+        x_min -= pad
+        x_max += pad
+    if y_min == y_max:
+        pad = max(1.0, abs(y_min)) * 1e-9
+        y_min -= pad
+        y_max += pad
+
+    shell = [
+        (x_min, y_min),
+        (x_min, y_max),
+        (x_max, y_max),
+        (x_max, y_min),
+        (x_min, y_min),
+    ]
+    return x_min, x_max, y_min, y_max, Polygon(shell)
+
+
 def _normalize_gap_collapse_axis_safe(axis):
     normalize_fn = getattr(_raster, "normalize_gap_collapse_axis", None)
     if callable(normalize_fn):
@@ -255,7 +333,10 @@ def _cache_matches_plot_request(cache, request) -> bool:
     if not isinstance(cache, dict):
         return False
 
-    cache_dims = tuple(int(d) for d in cache.get("dimensions", []) or [])
+    cache_dims_value = cache.get("dimensions", [])
+    if cache_dims_value is None:
+        cache_dims_value = []
+    cache_dims = tuple(int(d) for d in np.asarray(cache_dims_value).reshape(-1).tolist())
     if not cache_dims or not _dims_subset_of_cache(request["dimensions"], cache_dims):
         return False
     if str(cache.get("embedding_key", "")) != str(request["embedding"]):
@@ -500,6 +581,10 @@ def _render_plot_cache_fast(
     background_extent=None,
     background_origin=None,
     background_alpha: float = 1.0,
+    show=True,
+    save=None,
+    save_kwargs=None,
+    return_fig=None,
 ):
     display_img = _cached_display_image(
         cache,
@@ -537,8 +622,14 @@ def _render_plot_cache_fast(
     if not show_axes:
         ax.axis("off")
     ax.set_title(title, fontsize=figsize[0] * 1.5)
-    plt.show()
-    return fig, ax
+    return _finalize_image_plot_figure(
+        fig,
+        ax,
+        show=show,
+        save=save,
+        save_kwargs=save_kwargs,
+        return_fig=return_fig,
+    )
 
 
 def _can_render_plot_cache_fast(
@@ -1547,6 +1638,10 @@ def image_plot(
     show_axes: bool = False,
     xlim=None,
     ylim=None,
+    show=True,
+    save=None,
+    save_kwargs=None,
+    return_fig=None,
 ):
     """Visualize embeddings as a raster image with optional boundaries and per-spot alpha.
 
@@ -1571,6 +1666,17 @@ def image_plot(
     gap_collapse_axis / gap_collapse_max_run_px : optional
         Optionally collapse short fully-empty raster row/column gaps before
         rendering.
+    save : str or path-like, optional
+        If provided, save the figure to this path before display. Parent
+        directories are created automatically.
+    save_kwargs : dict, optional
+        Extra keyword arguments passed to ``Figure.savefig``. Defaults are
+        ``dpi=300``, ``bbox_inches='tight'``, and ``pad_inches=0.03``.
+    show : bool, optional (default ``True``)
+        Display the figure with ``plt.show()``.
+    return_fig : bool or None, optional
+        If ``True``, return ``(fig, ax)``. If ``None``, return ``(fig, ax)``
+        only when ``show=False`` to avoid duplicate notebook display.
     """
     # Create a local logger
     logger = logging.getLogger("image_plot")
@@ -1666,7 +1772,7 @@ def image_plot(
         )
         if verbose:
             logger.info("image_plot: rendering directly from cached image.")
-        _render_plot_cache_fast(
+        return _render_plot_cache_fast(
             cache=plot_cache,
             requested_dimensions=dimensions,
             title=title_text,
@@ -1675,8 +1781,11 @@ def image_plot(
             xlim=xlim,
             ylim=ylim,
             show_axes=bool(show_axes),
+            show=show,
+            save=save,
+            save_kwargs=save_kwargs,
+            return_fig=return_fig,
         )
-        return
 
     # Extract embedding
     if embedding not in adata.obsm:
@@ -1971,8 +2080,14 @@ def image_plot(
                     ax.set_title(title_text, fontsize=figsize[0] * 1.5)
                     if verbose:
                         logger.info("image_plot total time: %.3fs", perf_counter() - t_all)
-                    plt.show()
-                    return
+                    return _finalize_image_plot_figure(
+                        fig,
+                        ax,
+                        show=show,
+                        save=save,
+                        save_kwargs=save_kwargs,
+                        return_fig=return_fig,
+                    )
 
         raster_canvas = raster_canvas_for_imshow
         s_data_units = float(raster_canvas["s_data_units"])
@@ -2181,8 +2296,14 @@ def image_plot(
         ax.set_title(title_text, fontsize=figsize[0] * 1.5)
         if verbose:
             logger.info("image_plot total time: %.3fs", perf_counter() - t_all)
-        plt.show()
-        return
+        return _finalize_image_plot_figure(
+            fig,
+            ax,
+            show=show,
+            save=save,
+            save_kwargs=save_kwargs,
+            return_fig=return_fig,
+        )
     coord_dict = {
         "x": x_vals[valid],
         "y": y_vals[valid],
@@ -2328,7 +2449,14 @@ def image_plot(
             logger.warning(
                 f"'{color_by}' for {missing} barcodes is missing. Dropping these rows."
             )
-            coordinates_df = coordinates_df.dropna(subset=[color_by])
+            keep_color_mask = coordinates_df[color_by].notna().to_numpy()
+            if alpha_arr is not None and len(alpha_arr) == len(keep_color_mask):
+                alpha_arr = alpha_arr[keep_color_mask]
+            if vals is not None and len(vals) == len(keep_color_mask):
+                vals = np.asarray(vals)[keep_color_mask]
+            if raw_vals is not None and len(raw_vals) == len(keep_color_mask):
+                raw_vals = np.asarray(raw_vals)[keep_color_mask]
+            coordinates_df = coordinates_df.loc[keep_color_mask].reset_index(drop=True)
         if is_numeric_dtype(coordinates_df[color_by]):
             v = pd.to_numeric(coordinates_df[color_by], errors="coerce").to_numpy(dtype=float)
             raw_vals = v
@@ -2490,10 +2618,9 @@ def image_plot(
                 cm = plt.get_cmap(cmap)
                 cols = cm(grey_vals)[:, :3]
 
-    x_min, x_max = coordinates["x"].min(), coordinates["x"].max()
-    y_min, y_max = coordinates["y"].min(), coordinates["y"].max()
-    plot_boundary_polygon = Polygon(
-        [(x_min, y_min), (x_min, y_max), (x_max, y_max), (x_max, y_min)]
+    x_min, x_max, y_min, y_max, plot_boundary_polygon = _coordinate_bounds_polygon(
+        coordinates,
+        context="image_plot",
     )
 
     # Auto-adjust figsize/dpi (when either is None) so the canvas has enough pixels
@@ -2674,8 +2801,14 @@ def image_plot(
                     _apply_axis_crop(ax, xlim=xlim, ylim=ylim)
                     if verbose:
                         logger.info("image_plot total time: %.3fs", perf_counter() - t_all)
-                    plt.show()
-                    return
+                    return _finalize_image_plot_figure(
+                        fig,
+                        ax,
+                        show=show,
+                        save=save,
+                        save_kwargs=save_kwargs,
+                        return_fig=return_fig,
+                    )
 
         # --- Stable IMShow rendering with RGBA for per-spot alpha ---
         # 1) Estimate tile size in data units
@@ -3715,8 +3848,14 @@ def image_plot(
         ax.set_ylim(y_min, y_max)
 
     _apply_axis_crop(ax, xlim=xlim, ylim=ylim)
-    plt.show()
-    # Do not return plot object to avoid auto display
+    return _finalize_image_plot_figure(
+        fig,
+        ax,
+        show=show,
+        save=save,
+        save_kwargs=save_kwargs,
+        return_fig=return_fig,
+    )
 
 
 def image_plot_with_spatial_image(
@@ -3841,11 +3980,17 @@ def image_plot_with_spatial_image(
     image_cache_key: str | None = None,
     refresh_image_cache: bool = False,
     show_axes: bool = False,
+    show=True,
+    save=None,
+    save_kwargs=None,
+    return_fig=None,
 ):
     """
     Visualize embeddings as an image with optional segment boundaries and background image overlay.
 
     Supports per-spot alpha via `alpha_by='embedding'` (1D) or numeric obs column.
+    Use ``save='path.png'`` to write the figure, ``show=False`` to suppress
+    display, and ``return_fig=True`` to force returning ``(fig, ax)``.
     """
     # Create a local logger
     logger = logging.getLogger("image_plot_with_spatial_image")
@@ -3986,7 +4131,7 @@ def image_plot_with_spatial_image(
                 background_origin = None
         if verbose:
             logger.info("image_plot_with_spatial_image: rendering directly from cached image.")
-        _render_plot_cache_fast(
+        return _render_plot_cache_fast(
             cache=plot_cache,
             requested_dimensions=dimensions,
             title=title_text,
@@ -3999,8 +4144,11 @@ def image_plot_with_spatial_image(
             background_extent=background_extent,
             background_origin=background_origin,
             background_alpha=alpha_img,
+            show=show,
+            save=save,
+            save_kwargs=save_kwargs,
+            return_fig=return_fig,
         )
-        return
 
     # Extract spatial coordinates
     use_direct_origin_spatial = False
@@ -4243,7 +4391,18 @@ def image_plot_with_spatial_image(
             raise ValueError(f"'{color_by}' not found in adata.obs. Available: {list(adata.obs.columns)}")
         coordinates_df[color_by] = coordinates_df["barcode"].map(adata.obs[color_by])
         if coordinates_df[color_by].isnull().any():
-            coordinates_df = coordinates_df.dropna(subset=[color_by])
+            missing = int(coordinates_df[color_by].isnull().sum())
+            logger.warning(
+                f"'{color_by}' for {missing} barcodes is missing. Dropping these rows."
+            )
+            keep_color_mask = coordinates_df[color_by].notna().to_numpy()
+            if alpha_arr is not None and len(alpha_arr) == len(keep_color_mask):
+                alpha_arr = alpha_arr[keep_color_mask]
+            if vals is not None and len(vals) == len(keep_color_mask):
+                vals = np.asarray(vals)[keep_color_mask]
+            if raw_vals is not None and len(raw_vals) == len(keep_color_mask):
+                raw_vals = np.asarray(raw_vals)[keep_color_mask]
+            coordinates_df = coordinates_df.loc[keep_color_mask].reset_index(drop=True)
         if is_numeric_dtype(coordinates_df[color_by]):
             v = pd.to_numeric(coordinates_df[color_by], errors="coerce").to_numpy(dtype=float)
             raw_vals = v
@@ -4378,10 +4537,9 @@ def image_plot_with_spatial_image(
                 cm = plt.get_cmap(cmap)
                 cols = cm(grey_vals)[:, :3]
 
-    x_min, x_max = coordinates["x"].min(), coordinates["x"].max()
-    y_min, y_max = coordinates["y"].min(), coordinates["y"].max()
-    plot_boundary_polygon = Polygon(
-        [(x_min, y_min), (x_min, y_max), (x_max, y_max), (x_max, y_min)]
+    x_min, x_max, y_min, y_max, plot_boundary_polygon = _coordinate_bounds_polygon(
+        coordinates,
+        context="image_plot_with_spatial_image",
     )
 
     user_figsize_given = figsize is not None
@@ -4609,8 +4767,14 @@ def image_plot_with_spatial_image(
                     _apply_axis_crop(ax, xlim=xlim, ylim=ylim)
                     if verbose:
                         logger.info("image_plot_with_spatial_image total time: %.3fs", perf_counter() - t_all)
-                    plt.show()
-                    return
+                    return _finalize_image_plot_figure(
+                        fig,
+                        ax,
+                        show=show,
+                        save=save,
+                        save_kwargs=save_kwargs,
+                        return_fig=return_fig,
+                    )
 
         # --- Stable IMShow rendering with RGBA for per-spot alpha ---
         pts = pts_for_imshow if pts_for_imshow is not None else coordinates[["x", "y"]].values
@@ -5171,8 +5335,14 @@ def image_plot_with_spatial_image(
         sm.set_array([])
         fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.04)
 
-    plt.show()
-    # Do not return plot object to avoid auto display
+    return _finalize_image_plot_figure(
+        fig,
+        ax,
+        show=show,
+        save=save,
+        save_kwargs=save_kwargs,
+        return_fig=return_fig,
+    )
     coord_mode = str(coordinate_mode or "spatial").lower()
     if coord_mode not in {"spatial", "array", "visium", "visiumhd", "auto"}:
         coord_mode = "spatial"

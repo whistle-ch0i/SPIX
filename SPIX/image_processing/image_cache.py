@@ -2947,8 +2947,17 @@ def show_cached_image(
         img = np.asarray(cache.get("img_preview"))
         display_channels = None
     else:
-        img = np.asarray(get_cached_image_channels(cache, channels=channels))
-        display_channels = None if channels is not None else channels
+        read_channels = channels
+        if read_channels is None:
+            cache_channels = int(cache.get("channels", cache.get("img_channels", 0)))
+            if cache_channels >= 3:
+                read_channels = [0, 1, 2]
+            elif cache_channels == 2:
+                read_channels = [0, 1]
+            elif cache_channels == 1:
+                read_channels = [0]
+        img = np.asarray(get_cached_image_channels(cache, channels=read_channels))
+        display_channels = None
     if img.ndim != 3:
         raise ValueError("Cached object does not contain a 3D image array.")
 

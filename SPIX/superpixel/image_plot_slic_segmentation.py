@@ -359,7 +359,6 @@ def image_plot_slic_segmentation(
     continuous_gamma: float = 0.8,
     mask_background: bool = False,
     masked_slic_mode: str = "strict",
-    match_requested_segments: bool = False,
     max_segment_tuning_steps: int = 4,
     return_raster_meta: bool = False,
     persistent_store=None,
@@ -687,7 +686,7 @@ def image_plot_slic_segmentation(
     masked_mode = str(masked_slic_mode or "strict").lower()
     if masked_mode not in {"strict", "fast_fill"}:
         masked_mode = "strict"
-    if bool(match_requested_segments) or (slic_mask is not None and masked_mode == "strict"):
+    if slic_mask is not None and masked_mode == "strict":
         label_img = slic(
             slic_img,
             n_segments=int(n_segments),
@@ -851,7 +850,6 @@ def slic_segmentation_from_cached_image(
     continuous_gamma: float | None = None,
     mask_background: bool = False,
     masked_slic_mode: str = "strict",
-    match_requested_segments: bool = False,
     max_segment_tuning_steps: int = 4,
     return_raster_meta: bool = False,
     sample_take: Optional[np.ndarray] = None,
@@ -916,7 +914,7 @@ def slic_segmentation_from_cached_image(
     masked_mode = str(masked_slic_mode or "strict").lower()
     if masked_mode not in {"strict", "fast_fill"}:
         masked_mode = "strict"
-    if bool(match_requested_segments) or (slic_mask is not None and masked_mode == "strict"):
+    if slic_mask is not None and masked_mode == "strict":
         if verbose and slic_mask is not None:
             logger.info(
                 "Running cached masked SLIC in strict mode (mask loaded from cache; support_pixels=%d).",
