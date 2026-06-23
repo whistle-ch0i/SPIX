@@ -1344,6 +1344,43 @@ def fill_missing_ranks_with_worst(rank_df: pd.DataFrame) -> pd.DataFrame:
     return rank_df.fillna(max_rank + 1)
 
 
+def _fill_missing_rank_values_for_plot(
+    rank_df: pd.DataFrame,
+    mode: str | float | int | None = "worst",
+) -> pd.DataFrame:
+    """Fill missing rank values for visual trajectories without changing gene selection."""
+    if rank_df.empty or mode is None:
+        return rank_df
+    if isinstance(mode, str):
+        mode_l = mode.strip().lower()
+        if mode_l in {"", "none", "nan", "keep", "raw"}:
+            return rank_df
+        if mode_l in {"worst", "scale_worst", "per_scale_worst", "column_worst"}:
+            out = rank_df.copy()
+            # Iterate by position rather than column label.  Display-labeling can
+            # legitimately create duplicate column names (for example, identical
+            # observed segment-count labels), and ``out[col]`` would then return
+            # a DataFrame instead of a Series.
+            for pos in range(out.shape[1]):
+                vals = pd.to_numeric(out.iloc[:, pos], errors="coerce")
+                finite = vals[np.isfinite(vals.to_numpy(dtype=float, copy=False))]
+                if finite.empty:
+                    continue
+                out.iloc[:, pos] = vals.fillna(float(finite.max()) + 1.0)
+            return out
+        if mode_l in {"global_worst", "table_worst"}:
+            return fill_missing_ranks_with_worst(rank_df)
+        try:
+            fill_value = float(mode_l)
+        except ValueError as exc:
+            raise ValueError(
+                "missing_rank_values must be 'worst', 'global_worst', 'keep', "
+                "None, or a numeric fill value."
+            ) from exc
+        return rank_df.fillna(fill_value)
+    return rank_df.fillna(float(mode))
+
+
 def _format_observed_count_label(value: float, *, suffix: str = "K") -> str:
     if not np.isfinite(float(value)):
         return "NA"
@@ -1510,6 +1547,7 @@ def plot_multiscale_rank_trajectory(
     grid: bool = True,
     rotate_xticks: float = 45,
     missing: str = "warn",
+    missing_rank_values: str | float | int | None = "worst",
 ):
     """Plot publication-style multiscale rank trajectories.
 
@@ -1517,8 +1555,12 @@ def plot_multiscale_rank_trajectory(
     ``observed_obs_n_segments`` by default using integer count labels such as
     ``406K`` and ``475``. Set ``segment_label_mode="resolution"`` to label the
     x-axis by scale/resolution instead. Lower ranks are plotted higher by
-    inverting the y-axis.  Pass ``scale_groups`` to draw a fine/mid/coarse band
-    below the x-axis; set ``show_scale_group_bar=False`` to suppress it.
+    inverting the y-axis. Missing gene-scale ranks are filled with the
+    scale-specific worst rank by default so trajectories stay continuous while
+    preserving the interpretation that the gene was not a usable SVG at that
+    scale. Set ``missing_rank_values="keep"`` to retain raw NaNs. Pass
+    ``scale_groups`` to draw a fine/mid/coarse band below the x-axis; set
+    ``show_scale_group_bar=False`` to suppress it.
     """
     if show_legend is not None:
         legend = bool(show_legend)
@@ -1551,6 +1593,8 @@ def plot_multiscale_rank_trajectory(
             plot_df = label_multiscale_resolution_columns(plot_df, segments_index, native_label=native_label)
         else:
             raise ValueError("segment_label_mode must be 'observed_count' or 'resolution'.")
+
+    plot_df = _fill_missing_rank_values_for_plot(plot_df, mode=missing_rank_values)
 
     genes_use = [str(g) for g in genes if str(g) in plot_df.index]
     missing_genes = [str(g) for g in genes if str(g) not in plot_df.index]

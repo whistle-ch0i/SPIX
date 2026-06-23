@@ -1,5 +1,9 @@
 # SPIX/__init__.py
+import os
 from importlib import import_module
+
+os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba_spix")
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/mpl_spix")
 
 _SUBMODULE_ALIASES = {
     "tm": "tiles_embeddings",
